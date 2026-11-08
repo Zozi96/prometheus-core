@@ -1,13 +1,13 @@
 [package]
-name = "sureforge-gix"
-version = "0.1.0"
+name = "prometheus-core"
+version = "0.2.0"
 edition = "2021"
 publish = false
 license = "MIT"
-description = "In-process git primitives for the SureForge work-tree fingerprint."
+description = "In-process deterministic engine for the Prometheus gate: tree fingerprint and core git primitives."
 
 [lib]
-name = "sureforge_gix"
+name = "prometheus_core"
 crate-type = ["cdylib"]
 
 [dependencies]

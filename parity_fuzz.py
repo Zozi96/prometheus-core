@@ -1,6 +1,6 @@
-"""Randomized parity of sureforge_gix.stage_and_write with `git add -A` + `git write-tree`.
+"""Randomized parity of prometheus_core.stage_and_write with `git add -A` + `git write-tree`.
 
-usage: python3 fingerprint/parity_fuzz.py [iterations-per-category] [seed]
+usage: python3 core/parity_fuzz.py [iterations-per-category] [seed]
 
 Each category starts from a random committed tree, applies random work-tree
 edits, then stages both ways: git into a scratch index and a private object
@@ -21,7 +21,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "runtime"))
-import sureforge_gix as gix  # noqa: E402
+import prometheus_core as core  # noqa: E402
 import sureforge_hook as hook  # noqa: E402
 
 NAMES = ["a", "a.txt", "a-", "a0", "a.b", "b", "B", "x y", "ü.txt", "z", "dir", "dir.txt", "dir-"]
@@ -170,11 +170,11 @@ def compare_engines(root):
         oracle = (hook._git_fingerprint(top, None, oracle_errors, hook._CLI), oracle_errors)
     if oracle != expected:
         return f"{oracle}|prefilter {expected}"
-    if gix.preflight(top, hook.INPROCESS_MAX_ENTRIES)[0] != "inprocess":
+    if core.preflight(top, hook.INPROCESS_MAX_ENTRIES)[0] != "inprocess":
         return "routed"
-    gix_errors = []
+    core_errors = []
     try:
-        got = (hook._git_fingerprint(top, None, gix_errors, hook._InProcess(gix)), gix_errors)
+        got = (hook._git_fingerprint(top, None, core_errors, hook._InProcess(core)), core_errors)
     except RuntimeError as exc:
         return f"error: {exc}"
     return "same" if got == expected else f"{expected}|{got}"
@@ -200,7 +200,7 @@ def run(category, spec, iterations, seed):
                 continue
             expected = cli_tree(root, tmp)
             try:
-                got = gix.stage_and_write(str(root), str(Path(tmp) / "gix-objects"), [], [])
+                got = core.stage_and_write(str(root), str(Path(tmp) / "core-objects"), [], [])
             except RuntimeError as exc:
                 got = f"error: {exc}"
             if got.startswith("error: route:"):
@@ -224,7 +224,7 @@ def main():
         status = "pass" if not failures else "FAIL"
         print(f"{category:15} {status} {iterations - len(failures)}/{iterations} (routed to git: {routed},"
               f" fell back to git: {len(fell_back)}{' e.g. ' + fell_back[0][0] + ' ' + fell_back[0][1] if fell_back else ''})"
-              + (f"  first: {failures[0][0]} git={failures[0][1]} gix={failures[0][2]}" if failures else ""))
+              + (f"  first: {failures[0][0]} git={failures[0][1]} core={failures[0][2]}" if failures else ""))
     return 1 if bad else 0
 
 

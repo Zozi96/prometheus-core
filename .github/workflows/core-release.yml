@@ -1,15 +1,15 @@
-name: fingerprint-release
+name: core-release
 
-# Builds sureforge_gix on native runners for six targets and publishes the
+# Builds prometheus_core on native runners for six targets and publishes the
 # modules as release assets. Parity against sureforge_hook stays in the
 # private parent; this job only checks that the built module imports.
-# runtime/sureforge_gix.lock in the parent is updated afterwards with the
+# runtime/prometheus_core.lock in the parent is updated afterwards with the
 # sha256 values the release notes list.
 
 on:
   push:
-    tags: ["fp-v*"]
-  # Builds and tests all six targets from any branch; only an fp-v* tag publishes.
+    tags: ["core-v*"]
+  # Builds and tests all six targets from any branch; only a core-v* tag publishes.
   workflow_dispatch:
 
 permissions:
@@ -51,27 +51,27 @@ jobs:
           with zipfile.ZipFile(wheel) as archive:
               name, = [n for n in archive.namelist() if n.endswith("." + ext)]
               data = archive.read(name)
-          installed = "sureforge_gix.abi3.so" if ext == "so" else "sureforge_gix.pyd"
+          installed = "prometheus_core.abi3.so" if ext == "so" else "prometheus_core.pyd"
           pathlib.Path("module").mkdir()
           pathlib.Path("module", installed).write_bytes(data)
           pathlib.Path("upload").mkdir()
-          pathlib.Path("upload", "sureforge_gix-${{ matrix.platform }}." + ext).write_bytes(data)
+          pathlib.Path("upload", "prometheus_core-${{ matrix.platform }}." + ext).write_bytes(data)
           print(name, len(data), "bytes")
           EOF
       - name: Import check
         if: matrix.test
         shell: bash
         run: |
-          python -c "import sys; sys.path.insert(0, 'module'); import sureforge_gix; print('ENGINE_API', sureforge_gix.ENGINE_API)"
+          python -c "import sys; sys.path.insert(0, 'module'); import prometheus_core; print('ENGINE_API', prometheus_core.ENGINE_API)"
       - uses: actions/upload-artifact@v7
         with:
-          name: sureforge_gix-${{ matrix.platform }}
+          name: prometheus_core-${{ matrix.platform }}
           path: upload/
           if-no-files-found: error
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/fp-v')
+    if: startsWith(github.ref, 'refs/tags/core-v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -88,7 +88,7 @@ jobs:
           ls -la
           test "$(ls | wc -l)" -eq 6
           {
-            echo "sureforge_gix modules for runtime/sureforge_gix.lock (ENGINE_API 2)."
+            echo "prometheus_core modules for runtime/prometheus_core.lock (ENGINE_API 3)."
             echo
             echo '```'
             sha256sum -- *
