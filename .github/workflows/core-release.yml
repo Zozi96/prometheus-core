@@ -25,7 +25,7 @@ jobs:
         include:
           - { platform: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, manylinux: "2014", ext: so, test: true }
           - { platform: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2014", ext: so, test: true }
-          - { platform: macos-arm64, os: macos-14, target: aarch64-apple-darwin, manylinux: "", ext: so, test: true }
+          - { platform: macos-arm64, os: macos-15, target: aarch64-apple-darwin, manylinux: "", ext: so, test: true }
           - { platform: macos-x86_64, os: macos-15-intel, target: x86_64-apple-darwin, manylinux: "", ext: so, test: true }
           - { platform: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, manylinux: "", ext: pyd, test: true }
           # Cross-built on the x64 runner, which cannot load it: built, not tested.
