@@ -12,6 +12,7 @@ pub mod brief;
 pub mod classify;
 pub mod decide;
 pub mod fingerprint;
+pub mod hooks;
 pub mod impact;
 pub mod logs;
 pub mod scan;
