@@ -20,9 +20,10 @@ use std::path::Path;
 use gix_imara_diff::{sources::byte_lines, Algorithm, Diff, InternedInput};
 use pyo3::prelude::*;
 
+use crate::classify::{classify_row, is_test_path, overall_class, RowInput, RowSide};
 use crate::fingerprint::{err, linked_worktrees_impl, open, real, status_impl, text, Res};
 
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 const CONTEXT: u32 = 3;
 /// git's `buffer_is_binary`: a NUL in the first 8000 bytes marks the blob binary.
 const BINARY_SNIFF: usize = 8000;
@@ -319,6 +320,11 @@ fn scan_impl(
     // The changed rows against the session baseline.
     doc.push_str(",\"changed\":");
     let mut changed_reason: Option<&str> = None;
+    // Schema-2 classification state: the overall class/reason and the
+    // risk path set, filled when the changed rows could be measured.
+    let mut cls_class: Option<&'static str> = None;
+    let mut cls_reason: Option<&'static str> = None;
+    let mut risk_list: Option<Vec<String>> = None;
     if baseline.is_empty() {
         changed_reason = Some("no-baseline");
         doc.push_str("null");
@@ -331,6 +337,7 @@ fn scan_impl(
                 } else {
                     diff_maps(&flat(&objs, id)?, &flat(&objs, current_id)?)
                 };
+                let mut outputs = Vec::with_capacity(changes.len());
                 doc.push('[');
                 for (index, change) in changes.iter().enumerate() {
                     if index > 0 {
@@ -340,6 +347,37 @@ fn scan_impl(
                     let new_data = change.new.map(|leaf| objs.blob(&leaf)).transpose()?;
                     let binary = old_data.as_deref().is_some_and(is_binary)
                         || new_data.as_deref().is_some_and(is_binary);
+                    // Classification inputs: the same blob bytes, decoded
+                    // the way the Python oracle decodes them.
+                    let old_text = old_data.as_ref().map(|data| String::from_utf8_lossy(data).into_owned());
+                    let new_text = new_data.as_ref().map(|data| String::from_utf8_lossy(data).into_owned());
+                    let old_side = match (&old_data, &old_text) {
+                        (Some(bytes), Some(text)) => {
+                            RowSide::Text(text.as_str(), is_binary(bytes))
+                        }
+                        _ => RowSide::Absent,
+                    };
+                    let new_side = match (&new_data, &new_text) {
+                        (Some(bytes), Some(text)) => {
+                            RowSide::Text(text.as_str(), is_binary(bytes))
+                        }
+                        _ => RowSide::Absent,
+                    };
+                    let output = classify_row(&RowInput {
+                        path: &change.path,
+                        status: match change.status {
+                            "added" => 'A',
+                            "deleted" => 'D',
+                            "typechange" => 'T',
+                            _ => 'M',
+                        },
+                        old: old_side,
+                        new: new_side,
+                        mode_changed: match (change.old, change.new) {
+                            (Some(before), Some(after)) => before.mode != after.mode,
+                            _ => false,
+                        },
+                    });
                     doc.push_str("{\"path\":");
                     esc(&change.path, &mut doc);
                     doc.push_str(",\"status\":");
@@ -347,37 +385,75 @@ fn scan_impl(
                     doc.push_str(",\"binary\":");
                     doc.push_str(if binary { "true" } else { "false" });
                     if binary {
-                        doc.push_str(",\"added\":null,\"deleted\":null,\"hunks\":[]}");
-                        continue;
-                    }
-                    let (added, deleted, hunks) = line_diff(
-                        old_data.as_deref().unwrap_or_default(),
-                        new_data.as_deref().unwrap_or_default(),
-                    );
-                    doc.push_str(",\"added\":");
-                    doc.push_str(&added.to_string());
-                    doc.push_str(",\"deleted\":");
-                    doc.push_str(&deleted.to_string());
-                    doc.push_str(",\"hunks\":[");
-                    for (index, hunk) in hunks.iter().enumerate() {
-                        if index > 0 {
-                            doc.push(',');
+                        doc.push_str(",\"added\":null,\"deleted\":null,\"hunks\":[]");
+                    } else {
+                        let (added, deleted, hunks) = line_diff(
+                            old_data.as_deref().unwrap_or_default(),
+                            new_data.as_deref().unwrap_or_default(),
+                        );
+                        doc.push_str(",\"added\":");
+                        doc.push_str(&added.to_string());
+                        doc.push_str(",\"deleted\":");
+                        doc.push_str(&deleted.to_string());
+                        doc.push_str(",\"hunks\":[");
+                        for (index, hunk) in hunks.iter().enumerate() {
+                            if index > 0 {
+                                doc.push(',');
+                            }
+                            doc.push_str("{\"old_start\":");
+                            doc.push_str(&hunk.old_start.to_string());
+                            doc.push_str(",\"old_count\":");
+                            doc.push_str(&hunk.old_count.to_string());
+                            doc.push_str(",\"new_start\":");
+                            doc.push_str(&hunk.new_start.to_string());
+                            doc.push_str(",\"new_count\":");
+                            doc.push_str(&hunk.new_count.to_string());
+                            doc.push_str(",\"header\":");
+                            esc(&hunk.header, &mut doc);
+                            doc.push('}');
                         }
-                        doc.push_str("{\"old_start\":");
-                        doc.push_str(&hunk.old_start.to_string());
-                        doc.push_str(",\"old_count\":");
-                        doc.push_str(&hunk.old_count.to_string());
-                        doc.push_str(",\"new_start\":");
-                        doc.push_str(&hunk.new_start.to_string());
-                        doc.push_str(",\"new_count\":");
-                        doc.push_str(&hunk.new_count.to_string());
-                        doc.push_str(",\"header\":");
-                        esc(&hunk.header, &mut doc);
-                        doc.push('}');
+                        doc.push(']');
                     }
-                    doc.push_str("]}");
+                    doc.push_str(",\"class\":");
+                    esc(output.class, &mut doc);
+                    doc.push_str(",\"class_reason\":");
+                    reason_json(output.class_reason, &mut doc);
+                    doc.push_str(",\"risk\":");
+                    doc.push_str(if output.risk { "true" } else { "false" });
+                    doc.push_str(",\"manifest\":");
+                    match &output.manifest {
+                        None => doc.push_str("null"),
+                        Some((signature, deps_changed)) => {
+                            doc.push_str("{\"signature\":");
+                            match signature {
+                                None => doc.push_str("null"),
+                                Some(signature) => esc(signature, &mut doc),
+                            }
+                            doc.push_str(",\"deps_changed\":");
+                            doc.push_str(if *deps_changed { "true" } else { "false" });
+                            doc.push('}');
+                        }
+                    }
+                    doc.push('}');
+                    outputs.push(output);
                 }
                 doc.push(']');
+                let pairs: Vec<(bool, &crate::classify::RowOutput)> = changes
+                    .iter()
+                    .zip(outputs.iter())
+                    .map(|(change, output)| (is_test_path(&change.path), output))
+                    .collect();
+                let (overall, overall_reason, _unmeasurable) = overall_class(&pairs);
+                cls_class = overall;
+                cls_reason = overall_reason;
+                let mut risks: Vec<String> = changes
+                    .iter()
+                    .zip(outputs.iter())
+                    .filter(|(_, output)| output.risk)
+                    .map(|(change, _)| change.path.clone())
+                    .collect();
+                risks.sort();
+                risk_list = Some(risks);
             }
             _ => {
                 changed_reason = Some("baseline-unavailable");
@@ -387,6 +463,16 @@ fn scan_impl(
     }
     doc.push_str(",\"changed_unmeasurable\":");
     reason_json(changed_reason, &mut doc);
+    doc.push_str(",\"change_class\":");
+    reason_json(cls_class, &mut doc);
+    doc.push_str(",\"change_class_reason\":");
+    reason_json(cls_reason, &mut doc);
+    doc.push_str(",\"change_class_unmeasurable\":");
+    reason_json(if risk_list.is_some() { None } else { changed_reason }, &mut doc);
+    doc.push_str(",\"risk_paths\":");
+    names_json(&risk_list, &mut doc);
+    doc.push_str(",\"risk_paths_unmeasurable\":");
+    reason_json(if risk_list.is_some() { None } else { changed_reason }, &mut doc);
 
     // The two deltas, computed and reported separately (ADR-0006).
     let task_delta = match parse_id(task)? {
