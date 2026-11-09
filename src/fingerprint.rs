@@ -16,17 +16,17 @@ use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub(crate) type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-fn err(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
+pub(crate) fn err(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
-fn text(path: &[u8]) -> Res<String> {
+pub(crate) fn text(path: &[u8]) -> Res<String> {
     Ok(std::str::from_utf8(path)?.to_owned())
 }
 
-fn open(root: &str) -> Res<gix::Repository> {
+pub(crate) fn open(root: &str) -> Res<gix::Repository> {
     Ok(gix::open(root)?)
 }
 
@@ -45,7 +45,7 @@ fn plain(path: PathBuf) -> PathBuf {
 }
 
 /// Like Python's `Path.resolve()` for a path whose last component may not exist yet.
-fn real(path: &Path) -> Res<String> {
+pub(crate) fn real(path: &Path) -> Res<String> {
     let resolved: PathBuf = match std::fs::canonicalize(path) {
         Ok(p) => plain(p),
         Err(_) => {
@@ -71,7 +71,7 @@ fn paths_impl(cwd: &str) -> Res<(String, String, String, String, String)> {
 }
 
 /// `worktree list --porcelain` minus the main worktree: each linked worktree's path.
-fn linked_worktrees_impl(root: &str) -> Res<Vec<String>> {
+pub(crate) fn linked_worktrees_impl(root: &str) -> Res<Vec<String>> {
     let repo = open(root)?;
     let mut out = Vec::new();
     for proxy in repo.worktrees()? {
@@ -103,7 +103,7 @@ fn status_platform(repo: &gix::Repository, ignored: bool) -> Res<gix::status::Pl
 
 /// `status --porcelain=v2 -z --untracked-files=all --ignore-submodules=none`, as facts:
 /// whether anything is listed, the untracked paths (directories end in `/`), and submodule states.
-fn status_impl(root: &str, threads: Option<usize>) -> Res<(bool, Vec<String>, Vec<SubmoduleFacts>)> {
+pub(crate) fn status_impl(root: &str, threads: Option<usize>) -> Res<(bool, Vec<String>, Vec<SubmoduleFacts>)> {
     Ok(status_walk(root, threads, false)?.0)
 }
 

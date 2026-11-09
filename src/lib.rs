@@ -22,5 +22,6 @@ pub const ENGINE_API: u32 = 3;
 
 #[pymodule]
 fn prometheus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    fingerprint::register(m)
+    fingerprint::register(m)?;
+    scan::register(m)
 }
