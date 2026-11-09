@@ -1573,9 +1573,16 @@ fn path_tokens(segment: &str) -> BTreeSet<String> {
         pieces.push(run[piece_start..].iter().collect());
         for piece in pieces {
             let folded = casefold(&piece);
-            let stem = &folded[..folded.len().saturating_sub(1)];
-            if folded.len() > 1 && folded.ends_with('s') && RISK_TOKENS.contains(&stem) {
-                found.insert(stem.to_string());
+            // The oracle's `folded[:-1]` slices by char. Strip a trailing
+            // 's' by char as well: a byte slice at len-1 panics inside a
+            // multi-byte char (the 'é' of "café" is bytes 3..5, so byte 4
+            // is not a char boundary).
+            if folded.len() > 1 {
+                if let Some(stem) = folded.strip_suffix('s') {
+                    if RISK_TOKENS.contains(&stem) {
+                        found.insert(stem.to_string());
+                    }
+                }
             }
             found.insert(folded);
         }
@@ -3275,9 +3282,14 @@ fn line_signature(text: &str) -> String {
 
 // ---------------------------------------------------------------------------
 // setup.py: a Python-subset AST builder over the Part 2 token stream,
-// rendered exactly like ast.dump. Anything outside the subset fails
-// (None) — the signature is then unreadable, which the gate treats as a
-// dependency change: wider, never narrower.
+// rendered in the project's canonical AST form — the form the oracle's
+// `_canonical_ast_dump` defines: every field in order; a field omitted
+// exactly when unset and its class default is None; empty collections
+// rendered. NOT the interpreter's ast.dump,
+// whose output changes between versions (3.14 omits empty fields that
+// 3.12 renders). Anything outside the subset fails (None) — the signature
+// is then unreadable, which the gate treats as a dependency change:
+// wider, never narrower.
 
 use std::fmt::Write as _;
 

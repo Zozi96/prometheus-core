@@ -193,6 +193,14 @@ fn is_failing_line(line: &str) -> bool {
 // Write brief's `_repair_command` turns into a targeted rerun.
 
 fn unittest_selector(name: &str, qualifier: &str) -> String {
+    // Python 3.12+ prints the full id, the trailing component included —
+    // also for a failed import, whose qualifier is
+    // `unittest.loader._FailedTest.<module>`. Strip the trailing component
+    // BEFORE the _FailedTest special case, or it never matches and the
+    // selector names the loader instead of the broken module.
+    let qualifier = qualifier
+        .strip_suffix(&format!(".{name}"))
+        .unwrap_or(qualifier);
     if qualifier == "unittest.loader._FailedTest" {
         return format!("{}.py", name.replace('.', "/"));
     }
