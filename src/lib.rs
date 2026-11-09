@@ -10,6 +10,7 @@ use pyo3::prelude::*;
 
 pub mod brief;
 pub mod classify;
+pub mod decide;
 pub mod fingerprint;
 pub mod logs;
 pub mod scan;
@@ -28,5 +29,6 @@ fn prometheus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     scan::register(m)?;
     brief::register(m)?;
     settle::register(m)?;
-    store::register(m)
+    store::register(m)?;
+    decide::register(m)
 }
