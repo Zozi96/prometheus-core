@@ -14,6 +14,7 @@ pub mod fingerprint;
 pub mod logs;
 pub mod scan;
 pub mod settle;
+pub mod store;
 
 /// The engine API this build speaks. The gate runtime loads the module only
 /// when this equals the API it was written against; any other value keeps
@@ -22,5 +23,6 @@ pub const ENGINE_API: u32 = 3;
 
 #[pymodule]
 fn prometheus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    fingerprint::register(m)
+    fingerprint::register(m)?;
+    store::register(m)
 }
