@@ -8,11 +8,27 @@ description = "In-process deterministic engine for the Prometheus gate: tree fin
 
 [lib]
 name = "prometheus_core"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "prometheus-hook"
+path = "src/bin/prometheus-hook.rs"
 
 [dependencies]
 pyo3 = { version = "=0.30.1", features = ["abi3-py39", "generate-import-lib"] }
 gix = { version = "=0.89.0", default-features = false, features = ["sha1", "parallel", "status", "dirwalk", "index", "excludes", "attributes"] }
+# The hook fast path (ticket #51) speaks the hosts' JSON hook protocol on
+# stdin/stdout; std has no JSON, so serde_json is the parser of record.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SHA-256 is baked into two Python-defined formats the fast path must match
+# byte for byte: read-warning state keys and Droid writer label keys. gix
+# hashes git objects (SHA-1), not these.
+sha2 = "0.10"
+# getuid() for the per-user session directory (parity with the Python
+# runtime's record_path/secure_dir). Unix only.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 lto = "thin"

@@ -11,6 +11,7 @@ use pyo3::prelude::*;
 pub mod brief;
 pub mod classify;
 pub mod fingerprint;
+pub mod hooks;
 pub mod logs;
 pub mod scan;
 pub mod settle;
