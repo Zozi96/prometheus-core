@@ -26,5 +26,6 @@ fn prometheus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     fingerprint::register(m)?;
     logs::register(m)?;
     scan::register(m)?;
-    store::register(m)
+    store::register(m)?;
+    brief::register(m)
 }
