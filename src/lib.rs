@@ -2,9 +2,9 @@
 //!
 //! One engine, one seam: the Python gate runtime negotiates `ENGINE_API`
 //! and either calls these primitives in process or reruns the whole call on
-//! its own route. Today the engine owns the tree fingerprint; the scan,
-//! classification, log-parsing, brief, and settlement modules are scaffolded
-//! beside it and land one ticket at a time under spec #43 / ADR-0007.
+//! its own route. The engine owns the tree fingerprint and, under spec #43 /
+//! ADR-0007, the scan, classification, impact, log-parsing, receipt-store,
+//! brief, settlement, and decide modules plus the `prometheus-hook` binary.
 
 use pyo3::prelude::*;
 
@@ -22,7 +22,7 @@ pub mod store;
 /// The engine API this build speaks. The gate runtime loads the module only
 /// when this equals the API it was written against; any other value keeps
 /// the runtime on its own route.
-pub const ENGINE_API: u32 = 3;
+pub const ENGINE_API: u32 = 4;
 
 #[pymodule]
 fn prometheus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {

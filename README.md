@@ -3,7 +3,7 @@
 The in-process deterministic engine for the Prometheus gate (SureForge procedure).
 
 One Rust crate, exposed to Python as the `prometheus_core` module (PyO3, abi3).
-The gate runtime negotiates `ENGINE_API` (currently 3): when the module loads
+The gate runtime negotiates `ENGINE_API` (currently 4): when the module loads
 and the API matches, it answers in process; on any failure the runtime reruns
 the whole call on its own git CLI route.
 
@@ -11,11 +11,15 @@ the whole call on its own git CLI route.
 
 - `fingerprint` — the tree fingerprint: in-process git primitives (status,
   tracked files, excludes, staging into a private object store).
-- `scan` — unified tree scan (scaffold; lands with the scan tickets of spec #43).
-- `classify` — change-class support for the scan (scaffold).
-- `logs` — test-log parsing into normalized receipts (scaffold).
-- `brief` — review/write brief construction (scaffold).
-- `settle` — findings and evidence settlement (scaffold).
+- `scan` — unified tree scan.
+- `classify` — change-class support for the scan.
+- `impact` — impact graph and targeted selection.
+- `logs` — test-log parsing into normalized receipts.
+- `store` — receipt store and check slot.
+- `brief` — review/write brief construction.
+- `settle` — findings and evidence settlement.
+- `decide` — gate decision evaluation.
+- `hooks` / `prometheus-hook` — fast-path host hook binary.
 
 ## Releases
 
