@@ -5,10 +5,14 @@
 //! its own route. The engine owns the tree fingerprint and, under spec #43 /
 //! ADR-0007, the scan, classification, impact, log-parsing, receipt-store,
 //! brief, settlement, and decide modules plus the `prometheus-hook` binary.
+//! Under ADR-0010 the `check` module and the `prometheus-check` binary are
+//! the standalone check runner over the same primitives, with no Python
+//! gate runtime involved.
 
 use pyo3::prelude::*;
 
 pub mod brief;
+pub mod check;
 pub mod classify;
 pub mod decide;
 pub mod fingerprint;

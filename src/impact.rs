@@ -1249,6 +1249,19 @@ fn impact(
     py.detach(|| impact_impl(&root, &changed, &tests, &cargo_json)).map_err(err)
 }
 
+/// The impact document for the standalone `prometheus-check` runner
+/// (ADR-0010): the same JSON the Python route receives. `tests` is the
+/// discovered test-file listing, or `None` when discovery failed — the
+/// document then widens fail-closed and records why.
+pub fn impact_document(
+    root: &str,
+    changed: &[String],
+    tests: Option<Vec<String>>,
+    cargo_json: &str,
+) -> Option<String> {
+    impact_impl(root, changed, &tests, cargo_json).ok()
+}
+
 /// Register the impact graph on the `prometheus_core` module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(impact, m)?)?;

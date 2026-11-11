@@ -1246,6 +1246,20 @@ fn head_tree(py: Python<'_>, root: String) -> PyResult<Option<String>> {
     py.detach(|| head_tree_impl(&root)).map_err(err)
 }
 
+/// Tree fingerprint of a working tree for the standalone `prometheus-check`
+/// runner (ADR-0010): the same staging the Python route uses, with no
+/// exclusions and no manifest. `None` when the engine refuses the tree
+/// (embedded repository, oversized no-git folder, not a repository gix can
+/// open); the runner fails closed instead of inventing an identity.
+pub fn worktree_fingerprint(root: &str, store: &str) -> Option<String> {
+    stage_and_write_impl(root, store, Vec::new(), Vec::new(), None).ok()
+}
+
+/// The HEAD tree id of the repository at `root`, for the standalone runner.
+pub fn head_tree_id(root: &str) -> Option<String> {
+    head_tree_impl(root).ok().flatten()
+}
+
 /// Register every fingerprint primitive on the `prometheus_core` module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ENGINE_API", crate::ENGINE_API)?;

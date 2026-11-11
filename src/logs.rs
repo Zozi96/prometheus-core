@@ -1058,6 +1058,15 @@ fn parse_check_log(text: &str, exit_code: Option<i64>) -> String {
     }
 }
 
+/// The parsed check-log document for the standalone `prometheus-check`
+/// runner (ADR-0010): the same JSON `parse_check_log` returns to Python.
+pub fn parse_document(text: &str, exit_code: Option<i64>) -> String {
+    match std::panic::catch_unwind(|| parse_impl(text, exit_code)) {
+        Ok(document) => document,
+        Err(_) => receipt_json(None, Some("no-summary"), &[], &[]),
+    }
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_check_log, m)?)?;
     Ok(())

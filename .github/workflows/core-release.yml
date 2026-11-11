@@ -63,6 +63,20 @@ jobs:
         shell: bash
         run: |
           python -c "import sys; sys.path.insert(0, 'module'); import prometheus_core; print('ENGINE_API', prometheus_core.ENGINE_API)"
+      # The standalone prometheus-check runner (ADR-0010) ships beside the
+      # module: a native binary per platform, built on the runner (not in
+      # the manylinux container — it links no Python).
+      - name: Build prometheus-check
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Package prometheus-check
+        shell: bash
+        run: |
+          cargo build --release --target "${{ matrix.target }}" --bin prometheus-check
+          ext=""
+          if [ "${{ matrix.ext }}" = "pyd" ]; then ext=".exe"; fi
+          cp "target/${{ matrix.target }}/release/prometheus-check$ext" "upload/prometheus-check-${{ matrix.platform }}$ext"
       - uses: actions/upload-artifact@v7
         with:
           name: prometheus_core-${{ matrix.platform }}
@@ -86,9 +100,9 @@ jobs:
         run: |
           cd assets
           ls -la
-          test "$(ls | wc -l)" -eq 6
+          test "$(ls | wc -l)" -eq 12
           {
-            echo "prometheus_core modules for runtime/prometheus_core.lock (ENGINE_API 3)."
+            echo "prometheus_core modules for runtime/prometheus_core.lock, plus prometheus-check binaries for runtime/install_check.py."
             echo
             echo '```'
             sha256sum -- *

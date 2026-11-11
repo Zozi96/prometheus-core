@@ -20,6 +20,10 @@ the whole call on its own git CLI route.
 - `settle` — findings and evidence settlement.
 - `decide` — gate decision evaluation.
 - `hooks` / `prometheus-hook` — fast-path host hook binary.
+- `check` / `prometheus-check` — the standalone check runner (ADR-0010):
+  targeted selection over the impact graph, the host-wide check slot with
+  bounded footprint, iteration-profile handling, and green receipts, with
+  no Python gate runtime involved.
 
 ## Releases
 
