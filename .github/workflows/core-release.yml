@@ -41,6 +41,18 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'off' }}
           args: --release --out dist
+          # Linux only: the standalone runner is built in this same manylinux
+          # container, so it references no newer glibc than the module does.
+          # The binary stays in target/ for the packaging step below.
+          before-script-linux: |
+            set -euo pipefail
+            export PATH="$HOME/.cargo/bin:$PATH"
+            cargo build --release --no-default-features --target "${{ matrix.target }}" --bin prometheus-check
+            bin="target/${{ matrix.target }}/release/prometheus-check"
+            "$bin" --version
+            max="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n1)"
+            echo "highest GLIBC version referenced: ${max:-none}"
+            test "$(printf '%s\n' "${max:-0}" 2.17 | sort -V | tail -n1)" = "2.17"
       - name: Extract the module
         shell: bash
         run: |
@@ -64,19 +76,39 @@ jobs:
         run: |
           python -c "import sys; sys.path.insert(0, 'module'); import prometheus_core; print('ENGINE_API', prometheus_core.ENGINE_API)"
       # The standalone prometheus-check runner (ADR-0010) ships beside the
-      # module: a native binary per platform, built on the runner (not in
-      # the manylinux container — it links no Python).
-      - name: Build prometheus-check
+      # module and links no Python. Linux builds it in the manylinux
+      # container above; macOS and Windows build it here.
+      - name: Install Rust for prometheus-check
+        if: runner.os != 'Linux'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - name: Package prometheus-check
         shell: bash
         run: |
-          cargo build --release --target "${{ matrix.target }}" --bin prometheus-check
+          if [ "$RUNNER_OS" != "Linux" ]; then
+            cargo build --release --no-default-features --target "${{ matrix.target }}" --bin prometheus-check
+          fi
           ext=""
           if [ "${{ matrix.ext }}" = "pyd" ]; then ext=".exe"; fi
           cp "target/${{ matrix.target }}/release/prometheus-check$ext" "upload/prometheus-check-${{ matrix.platform }}$ext"
+      # The binary must run on its own: no Python on the library path, and
+      # the version it reports must be the crate's.
+      - name: Smoke-test prometheus-check
+        if: matrix.test
+        shell: bash
+        run: |
+          ext=""
+          if [ "${{ matrix.ext }}" = "pyd" ]; then ext=".exe"; fi
+          bin="upload/prometheus-check-${{ matrix.platform }}$ext"
+          chmod +x "$bin"
+          version="$("$bin" --version)"
+          echo "$version"
+          expected="prometheus-check $(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          test "$version" = "$expected"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            ! ldd "$bin" | grep -qi libpython
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: prometheus_core-${{ matrix.platform }}

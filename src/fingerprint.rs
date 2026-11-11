@@ -5,6 +5,10 @@
 //! git's text. Any failure raises, and the caller then reruns the whole
 //! fingerprint on the git CLI.
 
+// The Python bindings are this module's only callers of most primitives;
+// the native build keeps them compiled and tested but leaves them unused.
+#![cfg_attr(not(feature = "python"), allow(dead_code))]
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -13,11 +17,14 @@ use gix::dir::entry::{Kind, Status as DirStatus};
 use gix::dir::walk::EmissionMode;
 use gix::status::index_worktree::Item as WorktreeItem;
 use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
+#[cfg(feature = "python")]
 use pyo3::exceptions::PyRuntimeError;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 pub(crate) type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+#[cfg(feature = "python")]
 pub(crate) fn err(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
@@ -1017,6 +1024,7 @@ fn nogit_impl(root: &str, git_dir: &str, store: &str, max_files: usize) -> Res<(
     })
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (root, store, exclude, info_only, manifest=None))]
 fn stage_and_write(
@@ -1183,12 +1191,14 @@ fn preflight_impl(root: &str, max_entries: usize, nogit: bool) -> Res<(String, S
     Ok(("inprocess".to_owned(), String::new()))
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (root, max_entries, nogit=false))]
 fn preflight(py: Python<'_>, root: String, max_entries: usize, nogit: bool) -> PyResult<(String, String)> {
     py.detach(|| preflight_impl(&root, max_entries, nogit)).map_err(err)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn nogit_stage_and_write(
     py: Python<'_>,
@@ -1200,47 +1210,56 @@ fn nogit_stage_and_write(
     py.detach(|| nogit_impl(&root, &git_dir, &store, max_files)).map_err(err)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn paths(py: Python<'_>, cwd: String) -> PyResult<(String, String, String, String, String)> {
     py.detach(|| paths_impl(&cwd)).map_err(err)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn linked_worktrees(py: Python<'_>, root: String) -> PyResult<Vec<String>> {
     py.detach(|| linked_worktrees_impl(&root)).map_err(err)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (root, threads=None))]
 fn status(py: Python<'_>, root: String, threads: Option<usize>) -> PyResult<(bool, Vec<String>, Vec<SubmoduleFacts>)> {
     py.detach(|| status_impl(&root, threads)).map_err(err)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn status_and_ignored(py: Python<'_>, root: String) -> PyResult<(StatusFacts, Vec<String>)> {
     py.detach(|| status_walk(&root, None, true)).map_err(err)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn tracked_special(py: Python<'_>, root: String) -> PyResult<Vec<Tracked>> {
     py.detach(|| tracked_special_impl(&root)).map_err(err)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn tracked(py: Python<'_>, root: String) -> PyResult<Vec<Tracked>> {
     py.detach(|| tracked_impl(&root)).map_err(err)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn ignored_untracked(py: Python<'_>, root: String) -> PyResult<Vec<String>> {
     py.detach(|| ignored_untracked_impl(&root)).map_err(err)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn outside_excluded(py: Python<'_>, root: String, entries: Vec<String>, info_exclude: String) -> PyResult<Vec<String>> {
     py.detach(|| outside_excluded_impl(&root, entries, &info_exclude)).map_err(err)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn head_tree(py: Python<'_>, root: String) -> PyResult<Option<String>> {
     py.detach(|| head_tree_impl(&root)).map_err(err)
@@ -1256,6 +1275,7 @@ pub fn worktree_fingerprint(root: &str, store: &str) -> Option<String> {
 }
 
 /// Register every fingerprint primitive on the `prometheus_core` module.
+#[cfg(feature = "python")]
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ENGINE_API", crate::ENGINE_API)?;
     m.add_function(wrap_pyfunction!(preflight, m)?)?;

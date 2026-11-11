@@ -1,0 +1,56 @@
+name: check
+
+# Pull-request checks for the Rust engine and the standalone runner. The
+# native job builds and tests without the python feature, so it proves the
+# binaries need no libpython; the python job keeps the default feature and
+# its module exports compiling.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: native ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test without the python feature
+        run: cargo test --no-default-features
+      - name: Build the native binaries
+        run: cargo build --no-default-features --bins
+      - name: Standalone version
+        shell: bash
+        run: |
+          ext=""
+          if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          version="$(target/debug/prometheus-check$ext --version)"
+          echo "$version"
+          expected="prometheus-check $(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          test "$version" = "$expected"
+      - name: No libpython on Linux
+        if: runner.os == 'Linux'
+        run: |
+          ! ldd target/debug/prometheus-check | grep -qi libpython
+          ! ldd target/debug/prometheus-hook | grep -qi libpython
+
+  python:
+    name: python feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check the default feature set
+        run: cargo check --all-targets

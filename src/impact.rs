@@ -22,10 +22,13 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 use crate::classify::is_test_path;
-use crate::fingerprint::{err, open, status_impl, text, Res};
+#[cfg(feature = "python")]
+use crate::fingerprint::err;
+use crate::fingerprint::{open, status_impl, text, Res};
 
 const SCHEMA: u32 = 1;
 
@@ -1238,6 +1241,7 @@ fn selection(
     (level, vec![], vec![], vec![], module_target.clone(), reasons)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn impact(
     py: Python<'_>,
@@ -1263,6 +1267,7 @@ pub fn impact_document(
 }
 
 /// Register the impact graph on the `prometheus_core` module.
+#[cfg(feature = "python")]
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(impact, m)?)?;
     Ok(())

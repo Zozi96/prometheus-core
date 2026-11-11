@@ -19,12 +19,19 @@
 //! the Python route would skip (unparseable, not an object) is skipped here
 //! too, and returned rows are the very objects that parser produced.
 
+#[cfg(feature = "python")]
 use pyo3::exceptions::PyRuntimeError;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::{PyBool, PyDict, PyInt, PyList};
-use std::collections::{BTreeMap, HashMap};
+#[cfg(feature = "python")]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "python")]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,8 +42,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const STORE_SCHEMA: u32 = 1;
 
 const SLOT_POLL: Duration = Duration::from_millis(20);
+#[cfg(feature = "python")]
 const PROMPT_EVENTS: [&str; 2] = ["userpromptsubmit", "beforesubmitprompt"];
 
+#[cfg(feature = "python")]
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
@@ -49,12 +58,14 @@ fn err<E: std::fmt::Display>(e: E) -> PyErr {
 // decode failure must surface here as an error and let the Python route
 // reproduce its own behaviour.
 
+#[cfg(feature = "python")]
 enum TextRead {
     Text(String),
     Absent,
     Undecodable,
 }
 
+#[cfg(feature = "python")]
 fn read_text(path: &Path) -> TextRead {
     match std::fs::read(path) {
         Ok(bytes) => match String::from_utf8(bytes) {
@@ -65,6 +76,7 @@ fn read_text(path: &Path) -> TextRead {
     }
 }
 
+#[cfg(feature = "python")]
 fn parse_jsonl(py: Python<'_>, text: &str) -> PyResult<Vec<Py<PyDict>>> {
     let loads = py.import("json")?.getattr("loads")?;
     let mut rows = Vec::new();
@@ -78,6 +90,7 @@ fn parse_jsonl(py: Python<'_>, text: &str) -> PyResult<Vec<Py<PyDict>>> {
     Ok(rows)
 }
 
+#[cfg(feature = "python")]
 fn receipt_rows(py: Python<'_>, path: &Path) -> PyResult<Vec<Py<PyDict>>> {
     match read_text(path) {
         TextRead::Text(text) => parse_jsonl(py, &text),
@@ -85,6 +98,7 @@ fn receipt_rows(py: Python<'_>, path: &Path) -> PyResult<Vec<Py<PyDict>>> {
     }
 }
 
+#[cfg(feature = "python")]
 fn usage_rows(py: Python<'_>, session_dir: &Path) -> PyResult<Vec<Py<PyDict>>> {
     match read_text(&session_dir.join("usage.jsonl")) {
         TextRead::Text(text) => parse_jsonl(py, &text),
@@ -97,34 +111,41 @@ fn usage_rows(py: Python<'_>, session_dir: &Path) -> PyResult<Vec<Py<PyDict>>> {
 // Value helpers with Python semantics (identity for `is True`, truthiness
 // for `or`, the `int()` builtin for conversion).
 
+#[cfg(feature = "python")]
 fn get<'py>(row: &Bound<'py, PyDict>, key: &str) -> Option<Bound<'py, PyAny>> {
     row.get_item(key).ok().flatten()
 }
 
+#[cfg(feature = "python")]
 fn as_str(value: &Bound<'_, PyAny>) -> Option<String> {
     value.extract::<String>().ok()
 }
 
+#[cfg(feature = "python")]
 fn str_field_is(row: &Bound<'_, PyDict>, key: &str, want: &str) -> bool {
     get(row, key).and_then(|value| as_str(&value)).as_deref() == Some(want)
 }
 
+#[cfg(feature = "python")]
 fn is_true(value: &Bound<'_, PyAny>) -> bool {
     // `value is True`: identity, so 1 and "yes" do not count.
     value.is_instance_of::<PyBool>() && value.extract::<bool>().unwrap_or(false)
 }
 
+#[cfg(feature = "python")]
 fn is_exact_int(value: &Bound<'_, PyAny>) -> bool {
     // `type(value) is int`: bool is a subclass and does not count.
     value.is_exact_instance_of::<PyInt>()
 }
 
+#[cfg(feature = "python")]
 fn truthy(value: &Bound<'_, PyAny>) -> bool {
     value.is_truthy().unwrap_or(false)
 }
 
 /// `int(value or 0)`, through the builtin so float truncation and string
 /// errors behave exactly as the Python route's.
+#[cfg(feature = "python")]
 fn int_or_zero(py: Python<'_>, value: Option<Bound<'_, PyAny>>) -> PyResult<i64> {
     match value {
         Some(value) if truthy(&value) => Ok(py
@@ -151,7 +172,7 @@ const SHA256_K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut state: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
     ];
@@ -209,6 +230,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     state.iter().map(|word| format!("{word:08x}")).collect()
 }
 
+#[cfg(feature = "python")]
 fn file_sha256_hex(path: &Path) -> Option<String> {
     std::fs::read(path).ok().map(|bytes| sha256_hex(&bytes))
 }
@@ -222,6 +244,7 @@ fn file_sha256_hex(path: &Path) -> Option<String> {
 // runner origin) to these candidates and takes the latest that passes —
 // exactly the rows, in exactly the order, its own scan would visit.
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn store_green_candidates(
     py: Python<'_>,
@@ -296,6 +319,7 @@ fn store_green_candidates(
 // reports no match then, definitively. The caller still applies the
 // recognized-command / exit-only filter and takes the latest.
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn store_log_candidates(
     py: Python<'_>,
@@ -338,6 +362,7 @@ fn store_log_candidates(
 // Receipt aggregation: receipt_report over the rows of any number of
 // session receipt files, in one call, instead of a re-scan per process.
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn store_receipt_report(py: Python<'_>, paths: Vec<String>) -> PyResult<Py<PyDict>> {
     let mut native: i64 = 0;
@@ -401,6 +426,7 @@ fn store_receipt_report(py: Python<'_>, paths: Vec<String>) -> PyResult<Py<PyDic
 // segment's last Stop row; segments end at prompt-submit rows, and a final
 // synthetic prompt row closes the trailing segment, as in the oracle.
 
+#[cfg(feature = "python")]
 struct ClosureAgg {
     by_tier_class: BTreeMap<String, i64>,
     attempts_sum: i64,
@@ -410,6 +436,7 @@ struct ClosureAgg {
     standard_not_ready: i64,
 }
 
+#[cfg(feature = "python")]
 impl ClosureAgg {
     fn flush(&mut self, py: Python<'_>, segment: &[Py<PyDict>]) {
         let segment: Vec<Bound<'_, PyDict>> = segment.iter().map(|row| row.bind(py).clone()).collect();
@@ -439,6 +466,7 @@ impl ClosureAgg {
     }
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn store_closure_report(py: Python<'_>, session_dirs: Vec<String>) -> PyResult<Py<PyDict>> {
     let mut agg = ClosureAgg {
@@ -508,7 +536,9 @@ static SLOTS: Mutex<Option<HashMap<u64, File>>> = Mutex::new(None);
 pub enum SlotOutcome {
     Acquired(u64, f64),
     Timeout(f64, Vec<u8>),
-    Unavailable,
+    /// The slot could not be taken at all (directory or lock file unusable);
+    /// the text names why. Not contention, and not success.
+    Unavailable(String),
 }
 
 /// Acquire the host-wide Check slot for a native caller (the
@@ -595,6 +625,106 @@ fn slot_meta_json(session_id: &str, host: &str, command: &[String]) -> String {
     )
 }
 
+/// Create `dir` owner-only, or validate an existing one: a real directory
+/// (never a symlink) owned by this user with no group or world access. An
+/// `AlreadyExists` race with another creator is validated, not trusted.
+pub fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+    let refuse = |why: &str| Err(format!("unsafe directory {}: {why}", dir.display()));
+    let io = |error: std::io::Error| format!("{}: {error}", dir.display());
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match create_private_dir(dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(io(error)),
+            }
+            std::fs::symlink_metadata(dir).map_err(io)?
+        }
+        Err(error) => return Err(io(error)),
+    };
+    if meta.file_type().is_symlink() {
+        return refuse("it is a symlink");
+    }
+    if !meta.is_dir() {
+        return refuse("it is not a directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != unsafe { libc::getuid() } {
+            return refuse("it belongs to another user");
+        }
+        if meta.mode() & 0o077 != 0 {
+            return refuse("it is accessible to group or others");
+        }
+    }
+    Ok(())
+}
+
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(dir)
+    }
+}
+
+/// Open a slot file without following a symlink and require a regular
+/// file owned by this user. `private` also demands no group or world
+/// access (the lock file; the metadata file's mode is the writer's).
+fn open_slot_file(path: &Path, create: bool, write: bool, private: bool) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(write).create(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(path)?;
+        let meta = file.metadata()?;
+        let unsafe_file = !meta.is_file()
+            || meta.uid() != unsafe { libc::getuid() }
+            || meta.nlink() != 1
+            || (private && meta.mode() & 0o077 != 0);
+        if unsafe_file {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "not a private regular file owned by this user",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = private;
+        options.open(path)
+    }
+}
+
+fn read_slot_meta(path: &Path) -> Vec<u8> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    if let Ok(mut file) = open_slot_file(path, false, false, false) {
+        let _ = file.read_to_end(&mut bytes);
+    }
+    bytes
+}
+
+/// Rewrite the holder metadata through a checked handle: a symlink or a
+/// foreign file is left untouched, and the slot is kept either way.
+fn write_slot_meta(path: &Path, text: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = open_slot_file(path, true, true, false) {
+        if file.set_len(0).is_ok() {
+            let _ = file.write_all(text.as_bytes());
+        }
+    }
+}
+
 fn slot_acquire_impl(
     lock_path: &Path,
     meta_path: &Path,
@@ -604,24 +734,15 @@ fn slot_acquire_impl(
     timeout_s: f64,
 ) -> SlotOutcome {
     if let Some(parent) = lock_path.parent() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            let _ = std::fs::DirBuilder::new().mode(0o700).create(parent);
+        if let Err(why) = ensure_private_dir(parent) {
+            return SlotOutcome::Unavailable(why);
         }
-        #[cfg(not(unix))]
-        let _ = std::fs::create_dir_all(parent);
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = match options.open(lock_path) {
+    let file = match open_slot_file(lock_path, true, true, true) {
         Ok(file) => file,
-        Err(_) => return SlotOutcome::Unavailable,
+        Err(error) => {
+            return SlotOutcome::Unavailable(format!("lock file {}: {error}", lock_path.display()))
+        }
     };
     let started = Instant::now();
     loop {
@@ -632,7 +753,7 @@ fn slot_acquire_impl(
                 // nonblocking attempt returns False for both and polls on.
                 let waited = started.elapsed().as_secs_f64();
                 if waited >= timeout_s {
-                    let meta = std::fs::read(meta_path).unwrap_or_default();
+                    let meta = read_slot_meta(meta_path);
                     return SlotOutcome::Timeout(waited, meta);
                 }
                 std::thread::sleep(SLOT_POLL);
@@ -642,7 +763,7 @@ fn slot_acquire_impl(
     let waited = started.elapsed().as_secs_f64();
     // A contender that times out names what it can: a failed metadata
     // write never loses the slot.
-    let _ = std::fs::write(meta_path, slot_meta_json(session_id, host, command));
+    write_slot_meta(meta_path, &slot_meta_json(session_id, host, command));
     let token = SLOT_COUNTER.fetch_add(1, Ordering::Relaxed);
     slots()
         .get_or_insert_with(HashMap::new)
@@ -650,6 +771,7 @@ fn slot_acquire_impl(
     SlotOutcome::Acquired(token, waited)
 }
 
+#[cfg(feature = "python")]
 fn parse_holder(py: Python<'_>, meta: &[u8]) -> Py<PyAny> {
     let empty = || PyDict::new(py).unbind().into_any();
     let text = match std::str::from_utf8(meta) {
@@ -666,6 +788,7 @@ fn parse_holder(py: Python<'_>, meta: &[u8]) -> Py<PyAny> {
     }
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn store_slot_acquire(
     py: Python<'_>,
@@ -698,18 +821,20 @@ fn store_slot_acquire(
             result.set_item("waited", waited)?;
             result.set_item("holder", parse_holder(py, &meta))?;
         }
-        SlotOutcome::Unavailable => {
+        SlotOutcome::Unavailable(_) => {
             result.set_item("status", "unavailable")?;
         }
     }
     Ok(result.unbind())
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn store_slot_release(token: u64) -> bool {
     release_slot(token)
 }
 
+#[cfg(feature = "python")]
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("STORE_SCHEMA", STORE_SCHEMA)?;
     m.add_function(wrap_pyfunction!(store_green_candidates, m)?)?;

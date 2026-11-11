@@ -25,6 +25,13 @@ the whole call on its own git CLI route.
   bounded footprint, iteration-profile handling, and green receipts, with
   no Python gate runtime involved.
 
+## Building
+
+The default `python` feature builds the `prometheus_core` module. The native
+binaries need no Python: build and test them with
+`cargo build --release --no-default-features --bins` and
+`cargo test --no-default-features`.
+
 ## Releases
 
 Pushing a `core-v*` tag runs the `core-release` workflow, which builds the
@@ -32,6 +39,10 @@ module for six platforms and publishes them as release assets. The parent
 repo's `runtime/prometheus_core.lock` records the tag and each asset's sha256;
 its installer verifies the checksum and the `ENGINE_API` before keeping a
 download.
+
+The Linux `prometheus-check` binaries are built in the same manylinux2014
+container as the module, and the build fails if they reference a glibc newer
+than 2.17.
 
 ## Parity
 

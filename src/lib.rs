@@ -9,17 +9,22 @@
 //! the standalone check runner over the same primitives, with no Python
 //! gate runtime involved.
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
+#[cfg(feature = "python")]
 pub mod brief;
 pub mod check;
 pub mod classify;
+#[cfg(feature = "python")]
 pub mod decide;
 pub mod fingerprint;
 pub mod hooks;
 pub mod impact;
 pub mod logs;
+#[cfg(feature = "python")]
 pub mod scan;
+#[cfg(feature = "python")]
 pub mod settle;
 pub mod store;
 
@@ -28,6 +33,7 @@ pub mod store;
 /// the runtime on its own route.
 pub const ENGINE_API: u32 = 4;
 
+#[cfg(feature = "python")]
 #[pymodule]
 fn prometheus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     fingerprint::register(m)?;
