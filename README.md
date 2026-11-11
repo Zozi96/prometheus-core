@@ -1,11 +1,11 @@
 # prometheus-core
 
-The in-process deterministic engine for the Prometheus gate (SureForge procedure).
+The deterministic engine behind `prometheus-check` and the `PreToolUse` hook
+fast path (ADR-0010).
 
-One Rust crate, exposed to Python as the `prometheus_core` module (PyO3, abi3).
-The gate runtime negotiates `ENGINE_API` (currently 4): when the module loads
-and the API matches, it answers in process; on any failure the runtime reruns
-the whole call on its own git CLI route.
+One Rust crate. The optional `python` feature exposes a `prometheus_core`
+module (PyO3, abi3) for the scan primitives; the native binaries never load
+Python and are what Prometheus actually installs.
 
 ## Modules
 
@@ -16,9 +16,6 @@ the whole call on its own git CLI route.
 - `impact` — impact graph and targeted selection.
 - `logs` — test-log parsing into normalized receipts.
 - `store` — receipt store and check slot.
-- `brief` — review/write brief construction.
-- `settle` — findings and evidence settlement.
-- `decide` — gate decision evaluation.
 - `hooks` / `prometheus-hook` — fast-path host hook binary.
 - `check` / `prometheus-check` — the standalone check runner (ADR-0010):
   targeted selection over the impact graph, the host-wide check slot with
@@ -47,5 +44,5 @@ than 2.17.
 ## Parity
 
 `parity_fuzz.py` differentially tests the fingerprint primitives against
-`git add -A` + `git write-tree` over randomized trees. It expects this repo
-checked out as the `core/` submodule of the Prometheus parent.
+`git add -A` + `git write-tree` over randomized trees. It needs only the
+`prometheus_core` module and git; there is no Python runtime oracle.
