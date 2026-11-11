@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 publish = false
 license = "MIT"
-description = "In-process deterministic engine for the Prometheus gate: tree fingerprint and core git primitives."
+description = "Deterministic engine for the Prometheus check runner and hook fast path."
 
 [lib]
 name = "prometheus_core"

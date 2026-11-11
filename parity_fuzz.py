@@ -16,13 +16,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "runtime"))
 import prometheus_core as core  # noqa: E402
-import sureforge_hook as hook  # noqa: E402
 
 NAMES = ["a", "a.txt", "a-", "a0", "a.b", "b", "B", "x y", "ü.txt", "z", "dir", "dir.txt", "dir-"]
 CATEGORIES = {
@@ -34,12 +32,7 @@ CATEGORIES = {
     "staged": {"stage": True},
     "untracked-hidden": {"config": [("status.showUntrackedFiles", "no")]},
     "symlinks-off": {"config": [("core.symlinks", "false")]},
-    # Whole fingerprint, both engines: tracked rules with negations plus outside excludes.
-    "gitignore-outside": {"outside": True},
 }
-TRACKED_RULES = ["*.b", "!keep.b", "dir/", "!dir/a", "!a", "a0", "x y/", "*.dat", "!z", "dir/*", "!dir/a.txt", "!*.b", "!a?", "!dir/a0", "!dir/dir", "!dir/\u00fc.txt"]
-OUTSIDE_RULES = ["*.b", "keep.b", "dir/", "a", "a.txt", "**/z", "B", "x y/", "dir/a", "*.txt", "a0/", "dir", "x y", "dir/x y",
-                 "dir/**/a", "**/dir/a", "dir/**", "dir/a0/*.txt", "?????", "a?", "*.txt "]
 
 
 def git(root, *args, env=None):
@@ -97,15 +90,6 @@ def build(root, rng, spec):
         git(root, "config", key, value)
     if "attributes" in spec:
         (root / ".gitattributes").write_text(spec["attributes"])
-    if spec.get("outside"):
-        (root / ".gitignore").write_text("\n".join(rng.sample(TRACKED_RULES, rng.randrange(1, 6))) + "\n")
-        info = root / ".git" / "info" / "exclude"
-        info.parent.mkdir(exist_ok=True)
-        info.write_text("\n".join(rng.sample(OUTSIDE_RULES, rng.randrange(0, 4))) + "\n")
-        if rng.random() < 0.5:
-            other = Path(os.environ["HOME"]) / f"ignore-{rng.randrange(10**9)}"
-            other.write_text("\n".join(rng.sample(OUTSIDE_RULES, rng.randrange(1, 4))) + "\n")
-            git(root, "config", "core.excludesFile", str(other))
     if spec.get("gitignore"):
         rules = rng.sample(["*.b", "!keep.b", "dir/", "a0", "x y/", "*.dat", "!dir/a"], rng.randrange(1, 5))
         (root / ".gitignore").write_text("\n".join(rules) + "\n")
@@ -113,10 +97,6 @@ def build(root, rng, spec):
         place(root, rel(rng), rng, "link" if rng.random() < 0.1 else "file")
     git(root, "add", "-A")
     git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base", "--allow-empty")
-    if spec.get("outside") and rng.random() < 0.3:
-        tracked = tracked_paths(root)
-        if len({path.lower() for path in tracked}) == len(tracked):  # `b` and `B` cannot both exist where it is true
-            git(root, "config", "core.ignoreCase", "true")
 
 
 def mutate(root, rng, spec):
@@ -157,29 +137,6 @@ def cli_tree(root, tmp):
     return git(root, "-c", "core.splitIndex=false", "write-tree", "--missing-ok", env=env)
 
 
-def compare_engines(root):
-    """'same', 'routed', 'error: ...', or 'cli answer|other answer' for the whole fingerprint.
-
-    The CLI answer is first checked against git with the outside-exclude prefilter off: a
-    prefilter that skips a source git would list from is unsound.
-    """
-    top = str(root)
-    cli_errors, oracle_errors = [], []
-    expected = (hook._git_fingerprint(top, None, cli_errors, hook._CLI), cli_errors)
-    with unittest.mock.patch.object(hook, "_exclude_might_match", lambda *_, **__: True):
-        oracle = (hook._git_fingerprint(top, None, oracle_errors, hook._CLI), oracle_errors)
-    if oracle != expected:
-        return f"{oracle}|prefilter {expected}"
-    if core.preflight(top, hook.INPROCESS_MAX_ENTRIES)[0] != "inprocess":
-        return "routed"
-    core_errors = []
-    try:
-        got = (hook._git_fingerprint(top, None, core_errors, hook._InProcess(core)), core_errors)
-    except RuntimeError as exc:
-        return f"error: {exc}"
-    return "same" if got == expected else f"{expected}|{got}"
-
-
 def run(category, spec, iterations, seed):
     failures, routed, fell_back = [], 0, []
     for i in range(iterations):
@@ -189,15 +146,6 @@ def run(category, spec, iterations, seed):
             root = Path(tmp) / "r"
             build(root, rng, spec)
             mutate(root, rng, spec)
-            if spec.get("outside"):
-                outcome = compare_engines(root)
-                if outcome == "routed":
-                    routed += 1
-                elif outcome.startswith("error: "):
-                    fell_back.append((case, outcome[7:]))
-                elif outcome != "same":
-                    failures.append((case, *outcome.split("|", 1)))
-                continue
             expected = cli_tree(root, tmp)
             try:
                 got = core.stage_and_write(str(root), str(Path(tmp) / "core-objects"), [], [])
