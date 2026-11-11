@@ -721,10 +721,8 @@ fn vstest_parse(line: &str) -> Option<(Verdict, DotnetValues, String)> {
         (rest, Verdict::Passed)
     } else if let Some(rest) = line.strip_prefix("Failed!") {
         (rest, Verdict::Failed)
-    } else if let Some(rest) = line.strip_prefix("Skipped!") {
-        (rest, Verdict::Skipped)
     } else {
-        return None;
+        (line.strip_prefix("Skipped!")?, Verdict::Skipped)
     };
     let spaces = tail.bytes().take_while(|b| *b == b' ' || *b == b'\t').count();
     if spaces == 0 {

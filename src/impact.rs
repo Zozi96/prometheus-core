@@ -858,7 +858,7 @@ fn impact_impl(
             }
         }
     }
-    callers.sort_by(|a, b| (a.path.clone(), a.references.clone()).cmp(&(b.path.clone(), b.references.clone())));
+    callers.sort_by_key(|a| (a.path.clone(), a.references.clone()));
     let caller_paths: HashSet<&str> = callers.iter().map(|entry| entry.path.as_str()).collect();
     let mut caller_modules: BTreeSet<String> = BTreeSet::new();
     for entry in &callers {

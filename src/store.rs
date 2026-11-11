@@ -36,7 +36,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         block.push(0);
     }
     block.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in block.chunks_exact(64) {
+    for chunk in block.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
