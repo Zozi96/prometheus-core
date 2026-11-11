@@ -22,10 +22,13 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 use crate::classify::is_test_path;
-use crate::fingerprint::{err, open, status_impl, text, Res};
+#[cfg(feature = "python")]
+use crate::fingerprint::err;
+use crate::fingerprint::{open, status_impl, text, Res};
 
 const SCHEMA: u32 = 1;
 
@@ -1238,6 +1241,7 @@ fn selection(
     (level, vec![], vec![], vec![], module_target.clone(), reasons)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn impact(
     py: Python<'_>,
@@ -1249,7 +1253,21 @@ fn impact(
     py.detach(|| impact_impl(&root, &changed, &tests, &cargo_json)).map_err(err)
 }
 
+/// The impact document for the standalone `prometheus-check` runner
+/// (ADR-0010): the same JSON the Python route receives. `tests` is the
+/// discovered test-file listing, or `None` when discovery failed — the
+/// document then widens fail-closed and records why.
+pub fn impact_document(
+    root: &str,
+    changed: &[String],
+    tests: Option<Vec<String>>,
+    cargo_json: &str,
+) -> Option<String> {
+    impact_impl(root, changed, &tests, cargo_json).ok()
+}
+
 /// Register the impact graph on the `prometheus_core` module.
+#[cfg(feature = "python")]
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(impact, m)?)?;
     Ok(())

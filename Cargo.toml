@@ -14,8 +14,16 @@ crate-type = ["cdylib", "rlib"]
 name = "prometheus-hook"
 path = "src/bin/prometheus-hook.rs"
 
+[[bin]]
+name = "prometheus-check"
+path = "src/bin/prometheus-check.rs"
+
+[features]
+default = ["python"]
+python = ["dep:pyo3"]
+
 [dependencies]
-pyo3 = { version = "=0.30.1", features = ["abi3-py39", "generate-import-lib"] }
+pyo3 = { version = "=0.30.1", features = ["abi3-py39", "generate-import-lib"], optional = true }
 gix = { version = "=0.89.0", default-features = false, features = ["sha1", "parallel", "status", "dirwalk", "index", "excludes", "attributes"] }
 # Already in the lock tree as gix's own diff backend (via gix-diff); named
 # directly so the scan's hunk index uses the same line-diff engine git's

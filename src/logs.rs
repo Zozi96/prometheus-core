@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 const SCHEMA: u32 = 1;
@@ -1049,6 +1050,7 @@ fn parse_impl(text: &str, exit_code: Option<i64>) -> String {
 /// Never raises: a parse failure is the document's `error` code, and any
 /// internal failure degrades to the `no-summary` document — the caller
 /// still holds the Python route as its fallback.
+#[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (text, exit_code=None))]
 fn parse_check_log(text: &str, exit_code: Option<i64>) -> String {
@@ -1058,6 +1060,16 @@ fn parse_check_log(text: &str, exit_code: Option<i64>) -> String {
     }
 }
 
+/// The parsed check-log document for the standalone `prometheus-check`
+/// runner (ADR-0010): the same JSON `parse_check_log` returns to Python.
+pub fn parse_document(text: &str, exit_code: Option<i64>) -> String {
+    match std::panic::catch_unwind(|| parse_impl(text, exit_code)) {
+        Ok(document) => document,
+        Err(_) => receipt_json(None, Some("no-summary"), &[], &[]),
+    }
+}
+
+#[cfg(feature = "python")]
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_check_log, m)?)?;
     Ok(())
