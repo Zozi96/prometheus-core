@@ -1688,8 +1688,15 @@ mod tests {
         let dir = TempDir::new("venv");
         write(&dir.0, ".venv/bin/python", "");
         let found = python_candidates(&dir.0);
-        let venv = dir.0.join(".venv/bin/python").to_string_lossy().into_owned();
-        let at = found.iter().position(|name| *name == venv).expect("venv interpreter listed");
+        // Candidates are built by joining path components, so on Windows
+        // the same file is spelled with '\\' where this expectation uses
+        // '/': compare separator-normalized, as the filesystem does.
+        let norm = |name: &str| name.replace('\\', "/");
+        let venv = norm(&dir.0.join(".venv/bin/python").to_string_lossy());
+        let at = found
+            .iter()
+            .position(|name| norm(name) == venv)
+            .expect("venv interpreter listed");
         assert!(at < found.iter().position(|name| name == "python3").unwrap());
         assert_eq!(found.last().map(String::as_str), Some("python"));
     }
