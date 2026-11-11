@@ -1255,11 +1255,6 @@ pub fn worktree_fingerprint(root: &str, store: &str) -> Option<String> {
     stage_and_write_impl(root, store, Vec::new(), Vec::new(), None).ok()
 }
 
-/// The HEAD tree id of the repository at `root`, for the standalone runner.
-pub fn head_tree_id(root: &str) -> Option<String> {
-    head_tree_impl(root).ok().flatten()
-}
-
 /// Register every fingerprint primitive on the `prometheus_core` module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ENGINE_API", crate::ENGINE_API)?;

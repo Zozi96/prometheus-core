@@ -25,9 +25,10 @@
 //! serializes on the same slot.
 
 use prometheus_core::check::{
-    acquire_slot, append_receipt, behavioral_pass, bound_argv, build_before, change_class,
-    compiled_kind, counts_of, default_parallelism, find_green, load_config, profile_args,
-    read_receipts, scan_cache_read, scan_cache_write, Compiled, Config, Receipt, ScanEntry,
+    acquire_slot_in, append_receipt, behavioral_pass, bound_argv, build_before, change_class,
+    compiled_kind, counts_of, default_parallelism, find_green, host_slot_dir, load_config,
+    profile_args, read_receipts, scan_cache_read, scan_cache_write, Compiled, Config, Receipt,
+    ScanEntry,
 };
 use std::fs::File;
 use std::io::Write;
@@ -140,7 +141,15 @@ fn default_store(root: &Path) -> PathBuf {
     if let Some(git_dir) = git(root, &["rev-parse", "--absolute-git-dir"]) {
         return PathBuf::from(git_dir).join("prometheus-check");
     }
-    std::env::temp_dir().join("prometheus-check-store")
+    {
+        // One store per tree: receipts and the scan cache of unrelated
+        // projects must never share a directory.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        root.to_string_lossy().hash(&mut hasher);
+        std::env::temp_dir().join(format!("prometheus-check-store-{:016x}", hasher.finish()))
+    }
 }
 
 fn fingerprint(root: &Path, store: &Path) -> Option<String> {
@@ -349,8 +358,40 @@ fn python_targeted_command(tests: &[String]) -> Vec<String> {
     command
 }
 
-fn is_full_command(command: &[String]) -> bool {
-    command.iter().any(|part| part == "--workspace")
+/// Whether an explicit command is the Full suite rather than a Targeted
+/// check: the declared `test_command`, a workspace-wide cargo run, a
+/// solution-wide dotnet run, or a compiled run with no project or filter
+/// narrowing it. The full suite never carries the Iteration profile
+/// (ADR-0008), so this decides the profile, not just a label.
+fn is_full_command(command: &[String], config: &Config) -> bool {
+    if let Some(declared) = &config.test_command {
+        if declared == command {
+            return true;
+        }
+    }
+    if command.iter().any(|part| part == "--workspace" || part.ends_with(".sln") || part.ends_with(".slnx")) {
+        return true;
+    }
+    match compiled_kind(command) {
+        Some(Compiled::Cargo) => !command
+            .iter()
+            .any(|part| part == "-p" || part == "--package" || part.starts_with("--package=")),
+        Some(Compiled::MsBuild) => {
+            program_name_is(command, "dotnet")
+                && !command.iter().any(|part| part.ends_with(".csproj") || part == "--filter")
+        }
+        None => false,
+    }
+}
+
+fn program_name_is(command: &[String], want: &str) -> bool {
+    command
+        .first()
+        .map(|first| {
+            let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+            base.to_ascii_lowercase().trim_end_matches(".exe") == want
+        })
+        .unwrap_or(false)
 }
 
 /// Run one logical command end to end: Green receipt reuse, the Check
@@ -408,7 +449,7 @@ fn run_command(
         }
     };
 
-    let slot_dir = args.slot_dir.clone().unwrap_or_else(|| std::env::temp_dir().join("prometheus-check-slot"));
+    let slot_dir = args.slot_dir.clone().unwrap_or_else(host_slot_dir);
     let started = Instant::now();
     let execute = |launched: &[String], log_file: &mut File| -> Option<i32> {
         let mut child = match Command::new(&launched[0])
@@ -434,10 +475,10 @@ fn run_command(
     };
 
     let (code, slot_wait) = if kind.is_some() {
-        match acquire_slot(&slot_dir, &logical, Duration::from_secs_f64(args.timeout)) {
+        match acquire_slot_in(&slot_dir, &logical, Duration::from_secs_f64(args.timeout)) {
             Ok(slot) => {
                 let waited = slot.waited;
-                let code = run_under_slot(&launched, &mut log_file, execute);
+                let code = run_with_native_build(&launched, &mut log_file, execute);
                 (code, waited)
             }
             Err(timeout) => {
@@ -449,7 +490,7 @@ fn run_command(
             }
         }
     } else {
-        (run_under_slot(&launched, &mut log_file, execute), Duration::ZERO)
+        (run_with_native_build(&launched, &mut log_file, execute), Duration::ZERO)
     };
     let Some(code) = code else { return 1 };
     let wall = started.elapsed();
@@ -513,7 +554,7 @@ fn run_command(
     code
 }
 
-fn run_under_slot(
+fn run_with_native_build(
     launched: &[String],
     log_file: &mut File,
     execute: impl Fn(&[String], &mut File) -> Option<i32>,
@@ -546,7 +587,7 @@ fn main() {
     };
 
     if !args.changed {
-        let selection = if is_full_command(&args.command) { "full" } else { "targeted" };
+        let selection = if is_full_command(&args.command, &config) { "full" } else { "targeted" };
         std::process::exit(run_command(
             &args,
             &root,
@@ -560,22 +601,36 @@ fn main() {
     }
 
     // --changed: the Tree scan over both deltas, backed by the Scan cache.
+    // The base is resolved first: the cache is only valid for the base it
+    // names, and an unresolvable base is an uncertainty the selection
+    // widens on — never a silent empty Integration delta.
+    let base = args.base.clone().or_else(|| {
+        ["origin/main", "origin/master", "main", "master"]
+            .iter()
+            .find(|refname| {
+                git(&root, &["rev-parse", "--verify", &format!("{refname}^{{commit}}")]).is_some()
+            })
+            .map(|refname| refname.to_string())
+    });
+    let base_key = base.clone().unwrap_or_default();
+    let integration_known = base
+        .as_deref()
+        .map(|name| integration_delta(&root, name).is_some())
+        .unwrap_or(false);
     let cache_path = store.join("scan-cache.json");
-    let (task, integration, impact_doc) = match scan_cache_read(&cache_path, &before) {
+    let cached = if integration_known {
+        scan_cache_read(&cache_path, &before, &base_key)
+    } else {
+        None
+    };
+    let (task, integration, impact_doc) = match cached {
         Some(entry) => (entry.task_delta, entry.integration_delta, entry.impact),
         None => {
             let task = task_delta(&root);
-            let base = args
-                .base
-                .clone()
-                .or_else(|| {
-                    ["origin/main", "origin/master", "main", "master"]
-                        .iter()
-                        .find(|refname| git(&root, &["rev-parse", "--verify", &format!("{refname}^{{commit}}")]).is_some())
-                        .map(|refname| refname.to_string())
-                })
-                .unwrap_or_else(|| "HEAD".to_owned());
-            let integration = integration_delta(&root, &base).unwrap_or_default();
+            let integration = base
+                .as_deref()
+                .and_then(|name| integration_delta(&root, name))
+                .unwrap_or_default();
             let mut changed = task.clone();
             changed.extend(integration.iter().cloned());
             changed.sort();
@@ -591,15 +646,18 @@ fn main() {
             .unwrap_or_else(|| "{\"selection\":{\"level\":\"full\",\"tests\":[],\"packages\":[],\"projects\":[],\"module\":null,\"reasons\":[\"impact unavailable; widened to the full suite\"]}}".to_owned());
             let impact_doc: serde_json::Value =
                 serde_json::from_str(&document).unwrap_or(serde_json::Value::Null);
-            let _ = scan_cache_write(
-                &cache_path,
-                &ScanEntry {
-                    fingerprint: before.clone(),
-                    task_delta: task.clone(),
-                    integration_delta: integration.clone(),
-                    impact: impact_doc.clone(),
-                },
-            );
+            if integration_known {
+                let _ = scan_cache_write(
+                    &cache_path,
+                    &ScanEntry {
+                        fingerprint: before.clone(),
+                        base: base_key.clone(),
+                        task_delta: task.clone(),
+                        integration_delta: integration.clone(),
+                        impact: impact_doc.clone(),
+                    },
+                );
+            }
             (task, integration, impact_doc)
         }
     };
@@ -621,12 +679,25 @@ fn main() {
     }
 
     let selection = impact_doc.get("selection").cloned().unwrap_or(serde_json::Value::Null);
-    let level = selection.get("level").and_then(|value| value.as_str()).unwrap_or("full").to_owned();
+    let mut level = selection.get("level").and_then(|value| value.as_str()).unwrap_or("full").to_owned();
+    let mut integration_reason = None;
+    if !integration_known {
+        let named = match &args.base {
+            Some(name) => format!("base {name} could not be resolved"),
+            None => "no base ref could be resolved".to_owned(),
+        };
+        integration_reason =
+            Some(format!("integration delta unavailable: {named}; widened to the full suite"));
+        level = "full".to_owned();
+    }
     let mut reasons: Vec<String> = selection
         .get("reasons")
         .and_then(|value| value.as_array())
         .map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_owned)).collect())
         .unwrap_or_default();
+    if let Some(reason) = integration_reason {
+        reasons.push(reason);
+    }
     let str_list = |key: &str| -> Vec<String> {
         selection
             .get(key)

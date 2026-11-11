@@ -505,10 +505,39 @@ fn store_closure_report(py: Python<'_>, session_dirs: Vec<String>) -> PyResult<P
 static SLOT_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SLOTS: Mutex<Option<HashMap<u64, File>>> = Mutex::new(None);
 
-enum SlotOutcome {
+pub enum SlotOutcome {
     Acquired(u64, f64),
     Timeout(f64, Vec<u8>),
     Unavailable,
+}
+
+/// Acquire the host-wide Check slot for a native caller (the
+/// `prometheus-check` runner, ADR-0010): the same lock file, metadata,
+/// poll, and timeout semantics the Python route gets from
+/// `store_slot_acquire`, so a gate compiled run and a runner compiled run
+/// serialize on the one slot (GLOSSARY: Check slot).
+pub fn acquire_slot(
+    lock_path: &Path,
+    meta_path: &Path,
+    session_id: &str,
+    host: &str,
+    command: &[String],
+    timeout_s: f64,
+) -> SlotOutcome {
+    slot_acquire_impl(lock_path, meta_path, session_id, host, command, timeout_s)
+}
+
+/// Release a slot acquired through `acquire_slot` (or the Python
+/// binding): true when the token named a held slot.
+pub fn release_slot(token: u64) -> bool {
+    let file = slots().as_mut().and_then(|map| map.remove(&token));
+    match file {
+        Some(file) => {
+            let _ = file.unlock();
+            true
+        }
+        None => false,
+    }
 }
 
 fn slots() -> std::sync::MutexGuard<'static, Option<HashMap<u64, File>>> {
@@ -678,14 +707,7 @@ fn store_slot_acquire(
 
 #[pyfunction]
 fn store_slot_release(token: u64) -> bool {
-    let file = slots().as_mut().and_then(|map| map.remove(&token));
-    match file {
-        Some(file) => {
-            let _ = file.unlock();
-            true
-        }
-        None => false,
-    }
+    release_slot(token)
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -13,10 +13,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::io::Write;
-use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Repository config (.prometheus.json)
@@ -363,15 +362,19 @@ pub fn append_receipt(path: &Path, receipt: &Receipt) -> std::io::Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanEntry {
     pub fingerprint: String,
+    /// The base ref the Integration delta was computed against; a cache
+    /// entry is only valid for the base it names.
+    #[serde(default)]
+    pub base: String,
     pub task_delta: Vec<String>,
     pub integration_delta: Vec<String>,
     pub impact: serde_json::Value,
 }
 
-pub fn scan_cache_read(path: &Path, fingerprint: &str) -> Option<ScanEntry> {
+pub fn scan_cache_read(path: &Path, fingerprint: &str, base: &str) -> Option<ScanEntry> {
     let text = std::fs::read_to_string(path).ok()?;
     let entry: ScanEntry = serde_json::from_str(&text).ok()?;
-    (entry.fingerprint == fingerprint).then_some(entry)
+    (entry.fingerprint == fingerprint && entry.base == base).then_some(entry)
 }
 
 pub fn scan_cache_write(path: &Path, entry: &ScanEntry) -> std::io::Result<()> {
@@ -383,13 +386,49 @@ pub fn scan_cache_write(path: &Path, entry: &ScanEntry) -> std::io::Result<()> {
 
 // ---------------------------------------------------------------------------
 // The Check slot (ADR-0004): one host-wide turn for compiled check runs.
-// An OS file lock on `check-slot.lock` beside `check-slot.json` holder
-// metadata — the same on-disk shape the core receipt store uses — so a
-// holder that dies releases the slot with its process.
+// This is the core receipt store's slot itself — same lock file, same
+// holder metadata, same poll and timeout — acquired through
+// `store::acquire_slot`, so a gate compiled run and a `prometheus-check`
+// compiled run wait for each other (GLOSSARY: Check slot). The default
+// directory is the gate's: beside every session directory, resolved
+// exactly as the Python runtime's `record_path` resolves it.
+
+/// The directory holding the host-wide Check slot: `$XDG_RUNTIME_DIR/
+/// prometheus` when that dir is absolute, a directory, and owned by this
+/// user; else `<temp>/prometheus-<uid>` on POSIX, `<temp>/prometheus`
+/// elsewhere — the Python runtime's rule, so both routes name one slot.
+pub fn host_slot_dir() -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+            let path = PathBuf::from(&runtime);
+            if path.is_absolute() {
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if meta.is_dir() && meta.uid() == unsafe { libc::getuid() } {
+                        return path.join("prometheus");
+                    }
+                }
+            }
+        }
+        let uid = unsafe { libc::getuid() };
+        return std::env::temp_dir().join(format!("prometheus-{uid}"));
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join("prometheus")
+    }
+}
 
 pub struct Slot {
-    _file: File,
+    token: u64,
     pub waited: Duration,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        crate::store::release_slot(self.token);
+    }
 }
 
 #[derive(Debug)]
@@ -398,48 +437,35 @@ pub struct SlotTimeout {
     pub holder: String,
 }
 
-pub fn acquire_slot(
+/// Acquire the Check slot in `dir` (the gate's directory, or an explicit
+/// override a test or embedder names).
+pub fn acquire_slot_in(
     dir: &Path,
     command: &[String],
     timeout: Duration,
 ) -> Result<Slot, SlotTimeout> {
-    let _ = std::fs::create_dir_all(dir);
     let lock_path = dir.join("check-slot.lock");
     let meta_path = dir.join("check-slot.json");
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|_| SlotTimeout { waited: Duration::ZERO, holder: String::new() })?;
-    let started = Instant::now();
-    loop {
-        match file.try_lock() {
-            Ok(()) => break,
-            Err(_) => {
-                let waited = started.elapsed();
-                if waited >= timeout {
-                    let holder = std::fs::read_to_string(&meta_path).unwrap_or_default();
-                    return Err(SlotTimeout { waited, holder: holder.trim().to_owned() });
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+    match crate::store::acquire_slot(
+        &lock_path,
+        &meta_path,
+        "",
+        "prometheus-check",
+        command,
+        timeout.as_secs_f64(),
+    ) {
+        crate::store::SlotOutcome::Acquired(token, waited) => {
+            Ok(Slot { token, waited: Duration::from_secs_f64(waited) })
         }
+        crate::store::SlotOutcome::Timeout(waited, meta) => Err(SlotTimeout {
+            waited: Duration::from_secs_f64(waited),
+            holder: String::from_utf8_lossy(&meta).trim().to_owned(),
+        }),
+        crate::store::SlotOutcome::Unavailable => Err(SlotTimeout {
+            waited: Duration::ZERO,
+            holder: String::new(),
+        }),
     }
-    let started_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    let meta = serde_json::json!({
-        "command": command,
-        "host": "prometheus-check",
-        "pid": std::process::id(),
-        "session_id": "",
-        "started_at": started_at,
-    });
-    let _ = std::fs::write(&meta_path, format!("{meta}\n"));
-    Ok(Slot { _file: file, waited: started.elapsed() })
 }
 
 // ---------------------------------------------------------------------------
@@ -597,24 +623,27 @@ mod tests {
         let path = dir.join("scan-cache.json");
         let entry = ScanEntry {
             fingerprint: "abc".into(),
+            base: "main".into(),
             task_delta: argv(&["a.py"]),
             integration_delta: vec![],
             impact: serde_json::json!({"selection": {"level": "targeted"}}),
         };
         scan_cache_write(&path, &entry).unwrap();
-        assert!(scan_cache_read(&path, "abc").is_some());
-        assert!(scan_cache_read(&path, "other").is_none());
+        assert!(scan_cache_read(&path, "abc", "main").is_some());
+        assert!(scan_cache_read(&path, "other", "main").is_none());
+        assert!(scan_cache_read(&path, "abc", "develop").is_none(),
+                "a cache entry is only valid for the base it names");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn slot_is_exclusive_until_released() {
         let dir = std::env::temp_dir().join(format!("prometheus-check-slot-{}", std::process::id()));
-        let first = acquire_slot(&dir, &argv(&["cargo", "test"]), Duration::from_secs(5)).unwrap();
-        let blocked = acquire_slot(&dir, &argv(&["cargo", "test"]), Duration::from_millis(60));
+        let first = acquire_slot_in(&dir, &argv(&["cargo", "test"]), Duration::from_secs(5)).unwrap();
+        let blocked = acquire_slot_in(&dir, &argv(&["cargo", "test"]), Duration::from_millis(60));
         assert!(blocked.is_err());
         drop(first);
-        assert!(acquire_slot(&dir, &argv(&["cargo", "test"]), Duration::from_secs(5)).is_ok());
+        assert!(acquire_slot_in(&dir, &argv(&["cargo", "test"]), Duration::from_secs(5)).is_ok());
         let _ = std::fs::remove_dir_all(dir);
     }
 
