@@ -5,11 +5,12 @@
 //!
 //! Reads one hook event JSON from stdin (the exact bytes the host would
 //! send its Python adapter) and prints the reply JSON on stdout, always
-//! exiting 0 — the same contract the adapters keep. Shadow mode is the
-//! default: decisions are computed and optionally logged, session state is
-//! never written, and the Python hook keeps governing. `--active` enables
-//! the state writes for parity testing; no host configuration points here
-//! yet, by design.
+//! exiting 0 — the same contract the adapters keep. It answers only the
+//! retained `PreToolUse` guards (ADR-0010): secret-path ask and the
+//! unchanged-reread warning. Shadow mode is the default: decisions are
+//! computed and optionally logged, reread state is never written, and the
+//! Python adapter keeps governing. `--active` enables the state writes
+//! for parity testing; no host configuration points here yet, by design.
 
 use std::io::{Read, Write};
 use std::time::Instant;
