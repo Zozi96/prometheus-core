@@ -1,33 +1,12 @@
-//! Tree fingerprint: in-process git primitives for the work-tree fingerprint.
-//!
-//! Each function answers one git question the Python orchestration in
-//! `sureforge_hook.fingerprint()` asks, and returns a small structure, never
-//! git's text. Any failure raises, and the caller then reruns the whole
-//! fingerprint on the git CLI.
-
-// The Python bindings are this module's only callers of most primitives;
-// the native build keeps them compiled and tested but leaves them unused.
-#![cfg_attr(not(feature = "python"), allow(dead_code))]
-
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+//! In-process worktree fingerprinting for `prometheus-check`.
 
 use gix::bstr::{BString, ByteSlice};
 use gix::dir::entry::{Kind, Status as DirStatus};
 use gix::dir::walk::EmissionMode;
 use gix::status::index_worktree::Item as WorktreeItem;
 use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyRuntimeError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
 
 pub(crate) type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-#[cfg(feature = "python")]
-pub(crate) fn err(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
-    PyRuntimeError::new_err(e.to_string())
-}
 
 pub(crate) fn text(path: &[u8]) -> Res<String> {
     Ok(std::str::from_utf8(path)?.to_owned())
@@ -37,68 +16,13 @@ pub(crate) fn open(root: &str) -> Res<gix::Repository> {
     Ok(gix::open(root)?)
 }
 
-/// Windows canonical paths are verbatim (`\\?\C:\x`, `\\?\UNC\host\share`); git and Python print `C:\x`.
-fn plain(path: PathBuf) -> PathBuf {
-    if cfg!(windows) {
-        let text = path.to_string_lossy();
-        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-            return PathBuf::from(format!(r"\\{rest}"));
-        }
-        if let Some(rest) = text.strip_prefix(r"\\?\") {
-            return PathBuf::from(rest);
-        }
-    }
-    path
-}
-
-/// Like Python's `Path.resolve()` for a path whose last component may not exist yet.
-pub(crate) fn real(path: &Path) -> Res<String> {
-    let resolved: PathBuf = match std::fs::canonicalize(path) {
-        Ok(p) => plain(p),
-        Err(_) => {
-            let parent = path.parent().ok_or("path has no parent")?;
-            plain(std::fs::canonicalize(parent)?).join(path.file_name().ok_or("path has no name")?)
-        }
-    };
-    Ok(resolved.to_str().ok_or("path is not UTF-8")?.to_owned())
-}
-
-/// The batched `rev-parse`: (toplevel, index, common dir, info/exclude, objects).
-fn paths_impl(cwd: &str) -> Res<(String, String, String, String, String)> {
-    let repo = gix::discover(cwd)?;
-    let top = repo.workdir().ok_or("bare repository")?;
-    let common = repo.common_dir();
-    Ok((
-        real(top)?,
-        real(&repo.index_path())?,
-        real(common)?,
-        real(&common.join("info").join("exclude"))?,
-        real(&common.join("objects"))?,
-    ))
-}
-
-/// `worktree list --porcelain` minus the main worktree: each linked worktree's path.
-pub(crate) fn linked_worktrees_impl(root: &str) -> Res<Vec<String>> {
-    let repo = open(root)?;
-    let mut out = Vec::new();
-    for proxy in repo.worktrees()? {
-        out.push(proxy.base()?.to_str().ok_or("path is not UTF-8")?.to_owned());
-    }
-    out.sort();
-    Ok(out)
-}
-
 /// One submodule as `git status --porcelain=v2` reports it: (path, commit changed, tracked changes, untracked files).
 type SubmoduleFacts = (String, bool, bool, bool);
 
 /// `status --untracked-files=all --ignore-submodules=none`: every untracked file and submodule state,
 /// whatever `status.showUntrackedFiles` says. Its `no` drops the dirwalk entirely, so it is rebuilt here.
-/// `ignored` also emits ignored paths, fully ignored directories collapsed, as `ls-files -o -i --directory`.
-fn status_platform(repo: &gix::Repository, ignored: bool) -> Res<gix::status::Platform<'_, gix::progress::Discard>> {
-    let mut dirwalk = repo.dirwalk_options()?.emit_untracked(EmissionMode::Matching);
-    if ignored {
-        dirwalk = dirwalk.emit_ignored(Some(EmissionMode::CollapseDirectory)).emit_empty_directories(true);
-    }
+fn status_platform(repo: &gix::Repository) -> Res<gix::status::Platform<'_, gix::progress::Discard>> {
+    let dirwalk = repo.dirwalk_options()?.emit_untracked(EmissionMode::Matching);
     Ok(repo
         .status(gix::progress::Discard)?
         .index_worktree_submodules(gix::status::Submodule::Given {
@@ -111,16 +35,15 @@ fn status_platform(repo: &gix::Repository, ignored: bool) -> Res<gix::status::Pl
 /// `status --porcelain=v2 -z --untracked-files=all --ignore-submodules=none`, as facts:
 /// whether anything is listed, the untracked paths (directories end in `/`), and submodule states.
 pub(crate) fn status_impl(root: &str, threads: Option<usize>) -> Res<(bool, Vec<String>, Vec<SubmoduleFacts>)> {
-    Ok(status_walk(root, threads, false)?.0)
+    status_walk(root, threads)
 }
 
 type StatusFacts = (bool, Vec<String>, Vec<SubmoduleFacts>);
 
-/// The status facts, and with `ignored` the ignored listing from the same directory walk.
-fn status_walk(root: &str, threads: Option<usize>, ignored: bool) -> Res<(StatusFacts, Vec<String>)> {
+/// Collect status facts from the directory walk.
+fn status_walk(root: &str, threads: Option<usize>) -> Res<StatusFacts> {
     let repo = open(root)?;
-    let mut ignored_paths = Vec::new();
-    let iter = status_platform(&repo, ignored)?
+    let iter = status_platform(&repo)?
         .index_worktree_options_mut(|opts| opts.thread_limit = threads)
         .into_iter(None::<BString>)?;
     let mut changed = false;
@@ -167,7 +90,6 @@ fn status_walk(root: &str, threads: Option<usize>, ignored: bool) -> Res<(Status
                         changed = true;
                         untracked.push(path);
                     }
-                    DirStatus::Ignored(_) => ignored_paths.push(path),
                     _ => {}
                 }
             }
@@ -176,513 +98,7 @@ fn status_walk(root: &str, threads: Option<usize>, ignored: bool) -> Res<(Status
     }
     untracked.sort();
     submodules.sort();
-    ignored_paths.sort();
-    Ok(((changed, untracked, submodules), ignored_paths))
-}
-
-/// Index entries `fingerprint()` reads: every stage of a path with a skip-worktree or
-/// assume-unchanged stage, and every gitlink. The full listing is `tracked()`.
-fn tracked_special_impl(root: &str) -> Res<Vec<Tracked>> {
-    let repo = open(root)?;
-    let index = repo.index_or_empty()?;
-    let flag = gix::index::entry::Flags::SKIP_WORKTREE | gix::index::entry::Flags::ASSUME_VALID;
-    let flagged: std::collections::HashSet<&gix::bstr::BStr> = index
-        .entries()
-        .iter()
-        .filter(|e| e.flags.intersects(flag))
-        .map(|e| e.path(&index))
-        .collect();
-    let mut out = Vec::new();
-    for entry in index.entries() {
-        let path = entry.path(&index);
-        if entry.mode.bits() == 0o160000 || flagged.contains(path) {
-            out.push((
-                text(path)?,
-                entry.mode.bits(),
-                entry.id.to_hex().to_string(),
-                entry.stage_raw(),
-                entry.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE),
-                entry.flags.contains(gix::index::entry::Flags::ASSUME_VALID),
-            ));
-        }
-    }
-    Ok(out)
-}
-
-/// One index entry as `ls-files -s -v` shows it: (path, mode, oid, stage, skip-worktree, assume-unchanged).
-type Tracked = (String, u32, String, u32, bool, bool);
-
-fn tracked_impl(root: &str) -> Res<Vec<Tracked>> {
-    let repo = open(root)?;
-    let index = repo.index_or_empty()?;
-    let mut out = Vec::with_capacity(index.entries().len());
-    for entry in index.entries() {
-        out.push((
-            text(entry.path(&index))?,
-            entry.mode.bits(),
-            entry.id.to_hex().to_string(),
-            entry.stage_raw(),
-            entry.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE),
-            entry.flags.contains(gix::index::entry::Flags::ASSUME_VALID),
-        ));
-    }
-    Ok(out)
-}
-
-/// `ls-files -o -i --exclude-standard --directory -z`: ignored untracked paths, fully ignored directories as `dir/`.
-/// The same walk as `status_and_ignored`, which lists untracked files one by one so ignored files inside an
-/// untracked directory still show.
-fn ignored_untracked_impl(root: &str) -> Res<Vec<String>> {
-    Ok(status_walk(root, None, true)?.1)
-}
-
-/// True when the filesystem holding `git_dir` finds it under a case-swapped name. Nothing is written.
-fn case_insensitive_fs(git_dir: &Path) -> bool {
-    let Some(name) = git_dir.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let swapped: String = name
-        .chars()
-        .map(|c| if c.is_lowercase() { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() })
-        .collect();
-    swapped != name && git_dir.with_file_name(swapped).exists()
-}
-
-/// True when `dir` holds a `.git` directory with HEAD, or a `.git` file starting with `gitdir:`.
-fn holds_repo(dir: &Path) -> bool {
-    let marker = dir.join(".git");
-    match std::fs::symlink_metadata(&marker) {
-        Ok(meta) if meta.is_dir() => marker.join("HEAD").exists(),
-        Ok(meta) if meta.is_file() => std::fs::read(&marker).is_ok_and(|bytes| bytes.starts_with(b"gitdir:")),
-        _ => false,
-    }
-}
-
-/// Untracked paths under the directory `rel` as `ls-files -o` lists them: regular files and
-/// symlinks, a nested repository as `path/` and not entered.
-fn files_under(workdir: &Path, rel: &str, tracked: &HashSet<String>, out: &mut Vec<String>) -> Res<()> {
-    let mut dirs = vec![rel.to_owned()];
-    while let Some(dir) = dirs.pop() {
-        for entry in std::fs::read_dir(workdir.join(&dir))? {
-            let entry = entry?;
-            let name = entry.file_name().into_string().map_err(|_| "path is not UTF-8")?;
-            if name == ".git" {
-                continue;
-            }
-            let path = format!("{dir}/{name}");
-            let kind = entry.file_type()?;
-            if kind.is_dir() {
-                if holds_repo(&workdir.join(&path)) {
-                    out.push(format!("{path}/"));
-                } else {
-                    dirs.push(path);
-                }
-            } else if (kind.is_file() || kind.is_symlink()) && !tracked.contains(&path) {
-                out.push(path);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The work-tree-relative path of an ignore source, as `_exclude_source_is_tracked` compares it.
-fn source_rel(workdir_real: &Path, source: &Path) -> Option<String> {
-    let resolved = real(source).ok()?;
-    let rel = Path::new(&resolved).strip_prefix(workdir_real).ok()?;
-    Some(rel.to_str()?.replace('\\', "/"))
-}
-
-/// The exclude rule `check-ignore -v` names for `path`: its source (None for a rule without one)
-/// and whether it excludes; None when no rule matches. git names the outermost excluded
-/// ancestor's rule; gix's stack prefers the nearest, so the ancestors are asked first, from the top.
-fn ignore_rule(stack: &mut gix::AttributeStack<'_>, workdir_real: &Path, path: &str) -> Res<Option<(Option<String>, bool)>> {
-    let trimmed = path.trim_end_matches('/');
-    let source = |found: &gix::ignore::search::Match<'_>| found.source.map(|source| source_rel(workdir_real, source).unwrap_or_default());
-    for (at, _) in trimmed.match_indices('/') {
-        let platform = stack.at_path(Path::new(&trimmed[..at]), Some(gix::index::entry::Mode::DIR))?;
-        if let Some(found) = platform.matching_exclude_pattern().filter(|found| !found.pattern.is_negative()) {
-            return Ok(Some((source(&found), true)));
-        }
-    }
-    let mode = if path.ends_with('/') { gix::index::entry::Mode::DIR } else { gix::index::entry::Mode::FILE };
-    let platform = stack.at_path(Path::new(trimmed), Some(mode))?;
-    Ok(platform.matching_exclude_pattern().map(|found| (source(&found), !found.pattern.is_negative())))
-}
-
-/// `check-ignore -v` on a directory entry, which carries its slash: the rule the stack finds for
-/// `dir`, else one that names `dir/` with the slash (`dir/*`), which the stack cannot see. The
-/// slash lists come in git's order: deepest `.gitignore` first, then info/exclude, then global.
-fn dir_entry_rule(
-    stack: &mut gix::AttributeStack<'_>,
-    workdir: &Path,
-    workdir_real: &Path,
-    outside: &[(PathBuf, Vec<u8>)],
-    path: &str,
-    case: gix::glob::pattern::Case,
-) -> Res<Option<(Option<String>, bool)>> {
-    let trimmed = path.trim_end_matches('/');
-    if let Some(rule) = ignore_rule(stack, workdir_real, path)? {
-        return Ok(Some(rule));
-    }
-    let parse = gix::ignore::search::Ignore { support_precious: false };
-    let mut search = gix::ignore::Search::default();
-    for (source, bytes) in outside.iter().rev() {
-        search.add_patterns_buffer(bytes, source.clone(), None, parse)?;
-    }
-    let mut dirs = vec![""];
-    dirs.extend(trimmed.match_indices('/').map(|(at, _)| &trimmed[..at]));
-    for dir in dirs {
-        let file = workdir.join(dir).join(".gitignore");
-        if file.is_file() {
-            search.add_patterns_buffer(&std::fs::read(&file)?, file, Some(workdir), parse)?;
-        }
-    }
-    let with_slash = format!("{trimmed}/");
-    Ok(search
-        .pattern_matching_relative_path(with_slash.as_str().into(), Some(true), case)
-        .map(|found| (found.source.map(|source| source_rel(workdir_real, source).unwrap_or_default()), !found.pattern.is_negative())))
-}
-
-fn excluded(stack: &mut gix::AttributeStack<'_>, workdir_real: &Path, path: &str) -> Res<bool> {
-    Ok(ignore_rule(stack, workdir_real, path)?.is_some_and(|(_, excludes)| excludes))
-}
-
-/// The ignored paths under the directory `dir`, which is not itself excluded, as
-/// `ls-files -o -i --directory` lists them: an excluded directory as `path/`, an excluded file.
-fn ignored_under(
-    stack: &mut gix::AttributeStack<'_>,
-    workdir: &Path,
-    workdir_real: &Path,
-    dir: &str,
-    tracked: &HashSet<String>,
-    out: &mut Vec<String>,
-) -> Res<()> {
-    let mut dirs = vec![dir.to_owned()];
-    while let Some(dir) = dirs.pop() {
-        for entry in std::fs::read_dir(workdir.join(&dir))? {
-            let entry = entry?;
-            let name = entry.file_name().into_string().map_err(|_| "path is not UTF-8")?;
-            if name == ".git" {
-                continue;
-            }
-            let path = format!("{dir}/{name}");
-            let kind = entry.file_type()?;
-            if kind.is_dir() {
-                let collapsed = format!("{path}/");
-                if excluded(stack, workdir_real, &collapsed)? {
-                    out.push(collapsed);
-                } else if !holds_repo(&workdir.join(&path)) {
-                    dirs.push(path);
-                }
-            } else if (kind.is_file() || kind.is_symlink()) && !tracked.contains(&path) && excluded(stack, workdir_real, &path)? {
-                out.push(path);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The pathspecs from the `!` lines of each tracked gitignore behind a collapsed directory,
-/// as `_negation_pathspecs` builds them.
-fn negation_pathspecs(workdir: &Path, tracked_dirs: &[(String, String)]) -> Res<Vec<String>> {
-    let prefixes: Vec<String> = tracked_dirs.iter().map(|(dir, _)| dir.clone()).collect();
-    let mut specs: Vec<String> = Vec::new();
-    let mut read = HashSet::new();
-    for (_, source) in tracked_dirs {
-        if !read.insert(source.clone()) {
-            continue;
-        }
-        let file = workdir.join(source);
-        let content = if file.is_file() { String::from_utf8_lossy(&std::fs::read(&file)?).into_owned() } else { String::new() };
-        let base = Path::new(source).parent().and_then(Path::to_str).unwrap_or("").replace('\\', "/");
-        for line in content.lines() {
-            let line = line.trim();
-            if line.len() < 2 || !line.starts_with('!') {
-                continue;
-            }
-            let pattern = line[1..].trim_start_matches('/');
-            if pattern.is_empty() || pattern.split('/').any(|part| part == "..") {
-                continue;
-            }
-            let anchored = line[1..].contains('/');
-            let rel = if base.is_empty() { pattern.to_owned() } else { format!("{base}/{pattern}") };
-            let spec = if anchored {
-                if !prefixes.iter().any(|prefix| rel.starts_with(prefix.as_str())) {
-                    continue;
-                }
-                rel
-            } else {
-                format!(":(glob)**/{pattern}")
-            };
-            if !specs.contains(&spec) {
-                specs.push(spec);
-            }
-        }
-    }
-    Ok(specs)
-}
-
-/// Python's `fnmatch.fnmatchcase(name, pattern)` for a pattern whose only wildcard is `*`
-/// (any run, `/` included).
-fn star_match(name: &str, pattern: &str) -> bool {
-    let (s, p) = (name.as_bytes(), pattern.as_bytes());
-    let (mut i, mut j, mut star, mut mark) = (0, 0, None, 0);
-    while i < s.len() {
-        if j < p.len() && p[j] != b'*' && p[j] == s[i] {
-            i += 1;
-            j += 1;
-        } else if j < p.len() && p[j] == b'*' {
-            star = Some(j);
-            mark = i;
-            j += 1;
-        } else if let Some(at) = star {
-            j = at + 1;
-            mark += 1;
-            i = mark;
-        } else {
-            return false;
-        }
-    }
-    p[j..].iter().all(|c| *c == b'*')
-}
-
-/// `_exclude_might_match`: false only where it is easy to prove that no rule in `text` can
-/// exclude a path the negation `specs` name. It answers as Python does, except that a CRLF
-/// line, which Python's universal newlines read without its `\r`, makes it answer true.
-/// (Python's GIT_ICASE_PATHSPECS check is absent: the preflight sends that environment to the CLI.)
-fn exclude_might_match(text: &str, specs: &[String], fold: bool, workdir: &Path) -> bool {
-    // A directory names every file below it; a missing path names nothing for git to list.
-    let plain_file = |spec: &String| {
-        !spec.ends_with('/') && std::fs::symlink_metadata(workdir.join(spec)).map_or(true, |meta| !meta.is_dir())
-    };
-    let literal = |spec: &String| {
-        !spec.starts_with(':')
-            && spec.bytes().all(|b| (0x20..0x7f).contains(&b))
-            && !spec.contains(['*', '?', '[', ']', '\\'])
-            && !spec.split('/').any(|part| part == "." || part == "..") // git normalises `nm/./a` to `nm/a`
-            && plain_file(spec)
-    };
-    if !specs.iter().all(literal) {
-        return true;
-    }
-    let simple = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '*' | '/');
-    let mut rules = Vec::new();
-    for line in text.split('\n') {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if !line.chars().all(simple) || line.contains("**") || line.ends_with('/') {
-            return true;
-        }
-        rules.push(if fold { line.to_ascii_lowercase() } else { line.to_owned() });
-    }
-    specs.iter().any(|spec| {
-        let spec = if fold { spec.to_ascii_lowercase() } else { spec.clone() };
-        let parts: Vec<&str> = spec.split('/').filter(|part| !part.is_empty()).collect();
-        rules.iter().any(|rule| {
-            let anchored = rule.trim_start_matches('/');
-            if anchored.contains('/') {
-                (1..=parts.len()).any(|end| star_match(&parts[..end].join("/"), anchored))
-            } else {
-                parts.iter().any(|part| star_match(part, anchored))
-            }
-        })
-    })
-}
-
-/// The outside exclude files `_outside_exclude_files` reads, with their text, when they hold a rule.
-/// A file that exists but cannot be read is an error; a missing one holds nothing.
-fn outside_exclude_files(repo: &gix::Repository, workdir: &Path, info_exclude: &Path) -> Res<Vec<(PathBuf, Vec<u8>)>> {
-    let mut files = vec![info_exclude.to_owned()];
-    // `git config --path` prints nothing for an empty value, which the CLI path cannot use: it decides.
-    if repo.config_snapshot().string("core.excludesFile").is_some_and(|value| value.is_empty()) {
-        return Err("core.excludesFile is empty".into());
-    }
-    match repo.config_snapshot().trusted_path("core.excludesFile")? {
-        Some(path) => files.push(if path.is_absolute() { path } else { workdir.join(path) }),
-        None => match std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
-            Some(xdg) => files.push(PathBuf::from(xdg).join("git").join("ignore")),
-            None => files.push(PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(".config/git/ignore")),
-        },
-    }
-    let mut usable = Vec::new();
-    for path in files {
-        if !path.is_file() {
-            continue;
-        }
-        let bytes = std::fs::read(&path)?;
-        let rules = String::from_utf8_lossy(&bytes)
-            .lines()
-            .any(|line| !line.trim().is_empty() && !line.trim().starts_with('#'));
-        if rules {
-            usable.push((path, bytes));
-        }
-    }
-    Ok(usable)
-}
-
-/// `ls-files -i --exclude-from`: `path` or one of its parent directories is excluded by `search`.
-fn excluded_by(search: &gix::ignore::Search, path: &str, case: gix::glob::pattern::Case) -> bool {
-    let trimmed = path.trim_end_matches('/');
-    for (at, _) in trimmed.match_indices('/') {
-        let parent = &trimmed[..at];
-        if search
-            .pattern_matching_relative_path(parent.into(), Some(true), case)
-            .is_some_and(|found| !found.pattern.is_negative())
-        {
-            return true;
-        }
-    }
-    search
-        .pattern_matching_relative_path(trimmed.into(), Some(path.ends_with('/')), case)
-        .is_some_and(|found| !found.pattern.is_negative())
-}
-
-/// `_untracked_excluded` in process: from `entries`, the ignored listing of the status walk, the
-/// paths ignored only by a source that is not a tracked path, files listed one by one, an embedded
-/// repository as `dir/`. Any failure raises, so the caller reruns the fingerprint on the git CLI.
-fn outside_excluded_impl(root: &str, entries: Vec<String>, info_exclude: &str) -> Res<Vec<String>> {
-    let repo = open(root)?;
-    let workdir = repo.workdir().ok_or("no work tree")?.to_owned();
-    let workdir_real = PathBuf::from(real(&workdir)?);
-    let index = repo.index_or_empty()?;
-    let mut tracked = HashSet::with_capacity(index.entries().len());
-    for entry in index.entries() {
-        tracked.insert(text(entry.path(&index))?);
-    }
-    let mut stack = repo.excludes(&index, None, gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped)?;
-    let mut outside = Vec::new();
-    let mut tracked_dirs = Vec::new();
-    let mut listed = Vec::with_capacity(entries.len());
-    for path in entries {
-        // The walk collapses an untracked directory holding only ignored paths to `dir/`, which
-        // no rule excludes; git lists the ignored paths inside it as well.
-        if let Some(dir) = path.strip_suffix('/') {
-            if !excluded(&mut stack, &workdir_real, &path)? && !holds_repo(&workdir.join(dir)) {
-                ignored_under(&mut stack, &workdir, &workdir_real, dir, &tracked, &mut listed)?;
-            }
-        }
-        listed.push(path);
-    }
-    // `ls-files -o` drops an entry named like an index path (a tracked file replaced by a directory).
-    listed.retain(|path| !tracked.contains(path.trim_end_matches('/')));
-    listed.sort();
-    listed.dedup();
-    let info = if info_exclude.is_empty() { repo.common_dir().join("info").join("exclude") } else { PathBuf::from(info_exclude) };
-    let fold = repo.config_snapshot().boolean("core.ignoreCase").unwrap_or(false);
-    let case = if fold { gix::glob::pattern::Case::Fold } else { gix::glob::pattern::Case::Sensitive };
-    let mut loaded: Option<Vec<(PathBuf, Vec<u8>)>> = None;
-    for path in listed {
-        let rule = if path.ends_with('/') {
-            if loaded.is_none() {
-                loaded = Some(outside_exclude_files(&repo, &workdir, &info)?);
-            }
-            let outside_files = loaded.as_deref().unwrap_or_default();
-            dir_entry_rule(&mut stack, &workdir, &workdir_real, outside_files, &path, case)?
-        } else {
-            ignore_rule(&mut stack, &workdir_real, &path)?
-        };
-        let Some((Some(source), _)) = rule else {
-            continue;
-        };
-        if tracked.contains(&source) {
-            if path.ends_with('/') {
-                tracked_dirs.push((path, source));
-            }
-            continue;
-        }
-        outside.push(path);
-    }
-    let mut files = Vec::new();
-    for path in outside {
-        let Some(dir) = path.strip_suffix('/') else {
-            files.push(path);
-            continue;
-        };
-        if holds_repo(&workdir.join(dir)) {
-            files.push(path); // embedded repository: git lists the directory, not its files
-            continue;
-        }
-        let mut inner = Vec::new();
-        files_under(&workdir, dir, &tracked, &mut inner)?;
-        inner.sort();
-        for item in inner {
-            // `ls-files -o -i -- dir` lists only the excluded paths under it.
-            if let Some((Some(source), true)) = ignore_rule(&mut stack, &workdir_real, &item)? {
-                if !tracked.contains(&source) {
-                    files.push(item);
-                }
-            }
-        }
-    }
-    // A tracked `dir/` collapse hides a later `!dir/file`; an outside exclude that matches it is hashed.
-    if tracked_dirs.is_empty() {
-        return Ok(files);
-    }
-    let sources = match loaded {
-        Some(sources) => sources,
-        None => outside_exclude_files(&repo, &workdir, &info)?,
-    };
-    if sources.is_empty() {
-        return Ok(files);
-    }
-    let specs = negation_pathspecs(&workdir, &tracked_dirs)?;
-    if specs.is_empty() {
-        return Ok(files);
-    }
-    // Only a source that might name a negated path is asked, so the collapsed directory is walked only then.
-    let sources: Vec<_> = sources
-        .into_iter()
-        .filter(|(_, bytes)| exclude_might_match(&String::from_utf8_lossy(bytes), &specs, fold, &workdir))
-        .collect();
-    if sources.is_empty() {
-        return Ok(files);
-    }
-    let defaults = repo.pathspec_defaults()?;
-    let patterns = specs
-        .iter()
-        .map(|spec| gix::pathspec::parse(spec.as_bytes(), defaults))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut pathspec = gix::pathspec::Search::from_specs(patterns, None, &workdir)?;
-    let mut candidates = Vec::new();
-    let mut walked = HashSet::new();
-    for (dir, _) in &tracked_dirs {
-        let dir = dir.trim_end_matches('/');
-        if walked.insert(dir.to_owned()) {
-            files_under(&workdir, dir, &tracked, &mut candidates)?;
-        }
-    }
-    candidates.sort();
-    let candidates: Vec<String> = candidates
-        .into_iter()
-        .filter(|path| {
-            pathspec
-                .pattern_matching_relative_path(path.trim_end_matches('/').into(), Some(path.ends_with('/')), &mut |_, _, _, _| false)
-                .is_some_and(|found| !found.is_excluded())
-        })
-        .collect();
-    let mut seen = HashSet::new();
-    for (source, bytes) in sources {
-        let mut search = gix::ignore::Search::default();
-        search.add_patterns_buffer(&bytes, source, None, gix::ignore::search::Ignore { support_precious: false })?;
-        for path in &candidates {
-            if path.split('/').any(|part| part == "..") || seen.contains(path) || !excluded_by(&search, path, case) {
-                continue;
-            }
-            seen.insert(path.clone());
-            files.push(path.clone());
-        }
-    }
-    Ok(files)
-}
-
-fn head_tree_impl(root: &str) -> Res<Option<String>> {
-    let repo = open(root)?;
-    match repo.head_tree_id() {
-        Ok(id) => Ok(Some(id.to_hex().to_string())),
-        Err(_) if repo.head()?.is_unborn() => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    Ok((changed, untracked, submodules))
 }
 
 /// A staged entry for the tree: (mode bits, object id), keyed by repository path.
@@ -700,10 +116,10 @@ struct Writer<'a> {
 
 impl Writer<'_> {
     /// Hash `data` as `kind`; store it unless the repository or the store already has it.
-    fn put(&self, kind: gix::objs::Kind, data: &[u8], write: bool) -> Res<gix::ObjectId> {
+    fn put(&self, kind: gix::objs::Kind, data: &[u8]) -> Res<gix::ObjectId> {
         use gix::objs::{Exists, Write};
         let id = gix::objs::compute_hash(gix::hash::Kind::Sha1, kind, data)?;
-        if write && !self.repo.objects.exists(&id) && !self.store.contains(&id) {
+        if !self.repo.objects.exists(&id) && !self.store.contains(&id) {
             self.store.write_buf(kind, data)?;
         }
         Ok(id)
@@ -711,7 +127,6 @@ impl Writer<'_> {
 }
 
 /// `git add` of one work-tree path: its index mode and blob id, or None when it is gone.
-/// `write` false hashes without storing, as `update-index --info-only` does.
 fn hash_path(
     w: &Writer<'_>,
     pipeline: &mut gix::filter::Pipeline<'_>,
@@ -720,7 +135,6 @@ fn hash_path(
     old_mode: Option<u32>,
     trust_exec: bool,
     symlinks: bool,
-    write: bool,
 ) -> Res<Option<(u32, gix::ObjectId)>> {
     let workdir = w.repo.workdir().ok_or("bare repository")?;
     let rela_path = gix::path::from_bstr(rela.as_bstr())?;
@@ -744,7 +158,7 @@ fn hash_path(
     if md.is_symlink() {
         let target = std::fs::read_link(&path)?;
         let bytes = gix::path::into_bstr(target)?.into_owned();
-        return Ok(Some((MODE_LINK, w.put(gix::objs::Kind::Blob, &bytes, write)?)));
+        return Ok(Some((MODE_LINK, w.put(gix::objs::Kind::Blob, &bytes)?)));
     }
     if !md.is_file() {
         return Ok(None); // a directory now stands where the file was: git drops the entry
@@ -777,7 +191,7 @@ fn hash_path(
             ToGitOutcome::Process(mut r) => r.read_to_end(&mut data)?,
         };
     }
-    Ok(Some((mode, w.put(gix::objs::Kind::Blob, &data, write)?)))
+    Ok(Some((mode, w.put(gix::objs::Kind::Blob, &data)?)))
 }
 
 #[cfg(unix)]
@@ -828,12 +242,12 @@ fn write_tree(w: &Writer<'_>, entries: &[(&BString, (u32, gix::ObjectId))], dept
     tree.entries.sort();
     let mut buf = Vec::new();
     gix::objs::WriteTo::write_to(&tree, &mut buf)?;
-    w.put(gix::objs::Kind::Tree, &buf, true)
+    w.put(gix::objs::Kind::Tree, &buf)
 }
 
 /// Untracked bytecode under `__pycache__/`, pytest's cache, and tox's `.tox/`.
 /// A loose `*.pyc` stays, and so does any tracked file: this is only for
-/// paths the status walk sees as untracked, or that `info_only` would hash.
+/// paths the status walk sees as untracked.
 /// A trailing slash stays (an embedded repository is still reported).
 fn run_generated(path: &[u8]) -> bool {
     if path.ends_with(b"/") {
@@ -858,30 +272,14 @@ fn run_generated(path: &[u8]) -> bool {
     under_pytest_cache || under_tox || (under_pycache && name.ends_with(b".pyc"))
 }
 
-/// `add -A` (minus `exclude`) on a copy of the index, `update-index --add --info-only` for `info_only`,
-/// the manifest blob at `manifest.0`, then `write-tree --missing-ok`. New objects go to `store` only.
-/// `max_untracked` set means a folder outside git hashed through a private bare repository: an embedded
-/// repository or more untracked files than the cap refuses, as `_nogit_refused` does.
-fn stage_core(
-    repo: &gix::Repository,
-    store: &str,
-    exclude: Vec<String>,
-    info_only: Vec<String>,
-    manifest: Option<(String, Vec<u8>)>,
-    max_untracked: Option<usize>,
-) -> Res<Staging> {
+/// Stage the worktree into a private object store and write its tree.
+fn stage_core(repo: &gix::Repository, store: &str) -> Res<String> {
     std::fs::create_dir_all(store)?;
-    let w = Writer { repo: &repo, store: gix::odb::loose::Store::at(store, gix::hash::Kind::Sha1) };
+    let w = Writer { repo, store: gix::odb::loose::Store::at(store, gix::hash::Kind::Sha1) };
     let trust_exec = cfg!(unix) && repo.config_snapshot().boolean("core.fileMode").unwrap_or(true);
     let symlinks = repo.config_snapshot().boolean("core.symlinks").unwrap_or(true);
     let drivers = filter_drivers(repo);
     let (mut pipeline, index) = repo.filter_pipeline(None)?;
-    let skipped = |path: &[u8]| {
-        exclude.iter().any(|ex| {
-            let ex = ex.trim_end_matches('/').as_bytes();
-            path == ex || (path.starts_with(ex) && path.get(ex.len()) == Some(&b'/'))
-        })
-    };
     let mut staged = Staged::new();
     for entry in index.entries() {
         let path = entry.path(&index);
@@ -889,22 +287,16 @@ fn stage_core(
             staged.insert(path.to_owned(), (entry.mode.bits(), entry.id));
         }
     }
-    let iter = status_platform(repo, false)?.into_index_worktree_iter(None::<BString>)?;
+    let iter = status_platform(repo)?.into_index_worktree_iter(None::<BString>)?;
     let mut redo: Vec<(BString, Option<u32>)> = Vec::new();
-    let mut untracked = 0usize;
-    let mut embedded = false;
     for item in iter {
         match item.map_err(|e| format!("status: {e}"))? {
             WorktreeItem::Modification { rela_path, status, entry, .. } => {
-                if skipped(&rela_path) {
-                    continue;
-                }
                 match status {
                     EntryStatus::Change(Change::SubmoduleModification(_)) => {
                         return Err("a submodule differs; git add would store only its gitlink".into())
                     }
-                    // Tracked files under an excluded path still count. run_generated
-                    // applies to untracked entries and info-only paths, not here.
+                    // run_generated applies only to untracked entries, not here.
                     EntryStatus::NeedsUpdate(_) => {}
                     // git add -A drops it from the index mid-run, so later paths lose its attributes.
                     EntryStatus::Change(Change::Removed | Change::Type { .. })
@@ -916,15 +308,14 @@ fn stage_core(
                 }
             }
             WorktreeItem::DirectoryContents { entry, .. } => {
-                if entry.status != DirStatus::Untracked || skipped(&entry.rela_path) {
+                if entry.status != DirStatus::Untracked {
                     continue;
                 }
                 // A repository named like a cache is still an embedded repository.
                 if !matches!(entry.disk_kind, Some(Kind::Repository)) && run_generated(entry.rela_path.as_bytes()) {
                     continue;
                 }
-                untracked += 1;
-                // The preflight read only tracked attribute files; a new one gets the same check.
+                // Refuse unproven conversion attributes in a new attributes file.
                 if entry.rela_path.rsplit_str("/").next() == Some(b".gitattributes".as_bstr()) {
                     let workdir = repo.workdir().ok_or("bare repository")?;
                     let text = std::fs::read(workdir.join(gix::path::from_bstr(entry.rela_path.as_bstr())?))
@@ -935,7 +326,6 @@ fn stage_core(
                 }
                 match entry.disk_kind {
                     Some(Kind::File | Kind::Symlink) => redo.push((entry.rela_path, None)),
-                    Some(Kind::Repository) if max_untracked.is_some() => embedded = true,
                     Some(Kind::Repository) => return Err("embedded git repository".into()),
                     _ => {}
                 }
@@ -943,112 +333,22 @@ fn stage_core(
             other => return Err(format!("unexpected status item: {other:?}").into()),
         }
     }
-    if embedded {
-        return Ok(Staging::Refused("embedded git repository"));
-    }
-    if max_untracked.is_some_and(|max| untracked > max) {
-        return Ok(Staging::Refused(""));
-    }
     let state: &gix::index::State = &index;
     for (path, old_mode) in redo {
         staged.remove(&path);
-        let found = hash_path(&w, &mut pipeline, state, &path, old_mode, trust_exec, symlinks, true)
+        let found = hash_path(&w, &mut pipeline, state, &path, old_mode, trust_exec, symlinks)
             .map_err(|e| format!("hash {path}: {e}"))?;
         if let Some(found) = found {
             staged.insert(path, found);
         }
     }
-    for path in info_only {
-        let path = BString::from(path);
-        if run_generated(path.as_bytes()) {
-            continue;
-        }
-        if let Some(found) = hash_path(&w, &mut pipeline, state, &path, None, trust_exec, symlinks, false)? {
-            staged.insert(path, found);
-        }
-    }
-    if let Some((path, content)) = manifest {
-        if staged.contains_key(path.as_bytes().as_bstr()) {
-            return Err("route: the manifest path is in use".into());
-        }
-        staged.insert(path.into(), (MODE_FILE, w.put(gix::objs::Kind::Blob, &content, true)?));
-    }
     let entries: Vec<(&BString, (u32, gix::ObjectId))> = staged.iter().map(|(p, v)| (p, *v)).collect();
-    Ok(Staging::Tree(write_tree(&w, &entries, 0)?.to_hex().to_string()))
+    Ok(write_tree(&w, &entries, 0)?.to_hex().to_string())
 }
 
-/// A staged tree id, or why a folder outside git is refused ("" when only the file cap is passed).
-enum Staging {
-    Tree(String),
-    Refused(&'static str),
+fn stage_and_write_impl(root: &str, store: &str) -> Res<String> {
+    stage_core(&open(root)?, store)
 }
-
-fn stage_and_write_impl(
-    root: &str,
-    store: &str,
-    exclude: Vec<String>,
-    info_only: Vec<String>,
-    manifest: Option<(String, Vec<u8>)>,
-) -> Res<String> {
-    match stage_core(&open(root)?, store, exclude, info_only, manifest, None)? {
-        Staging::Tree(id) => Ok(id),
-        Staging::Refused(reason) => Err(reason.into()),
-    }
-}
-
-/// The no-git fingerprint: `root` hashed through a new private repository at `git_dir` whose config
-/// points its work tree at `root` (the CLI path sets GIT_WORK_TREE instead), with an empty index.
-/// Returns (tree, refusal reason).
-fn nogit_impl(root: &str, git_dir: &str, store: &str, max_files: usize) -> Res<(Option<String>, Option<String>)> {
-    use std::io::Write;
-    if Path::new(git_dir).exists() {
-        return Err("the private repository must be new".into());
-    }
-    let root = plain(std::fs::canonicalize(root)?);
-    let root = root.to_str().ok_or("path is not UTF-8")?;
-    if root.contains('\n') {
-        return Err("route: a newline in the folder path".into());
-    }
-    gix::init_bare(git_dir)?;
-    let quoted = root.replace('\\', "\\\\").replace('"', "\\\"");
-    let mut config = std::fs::OpenOptions::new().append(true).open(Path::new(git_dir).join("config"))?;
-    writeln!(config, "[core]\n\tbare = false\n\tworktree = \"{quoted}\"")?;
-    drop(config);
-    let repo = gix::open(git_dir)?;
-    if repo.workdir() != Some(Path::new(root)) {
-        return Err(format!("the private repository did not take the work tree: {:?}", repo.workdir()).into());
-    }
-    Ok(match stage_core(&repo, store, Vec::new(), Vec::new(), None, Some(max_files))? {
-        Staging::Tree(id) => (Some(id), None),
-        Staging::Refused(reason) => (None, Some(reason.to_owned())),
-    })
-}
-
-#[cfg(feature = "python")]
-#[pyfunction]
-#[pyo3(signature = (root, store, exclude, info_only, manifest=None))]
-fn stage_and_write(
-    py: Python<'_>,
-    root: String,
-    store: String,
-    exclude: Vec<String>,
-    info_only: Vec<String>,
-    manifest: Option<(String, Vec<u8>)>,
-) -> PyResult<String> {
-    py.detach(|| stage_and_write_impl(&root, &store, exclude, info_only, manifest)).map_err(err)
-}
-
-/// Environment variables that move git's view of the repository; the git CLI honors them all.
-/// (GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, and GIT_CONFIG_COUNT are absent: gix reads them as git does.)
-const RELOCATING_ENV: &[&str] = &[
-    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-    "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
-    "GIT_ATTR_SOURCE", "GIT_ICASE_PATHSPECS", "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS",
-];
-
-/// `extensions.*` keys this engine reads like git; any other routes to the CLI.
-const KNOWN_EXTENSIONS: &[&str] = &["objectformat", "refstorage", "worktreeconfig", "preciousobjects", "noop"];
 
 /// Whether any `filter.<driver>` has a command git would run.
 fn filter_drivers(repo: &gix::Repository) -> bool {
@@ -1103,192 +403,309 @@ fn unproven_attributes(text: &[u8], drivers: bool) -> Option<&'static str> {
     }
 }
 
-/// Whether this repository may be fingerprinted in process: ("inprocess", "") or ("cli", reason).
-/// `nogit`: a folder outside any repository, hashed through a private one; only the environment matters.
-fn preflight_impl(root: &str, max_entries: usize, nogit: bool) -> Res<(String, String)> {
-    let cli = |reason: &str| Ok(("cli".to_owned(), reason.to_owned()));
-    for name in RELOCATING_ENV {
-        if std::env::var_os(name).is_some() {
-            return cli(&format!("{name} is set"));
+/// Return the worktree tree ID, or None when it cannot be fingerprinted.
+pub fn worktree_fingerprint(root: &str, store: &str) -> Option<String> {
+    stage_and_write_impl(root, store).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{stage_and_write_impl, worktree_fingerprint};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const NAMES: [&str; 13] = ["a", "a.txt", "a-", "a0", "a.b", "b", "B", "x y", "ü.txt", "z", "dir", "dir.txt", "dir-"];
+    const RULES: [&str; 7] = ["*.b", "!keep.b", "dir/", "a0", "x y/", "*.dat", "!dir/a"];
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("prometheus-fingerprint-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            fs::create_dir(&path).unwrap();
+            Self(path)
         }
     }
-    if nogit {
-        return Ok(("inprocess".to_owned(), String::new()));
+    impl Drop for Temp {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
     }
-    let repo = match gix::discover(root) {
-        Ok(repo) => repo,
-        Err(_) => return cli("not a repository gix can open"),
-    };
-    let config = repo.config_snapshot();
-    if config.integer("core.repositoryFormatVersion").unwrap_or(0) > 1 {
-        return cli("core.repositoryFormatVersion above 1");
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            z ^ (z >> 31)
+        }
+        fn n(&mut self, n: usize) -> usize { (self.next() % n as u64) as usize }
+        fn path(&mut self) -> String {
+            let depth = 1 + self.n(3);
+            (0..depth).map(|_| NAMES[self.n(NAMES.len())]).collect::<Vec<_>>().join("/")
+        }
+        fn content(&mut self) -> Vec<u8> {
+            if self.n(7) == 0 {
+                let count = 1 + self.n(39);
+                return (0..count).map(|_| self.next() as u8).collect();
+            }
+            let eol: &[u8] = [b"\n".as_slice(), b"\r\n", b"\r"][self.n(3)];
+            let count = self.n(5);
+            let mut bytes = Vec::new();
+            for i in 0..count {
+                if i > 0 { bytes.extend_from_slice(eol); }
+                let word = ["x", "y", "line", ""][self.n(4)];
+                for _ in 0..1 + self.n(3) { bytes.extend_from_slice(word.as_bytes()); }
+            }
+            if self.n(10) < 7 { bytes.extend_from_slice(eol); }
+            bytes
+        }
     }
-    let file = config.plumbing();
-    for section in file.sections_by_name("extensions").into_iter().flatten() {
-        for key in section.body().value_names() {
-            let key = key.to_ascii_lowercase();
-            if !KNOWN_EXTENSIONS.contains(&key.as_str()) {
-                return cli(&format!("extensions.{key}"));
+
+    fn git(root: &Path, home: &Path, args: &[&str], extra: &[(&str, &Path)]) -> Output {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(root).args(args).env("HOME", home).env("GIT_CONFIG_NOSYSTEM", "1");
+        for (key, value) in extra { command.env(key, value); }
+        command.output().expect("git must be installed")
+    }
+    fn git_ok(root: &Path, home: &Path, args: &[&str], extra: &[(&str, &Path)]) -> String {
+        let out = git(root, home, args, extra);
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim_end().to_owned()
+    }
+    fn init(root: &Path, home: &Path) {
+        fs::create_dir(root).unwrap();
+        git_ok(root, home, &["init", "-q"], &[]);
+        for (key, val) in [("core.autocrlf", "false"), ("core.eol", "native"), ("status.showUntrackedFiles", "all")] {
+            git_ok(root, home, &["config", key, val], &[]);
+        }
+        #[cfg(unix)]
+        for (key, val) in [("core.fileMode", "true"), ("core.symlinks", "true")] {
+            git_ok(root, home, &["config", key, val], &[]);
+        }
+        let empty = home.join("empty");
+        fs::write(&empty, "").unwrap();
+        for key in ["core.excludesfile", "core.attributesfile"] {
+            git_ok(root, home, &["config", key, empty.to_str().unwrap()], &[]);
+        }
+    }
+    fn place(root: &Path, rel: &str, rng: &mut Rng, link: bool) {
+        let path = root.join(rel);
+        if fs::create_dir_all(path.parent().unwrap()).is_err() { return; }
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            let result = if meta.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+            if result.is_err() { return; }
+        }
+        #[cfg(unix)]
+        if link {
+            use std::os::unix::fs::symlink;
+            let target = ["a", "../a.txt", "dir", "missing", "."][rng.n(5)];
+            let _ = symlink(target, &path);
+            return;
+        }
+        #[cfg(not(unix))]
+        let _ = link;
+        if fs::write(&path, rng.content()).is_ok() {
+            #[cfg(unix)]
+            if rng.n(5) == 0 {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o755));
             }
         }
     }
-    if config.string("extensions.objectFormat").is_some_and(|v| !v.eq_ignore_ascii_case(b"sha1")) {
-        return cli("extensions.objectFormat is not sha1");
+    fn expected(root: &Path, home: &Path, temp: &Path) -> String {
+        let index = temp.join("index");
+        let source = root.join(".git/index");
+        if source.exists() { fs::copy(source, &index).unwrap(); }
+        let objects = temp.join("git-objects");
+        fs::create_dir(&objects).unwrap();
+        let alternate = root.join(".git/objects");
+        let env = [("GIT_INDEX_FILE", index.as_path()), ("GIT_OBJECT_DIRECTORY", objects.as_path()), ("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternate.as_path())];
+        git_ok(root, home, &["-c", "core.splitIndex=false", "add", "-A"], &env);
+        git_ok(root, home, &["-c", "core.splitIndex=false", "write-tree", "--missing-ok"], &env)
     }
-    if config.string("extensions.refStorage").is_some_and(|v| !v.eq_ignore_ascii_case(b"files")) {
-        return cli("extensions.refStorage is not files");
-    }
-    if let Some(value) = config.string("core.fsmonitor") {
-        if config.boolean("core.fsmonitor") != Some(false) && !value.is_empty() {
-            return cli("core.fsmonitor is set");
+    fn parity(category: usize) {
+        let names = ["plain", "text-auto", "autocrlf-true", "eol-attributes", "gitignore", "staged", "untracked-hidden", "symlinks-off"];
+        let mut verified = 0;
+        for iteration in 0..20 {
+            let tmp = Temp::new();
+            let root = tmp.0.join("repo");
+            let home = tmp.0.join("home");
+            fs::create_dir(&home).unwrap();
+            init(&root, &home);
+            let mut rng = Rng((category as u64).wrapping_mul(0xd1b54a32d192ed03) ^ iteration as u64 ^ 0x5eed);
+            match category {
+                1 => fs::write(root.join(".gitattributes"), "* text=auto\n").unwrap(),
+                2 => { git_ok(&root, &home, &["config", "core.autocrlf", "true"], &[]); },
+                3 => {
+                    fs::write(root.join(".gitattributes"), "*.txt eol=lf\n*.b eol=crlf\n*.dat binary\n").unwrap();
+                    git_ok(&root, &home, &["config", "core.autocrlf", "input"], &[]);
+                },
+                4 => {
+                    let mut rules = Vec::new();
+                    for _ in 0..1 + rng.n(4) { rules.push(RULES[rng.n(RULES.len())]); }
+                    fs::write(root.join(".gitignore"), format!("{}\n", rules.join("\n"))).unwrap();
+                    let mut outside = Vec::new();
+                    for _ in 0..1 + rng.n(4) { outside.push(RULES[rng.n(RULES.len())]); }
+                    fs::write(root.join(".git/info/exclude"), format!("{}\n", outside.join("\n"))).unwrap();
+                },
+                6 => { git_ok(&root, &home, &["config", "status.showUntrackedFiles", "no"], &[]); },
+                7 => { git_ok(&root, &home, &["config", "core.symlinks", "false"], &[]); },
+                _ => {}
+            }
+            for _ in 0..3 + rng.n(12) {
+                let path = rng.path();
+                let link = rng.n(10) == 0;
+                place(&root, &path, &mut rng, link);
+            }
+            git_ok(&root, &home, &["add", "-A"], &[]);
+            git_ok(&root, &home, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base", "--allow-empty"], &[]);
+            let tracked = git(&root, &home, &["ls-files", "-z"], &[]).stdout;
+            let tracked: Vec<&str> = tracked.split(|b| *b == 0).filter(|v| !v.is_empty()).map(|v| std::str::from_utf8(v).unwrap()).collect();
+            for _ in 0..1 + rng.n(9) {
+                let action = rng.n(100);
+                if !tracked.is_empty() && action < 45 {
+                    let path = root.join(tracked[rng.n(tracked.len())]);
+                    if let Ok(meta) = fs::symlink_metadata(&path) {
+                        if action < 30 && meta.is_file() {
+                            if rng.n(10) < 7 { let _ = fs::write(&path, rng.content()); }
+                            else {
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(meta.permissions().mode() ^ 0o111));
+                                }
+                            }
+                        } else if action >= 30 && !meta.is_dir() { let _ = fs::remove_file(&path); }
+                    }
+                } else {
+                    let path = rng.path();
+                    place(&root, &path, &mut rng, action < 55);
+                }
+            }
+            if category == 5 {
+                let output = git(&root, &home, &["-c", "status.renames=false", "status", "--porcelain", "-z", "-uall"], &[]);
+                assert!(output.status.success());
+                let changed: Vec<&[u8]> = output.stdout.split(|b| *b == 0).filter(|s| s.len() > 3).collect();
+                for _ in 0..rng.n(3).min(changed.len()) {
+                    let path = std::str::from_utf8(&changed[rng.n(changed.len())][3..]).unwrap();
+                    let args = if rng.n(3) == 0 { vec!["add", "-N", "--", path] } else { vec!["add", "--", path] };
+                    let _ = git(&root, &home, &args, &[]);
+                }
+            }
+            let expected = expected(&root, &home, &tmp.0);
+            let store = tmp.0.join("core-objects");
+            let root_str = root.to_str().unwrap();
+            let store_str = store.to_str().unwrap();
+            match stage_and_write_impl(root_str, store_str) {
+                Ok(got) => {
+                    if got != expected {
+                        let original = root.join(".git/objects");
+                        let reference = tmp.0.join("git-objects");
+                        let actual_env = [("GIT_OBJECT_DIRECTORY", store.as_path()), ("GIT_ALTERNATE_OBJECT_DIRECTORIES", original.as_path())];
+                        let expected_env = [("GIT_OBJECT_DIRECTORY", reference.as_path()), ("GIT_ALTERNATE_OBJECT_DIRECTORIES", original.as_path())];
+                        let actual_tree = git_ok(&root, &home, &["ls-tree", "-r", &got], &actual_env);
+                        let expected_tree = git_ok(&root, &home, &["ls-tree", "-r", &expected], &expected_env);
+                        panic!("{} iteration {iteration}\nactual:\n{actual_tree}\nexpected:\n{expected_tree}", names[category]);
+                    }
+                    assert_eq!(worktree_fingerprint(root_str, store_str), Some(expected), "{} iteration {iteration}", names[category]);
+                    verified += 1;
+                }
+                Err(error) if error.to_string().starts_with("route:") => assert_eq!(worktree_fingerprint(root_str, store_str), None),
+                Err(error) => panic!("{} iteration {iteration}: {error}", names[category]),
+            }
         }
+        assert!(verified > 0, "{} had no verified trees", names[category]);
     }
-    if config.boolean("core.safecrlf") == Some(true) {
-        return cli("core.safecrlf is true");
-    }
-    if config.string("core.bigFileThreshold").is_some() {
-        return cli("core.bigFileThreshold packs large blobs");
-    }
-    // Failed parity: with core.ignoreCase on a case-sensitive filesystem, gix and git disagree on excludes.
-    if config.boolean("core.ignoreCase") == Some(true) && !case_insensitive_fs(repo.git_dir()) {
-        return cli("core.ignoreCase on a case-sensitive filesystem");
-    }
-    // Failed parity: git reads a relative excludesFile from the work tree, gix does not.
-    if matches!(config.trusted_path("core.excludesFile"), Ok(Some(path)) if !path.is_absolute()) {
-        return cli("core.excludesFile is relative");
-    }
-    let index = repo.index_or_empty()?;
-    if index.is_sparse() {
-        return cli("sparse index");
-    }
-    if index.entries().len() > max_entries {
-        return cli("index above the in-process size threshold");
-    }
-    // Attribute sources: tracked .gitattributes (work tree copy), info/attributes, the global file.
-    let workdir = repo.workdir().ok_or("bare repository")?;
-    let mut sources: Vec<PathBuf> = index
-        .entries()
-        .iter()
-        .map(|e| e.path(&index))
-        .filter(|p| p.rsplit_str("/").next() == Some(b".gitattributes".as_bstr()))
-        .filter_map(|p| gix::path::from_bstr(p).ok().map(|p| workdir.join(p)))
-        .collect();
-    sources.push(repo.common_dir().join("info").join("attributes"));
-    if let Ok(Some(global)) = config.trusted_path("core.attributesFile") {
-        sources.push(global.into());
-    } else if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
-    }) {
-        sources.push(base.join("git").join("attributes"));
-    }
-    let drivers = filter_drivers(&repo);
-    for source in sources {
-        let Ok(text) = std::fs::read(&source) else { continue };
-        if let Some(reason) = unproven_attributes(&text, drivers) {
-            return cli(reason);
+    #[test] fn parity_plain() { parity(0); }
+    #[test] fn parity_text_auto() { parity(1); }
+    #[test] fn parity_autocrlf_true() { parity(2); }
+    #[test] fn parity_eol_attributes() { parity(3); }
+    #[test] fn parity_gitignore() { parity(4); }
+    #[test] fn parity_staged() { parity(5); }
+    #[test] fn parity_untracked_hidden() { parity(6); }
+    #[test] fn parity_symlinks_off() { parity(7); }
+
+    #[test]
+    fn ignore_negations_apply_in_both_files() {
+        let tmp = Temp::new();
+        let home = tmp.0.join("home");
+        fs::create_dir(&home).unwrap();
+        let root = tmp.0.join("repo");
+        init(&root, &home);
+        let global_excludes = home.join("excludes");
+        fs::write(&global_excludes, "*.txt\n!keep.txt\n").unwrap();
+        git_ok(&root, &home, &["config", "core.excludesfile", global_excludes.to_str().unwrap()], &[]);
+        fs::write(root.join(".gitignore"), "*.dat\n!keep.dat\n").unwrap();
+        fs::write(root.join(".git/info/exclude"), "*.b\n!keep.b\n").unwrap();
+        for name in ["skip.dat", "keep.dat", "skip.b", "keep.b", "skip.txt", "keep.txt"] {
+            fs::write(root.join(name), name).unwrap();
         }
+        let tree = expected(&root, &home, &tmp.0);
+        let objects = tmp.0.join("git-objects");
+        let alternate = root.join(".git/objects");
+        let env = [("GIT_OBJECT_DIRECTORY", objects.as_path()), ("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternate.as_path())];
+        let names = git_ok(&root, &home, &["ls-tree", "-r", "--name-only", &tree], &env);
+        assert_eq!(names.lines().collect::<Vec<_>>(), [".gitignore", "keep.b", "keep.dat", "keep.txt"]);
+        let store = tmp.0.join("core-objects");
+        assert_eq!(worktree_fingerprint(root.to_str().unwrap(), store.to_str().unwrap()), Some(tree));
     }
-    Ok(("inprocess".to_owned(), String::new()))
-}
 
-#[cfg(feature = "python")]
-#[pyfunction]
-#[pyo3(signature = (root, max_entries, nogit=false))]
-fn preflight(py: Python<'_>, root: String, max_entries: usize, nogit: bool) -> PyResult<(String, String)> {
-    py.detach(|| preflight_impl(&root, max_entries, nogit)).map_err(err)
-}
+    #[test]
+    fn routes_unproven_new_attributes() {
+        let tmp = Temp::new();
+        let home = tmp.0.join("home");
+        fs::create_dir(&home).unwrap();
+        let root = tmp.0.join("repo");
+        init(&root, &home);
+        fs::write(root.join(".gitattributes"), "*.txt ident\n").unwrap();
+        let store = tmp.0.join("objects");
+        let root = root.to_str().unwrap();
+        let store = store.to_str().unwrap();
+        assert!(stage_and_write_impl(root, store).unwrap_err().to_string().starts_with("route:"));
+        assert_eq!(worktree_fingerprint(root, store), None);
+    }
 
-#[cfg(feature = "python")]
-#[pyfunction]
-fn nogit_stage_and_write(
-    py: Python<'_>,
-    root: String,
-    git_dir: String,
-    store: String,
-    max_files: usize,
-) -> PyResult<(Option<String>, Option<String>)> {
-    py.detach(|| nogit_impl(&root, &git_dir, &store, max_files)).map_err(err)
-}
+    #[test]
+    fn refuses_non_repository_and_embedded_repository() {
+        let tmp = Temp::new();
+        let home = tmp.0.join("home");
+        fs::create_dir(&home).unwrap();
+        let root = tmp.0.join("repo");
+        fs::create_dir(&root).unwrap();
+        let store = tmp.0.join("objects");
+        assert_eq!(worktree_fingerprint(root.to_str().unwrap(), store.to_str().unwrap()), None);
+        git_ok(&root, &home, &["init", "-q"], &[]);
+        let embedded = root.join("embedded");
+        init(&embedded, &home);
+        assert_eq!(worktree_fingerprint(root.to_str().unwrap(), store.to_str().unwrap()), None);
+    }
 
-#[cfg(feature = "python")]
-#[pyfunction]
-fn paths(py: Python<'_>, cwd: String) -> PyResult<(String, String, String, String, String)> {
-    py.detach(|| paths_impl(&cwd)).map_err(err)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction]
-fn linked_worktrees(py: Python<'_>, root: String) -> PyResult<Vec<String>> {
-    py.detach(|| linked_worktrees_impl(&root)).map_err(err)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction]
-#[pyo3(signature = (root, threads=None))]
-fn status(py: Python<'_>, root: String, threads: Option<usize>) -> PyResult<(bool, Vec<String>, Vec<SubmoduleFacts>)> {
-    py.detach(|| status_impl(&root, threads)).map_err(err)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction]
-fn status_and_ignored(py: Python<'_>, root: String) -> PyResult<(StatusFacts, Vec<String>)> {
-    py.detach(|| status_walk(&root, None, true)).map_err(err)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction]
-fn tracked_special(py: Python<'_>, root: String) -> PyResult<Vec<Tracked>> {
-    py.detach(|| tracked_special_impl(&root)).map_err(err)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction]
-fn tracked(py: Python<'_>, root: String) -> PyResult<Vec<Tracked>> {
-    py.detach(|| tracked_impl(&root)).map_err(err)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction]
-fn ignored_untracked(py: Python<'_>, root: String) -> PyResult<Vec<String>> {
-    py.detach(|| ignored_untracked_impl(&root)).map_err(err)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction]
-fn outside_excluded(py: Python<'_>, root: String, entries: Vec<String>, info_exclude: String) -> PyResult<Vec<String>> {
-    py.detach(|| outside_excluded_impl(&root, entries, &info_exclude)).map_err(err)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction]
-fn head_tree(py: Python<'_>, root: String) -> PyResult<Option<String>> {
-    py.detach(|| head_tree_impl(&root)).map_err(err)
-}
-
-/// Tree fingerprint of a working tree for the standalone `prometheus-check`
-/// runner (ADR-0010): the same staging the Python route uses, with no
-/// exclusions and no manifest. `None` when the engine refuses the tree
-/// (embedded repository, oversized no-git folder, not a repository gix can
-/// open); the runner fails closed instead of inventing an identity.
-pub fn worktree_fingerprint(root: &str, store: &str) -> Option<String> {
-    stage_and_write_impl(root, store, Vec::new(), Vec::new(), None).ok()
-}
-
-/// Register every fingerprint primitive on the `prometheus_core` module.
-#[cfg(feature = "python")]
-pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("ENGINE_API", crate::ENGINE_API)?;
-    m.add_function(wrap_pyfunction!(preflight, m)?)?;
-    m.add_function(wrap_pyfunction!(nogit_stage_and_write, m)?)?;
-    m.add_function(wrap_pyfunction!(paths, m)?)?;
-    m.add_function(wrap_pyfunction!(linked_worktrees, m)?)?;
-    m.add_function(wrap_pyfunction!(status, m)?)?;
-    m.add_function(wrap_pyfunction!(tracked, m)?)?;
-    m.add_function(wrap_pyfunction!(tracked_special, m)?)?;
-    m.add_function(wrap_pyfunction!(status_and_ignored, m)?)?;
-    m.add_function(wrap_pyfunction!(ignored_untracked, m)?)?;
-    m.add_function(wrap_pyfunction!(outside_excluded, m)?)?;
-    m.add_function(wrap_pyfunction!(head_tree, m)?)?;
-    m.add_function(wrap_pyfunction!(stage_and_write, m)?)?;
-    Ok(())
+    #[test]
+    fn ignores_only_untracked_generated_caches() {
+        let tmp = Temp::new();
+        let home = tmp.0.join("home");
+        fs::create_dir(&home).unwrap();
+        let root = tmp.0.join("repo");
+        init(&root, &home);
+        fs::create_dir_all(root.join("__pycache__")).unwrap();
+        fs::write(root.join("__pycache__/tracked.pyc"), "tracked").unwrap();
+        git_ok(&root, &home, &["add", "-f", "__pycache__/tracked.pyc"], &[]);
+        let store = tmp.0.join("objects");
+        let fingerprint = || worktree_fingerprint(root.to_str().unwrap(), store.to_str().unwrap()).unwrap();
+        let before = fingerprint();
+        for path in ["__pycache__/m.pyc", ".pytest_cache/v/cache/lastfailed", ".tox/py/log"] {
+            let file = root.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "ignored").unwrap();
+        }
+        assert_eq!(fingerprint(), before);
+        fs::write(root.join("top.pyc"), "loose").unwrap();
+        let loose = fingerprint();
+        assert_ne!(loose, before);
+        fs::write(root.join("__pycache__/tracked.pyc"), "changed").unwrap();
+        assert_ne!(fingerprint(), loose);
+    }
 }

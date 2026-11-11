@@ -182,7 +182,7 @@ fn cargo_graph_json(root: &Path) -> String {
                 .map(|items| {
                     items
                         .iter()
-                        .filter_map(|dep| dep.get("path").and_then(|value| value.as_str()).map(|path| rel(path)))
+                        .filter_map(|dep| dep.get("path").and_then(|value| value.as_str()).map(rel))
                         .collect()
                 })
                 .unwrap_or_default();

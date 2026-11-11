@@ -15,9 +15,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-
 const SCHEMA: u32 = 1;
 const FAILING_LINE_LIMIT: usize = 50;
 const SELECTOR_LIMIT: usize = 50;
@@ -318,10 +315,9 @@ fn failed_selectors(lines: &[&str]) -> Vec<String> {
             pytest_failure(line).map(str::to_string)
         } else if let Some(name) = cargo_failure(line) {
             Some(format!("cargo test -- --exact {name}"))
-        } else if let Some(name) = vstest_failure(line).or_else(|| mtp_failure(line)) {
-            Some(format!("dotnet test --filter FullyQualifiedName={name}"))
         } else {
-            None
+            vstest_failure(line).or_else(|| mtp_failure(line))
+                .map(|name| format!("dotnet test --filter FullyQualifiedName={name}"))
         };
         if let Some(selector) = selector {
             if selectors.len() < SELECTOR_LIMIT && seen.insert(selector.clone()) {
@@ -478,7 +474,7 @@ fn pytest_group(line: &str) -> Option<&str> {
         ends.push(pos);
         if rest[pos..].starts_with(", ") {
             pos += 2;
-        } else if bytes.get(pos).map_or(false, |b| b.is_ascii_digit()) {
+        } else if bytes.get(pos).is_some_and(|b| b.is_ascii_digit()) {
             // Adjacent item with no separator: keep scanning.
         } else {
             break;
@@ -725,10 +721,8 @@ fn vstest_parse(line: &str) -> Option<(Verdict, DotnetValues, String)> {
         (rest, Verdict::Passed)
     } else if let Some(rest) = line.strip_prefix("Failed!") {
         (rest, Verdict::Failed)
-    } else if let Some(rest) = line.strip_prefix("Skipped!") {
-        (rest, Verdict::Skipped)
     } else {
-        return None;
+        (line.strip_prefix("Skipped!")?, Verdict::Skipped)
     };
     let spaces = tail.bytes().take_while(|b| *b == b' ' || *b == b'\t').count();
     if spaces == 0 {
@@ -957,7 +951,7 @@ fn receipt_json(
 }
 
 fn parse_impl(text: &str, exit_code: Option<i64>) -> String {
-    let known_failure = exit_code.map_or(false, |code| code != 0);
+    let known_failure = exit_code.is_some_and(|code| code != 0);
     let failing_lines: Vec<String> = split_lines(text)
         .into_iter()
         .filter(|line| is_failing_line(line))
@@ -1046,31 +1040,11 @@ fn parse_impl(text: &str, exit_code: Option<i64>) -> String {
     receipt_json(counts.as_ref(), error, &failing_lines, &failed_tests)
 }
 
-/// Parse check output into the normalized receipt document (JSON, schema 1).
-/// Never raises: a parse failure is the document's `error` code, and any
-/// internal failure degrades to the `no-summary` document — the caller
-/// still holds the Python route as its fallback.
-#[cfg(feature = "python")]
-#[pyfunction]
-#[pyo3(signature = (text, exit_code=None))]
-fn parse_check_log(text: &str, exit_code: Option<i64>) -> String {
-    match std::panic::catch_unwind(|| parse_impl(text, exit_code)) {
-        Ok(document) => document,
-        Err(_) => receipt_json(None, Some("no-summary"), &[], &[]),
-    }
-}
-
 /// The parsed check-log document for the standalone `prometheus-check`
-/// runner (ADR-0010): the same JSON `parse_check_log` returns to Python.
+/// runner (ADR-0010).
 pub fn parse_document(text: &str, exit_code: Option<i64>) -> String {
     match std::panic::catch_unwind(|| parse_impl(text, exit_code)) {
         Ok(document) => document,
         Err(_) => receipt_json(None, Some("no-summary"), &[], &[]),
     }
-}
-
-#[cfg(feature = "python")]
-pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(parse_check_log, m)?)?;
-    Ok(())
 }

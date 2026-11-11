@@ -22,12 +22,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-
 use crate::classify::is_test_path;
-#[cfg(feature = "python")]
-use crate::fingerprint::err;
 use crate::fingerprint::{open, status_impl, text, Res};
 
 const SCHEMA: u32 = 1;
@@ -210,10 +205,8 @@ fn public_symbols(text: &str) -> Vec<String> {
             }
         } else if let Some(rest) = strip_keyword(line, "def") {
             Some(rest)
-        } else if let Some(rest) = strip_keyword(line, "class") {
-            Some(rest)
         } else {
-            None
+            strip_keyword(line, "class")
         };
         let rest = match rest {
             Some(rest) => rest,
@@ -227,7 +220,7 @@ fn public_symbols(text: &str) -> Vec<String> {
             Some(first) => first,
             None => continue,
         };
-        if !(first.is_ascii_alphabetic() || first == '_') || first == '_' {
+        if !first.is_ascii_alphabetic() {
             continue;
         }
         if !symbols.contains(&name) {
@@ -865,7 +858,7 @@ fn impact_impl(
             }
         }
     }
-    callers.sort_by(|a, b| (a.path.clone(), a.references.clone()).cmp(&(b.path.clone(), b.references.clone())));
+    callers.sort_by_key(|a| (a.path.clone(), a.references.clone()));
     let caller_paths: HashSet<&str> = callers.iter().map(|entry| entry.path.as_str()).collect();
     let mut caller_modules: BTreeSet<String> = BTreeSet::new();
     for entry in &callers {
@@ -1181,7 +1174,7 @@ fn python_module_target(root: &Path, changed: &[String]) -> Option<String> {
 }
 
 /// The selection ladder — the hook's `_impact_selection`, step for step.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn selection(
     changed: &[String],
     affected: &Option<Vec<String>>,
@@ -1241,22 +1234,9 @@ fn selection(
     (level, vec![], vec![], vec![], module_target.clone(), reasons)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction]
-fn impact(
-    py: Python<'_>,
-    root: String,
-    changed: Vec<String>,
-    tests: Option<Vec<String>>,
-    cargo_json: String,
-) -> PyResult<String> {
-    py.detach(|| impact_impl(&root, &changed, &tests, &cargo_json)).map_err(err)
-}
-
-/// The impact document for the standalone `prometheus-check` runner
-/// (ADR-0010): the same JSON the Python route receives. `tests` is the
-/// discovered test-file listing, or `None` when discovery failed — the
-/// document then widens fail-closed and records why.
+/// The impact document for the standalone `prometheus-check` runner (ADR-0010).
+/// `tests` is the discovered test-file listing, or `None` when discovery failed —
+/// the document then widens fail-closed and records why.
 pub fn impact_document(
     root: &str,
     changed: &[String],
@@ -1264,11 +1244,4 @@ pub fn impact_document(
     cargo_json: &str,
 ) -> Option<String> {
     impact_impl(root, changed, &tests, cargo_json).ok()
-}
-
-/// Register the impact graph on the `prometheus_core` module.
-#[cfg(feature = "python")]
-pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(impact, m)?)?;
-    Ok(())
 }

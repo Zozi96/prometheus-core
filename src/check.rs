@@ -254,7 +254,7 @@ fn is_dotnet_target(arg: &str) -> bool {
     // A leading slash is an MSBuild flag (`/p:Name=value`) unless a path
     // separator comes before any `:` or `=`: `/tmp/x.csproj` is a target.
     match arg.strip_prefix('/') {
-        Some(rest) => rest.find('/').is_some_and(|slash| rest.find([':', '=']).map_or(true, |end| slash < end)),
+        Some(rest) => rest.find('/').is_some_and(|slash| rest.find([':', '=']).is_none_or(|end| slash < end)),
         None => true,
     }
 }
@@ -1059,7 +1059,7 @@ pub fn find_green(
                 && row.command == logical
                 && row.exit == 0
                 && row.behavioral
-                && !(plain && !row.profile.is_empty())
+                && (!plain || row.profile.is_empty())
         })
         .cloned()
 }
@@ -1129,7 +1129,7 @@ pub fn host_slot_dir() -> PathBuf {
             }
         }
         let uid = unsafe { libc::getuid() };
-        return std::env::temp_dir().join(format!("prometheus-{uid}"));
+        std::env::temp_dir().join(format!("prometheus-{uid}"))
     }
     #[cfg(not(unix))]
     {
@@ -1422,9 +1422,9 @@ mod tests {
             wall_ms: 0,
             slot_wait_ms: 0,
         };
-        assert!(find_green(&[base.clone()], "abc", &argv(&["pytest", "-q"]), true).is_some());
-        assert!(find_green(&[base.clone()], "xyz", &argv(&["pytest", "-q"]), true).is_none());
-        assert!(find_green(&[base.clone()], "abc", &argv(&["pytest"]), true).is_none());
+        assert!(find_green(std::slice::from_ref(&base), "abc", &argv(&["pytest", "-q"]), true).is_some());
+        assert!(find_green(std::slice::from_ref(&base), "xyz", &argv(&["pytest", "-q"]), true).is_none());
+        assert!(find_green(std::slice::from_ref(&base), "abc", &argv(&["pytest"]), true).is_none());
         let mut profiled = base.clone();
         profiled.profile = argv(&["-p:RunAnalyzers=false"]);
         assert!(find_green(&[profiled.clone()], "abc", &argv(&["pytest", "-q"]), true).is_none());
@@ -1876,7 +1876,7 @@ mod tests {
 
         let meta = dir("meta", 0o700);
         symlink(&victim, meta.join("check-slot.json")).unwrap();
-        let slot = acquire_slot_in(&meta, &cmd, Duration::from_secs(2)).ok().expect("slot acquired");
+        let slot = acquire_slot_in(&meta, &cmd, Duration::from_secs(2)).expect("slot acquired");
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep", "metadata must not follow the symlink");
         drop(slot);
     }

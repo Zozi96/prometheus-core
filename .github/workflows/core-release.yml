@@ -1,15 +1,8 @@
 name: core-release
 
-# Builds prometheus_core on native runners for six targets and publishes the
-# modules as release assets. Parity against sureforge_hook stays in the
-# private parent; this job only checks that the built module imports.
-# runtime/prometheus_core.lock in the parent is updated afterwards with the
-# sha256 values the release notes list.
-
 on:
   push:
     tags: ["core-v*"]
-  # Builds and tests all six targets from any branch; only a core-v* tag publishes.
   workflow_dispatch:
 
 permissions:
@@ -23,96 +16,59 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { platform: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, manylinux: "2014", ext: so, test: true }
-          - { platform: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2014", ext: so, test: true }
-          - { platform: macos-arm64, os: macos-15, target: aarch64-apple-darwin, manylinux: "", ext: so, test: true }
-          - { platform: macos-x86_64, os: macos-15-intel, target: x86_64-apple-darwin, manylinux: "", ext: so, test: true }
-          - { platform: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, manylinux: "", ext: pyd, test: true }
-          # Cross-built on the x64 runner, which cannot load it: built, not tested.
-          - { platform: windows-arm64, os: windows-latest, target: aarch64-pc-windows-msvc, manylinux: "", ext: pyd, test: false }
+          - { platform: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, image: quay.io/pypa/manylinux2014_x86_64, bin_ext: "", test: true }
+          - { platform: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, image: quay.io/pypa/manylinux2014_aarch64, bin_ext: "", test: true }
+          - { platform: macos-arm64, os: macos-15, target: aarch64-apple-darwin, bin_ext: "", test: true }
+          - { platform: macos-x86_64, os: macos-15-intel, target: x86_64-apple-darwin, bin_ext: "", test: true }
+          - { platform: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, bin_ext: .exe, test: true }
+          - { platform: windows-arm64, os: windows-latest, target: aarch64-pc-windows-msvc, bin_ext: .exe, test: false }
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-      - name: Build the wheel
-        uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.target }}
-          manylinux: ${{ matrix.manylinux || 'off' }}
-          args: --release --out dist
-          # Linux only: the standalone runner is built in this same manylinux
-          # container, so it references no newer glibc than the module does.
-          # The binary stays in target/ for the packaging step below.
-          before-script-linux: |
-            set -euo pipefail
+      - name: Build Linux in manylinux2014
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD":/io -w /io -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" "${{ matrix.image }}" bash -euxo pipefail -c '
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --target "${{ matrix.target }}"
             export PATH="$HOME/.cargo/bin:$PATH"
-            cargo build --release --no-default-features --target "${{ matrix.target }}" --bin prometheus-check
+            cargo build --release --locked --target "${{ matrix.target }}" --bin prometheus-check
             bin="target/${{ matrix.target }}/release/prometheus-check"
             "$bin" --version
-            max="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n1)"
+            max="$(objdump -T "$bin" | grep -o "GLIBC_[0-9][0-9.]*" | sed "s/^GLIBC_//" | sort -uV | tail -n1)"
             echo "highest GLIBC version referenced: ${max:-none}"
-            test "$(printf '%s\n' "${max:-0}" 2.17 | sort -V | tail -n1)" = "2.17"
-      - name: Extract the module
-        shell: bash
-        run: |
-          python - <<'EOF'
-          import glob, pathlib, zipfile
-          wheel, = glob.glob("dist/*.whl")
-          ext = "${{ matrix.ext }}"
-          with zipfile.ZipFile(wheel) as archive:
-              name, = [n for n in archive.namelist() if n.endswith("." + ext)]
-              data = archive.read(name)
-          installed = "prometheus_core.abi3.so" if ext == "so" else "prometheus_core.pyd"
-          pathlib.Path("module").mkdir()
-          pathlib.Path("module", installed).write_bytes(data)
-          pathlib.Path("upload").mkdir()
-          pathlib.Path("upload", "prometheus_core-${{ matrix.platform }}." + ext).write_bytes(data)
-          print(name, len(data), "bytes")
-          EOF
-      - name: Import check
-        if: matrix.test
-        shell: bash
-        run: |
-          python -c "import sys; sys.path.insert(0, 'module'); import prometheus_core; print('ENGINE_API', prometheus_core.ENGINE_API)"
-      # The standalone prometheus-check runner (ADR-0010) ships beside the
-      # module and links no Python. Linux builds it in the manylinux
-      # container above; macOS and Windows build it here.
-      - name: Install Rust for prometheus-check
+            test -n "$max" && test "$(printf "%s\n2.17\n" "$max" | sort -V | tail -n1)" = "2.17"
+            mkdir -p upload
+            cp "$bin" "upload/prometheus-check-${{ matrix.platform }}"
+            chmod 0755 "upload/prometheus-check-${{ matrix.platform }}"
+            chown -R "$HOST_UID:$HOST_GID" upload
+          '
+      - name: Install Rust
         if: runner.os != 'Linux'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - name: Package prometheus-check
+        if: runner.os != 'Linux'
         shell: bash
         run: |
-          if [ "$RUNNER_OS" != "Linux" ]; then
-            cargo build --release --no-default-features --target "${{ matrix.target }}" --bin prometheus-check
-          fi
-          ext=""
-          if [ "${{ matrix.ext }}" = "pyd" ]; then ext=".exe"; fi
-          cp "target/${{ matrix.target }}/release/prometheus-check$ext" "upload/prometheus-check-${{ matrix.platform }}$ext"
-      # The binary must run on its own: no Python on the library path, and
-      # the version it reports must be the crate's.
-      - name: Smoke-test prometheus-check
+          cargo build --release --locked --target "${{ matrix.target }}" --bin prometheus-check
+          mkdir -p upload
+          cp "target/${{ matrix.target }}/release/prometheus-check${{ matrix.bin_ext }}" "upload/prometheus-check-${{ matrix.platform }}${{ matrix.bin_ext }}"
+      - name: Smoke-test
         if: matrix.test
         shell: bash
         run: |
-          ext=""
-          if [ "${{ matrix.ext }}" = "pyd" ]; then ext=".exe"; fi
-          bin="upload/prometheus-check-${{ matrix.platform }}$ext"
+          bin="upload/prometheus-check-${{ matrix.platform }}${{ matrix.bin_ext }}"
           chmod +x "$bin"
           version="$("$bin" --version)"
           echo "$version"
           expected="prometheus-check $(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           test "$version" = "$expected"
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            ! ldd "$bin" | grep -qi libpython
-          fi
+          if [ "$RUNNER_OS" = "Linux" ]; then ! ldd "$bin" | grep -qi libpython; fi
       - uses: actions/upload-artifact@v7
         with:
-          name: prometheus_core-${{ matrix.platform }}
-          path: upload/
+          name: prometheus-check-${{ matrix.platform }}
+          path: upload/*
           if-no-files-found: error
 
   release:
@@ -124,17 +80,17 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          path: assets
+          path: dist
           merge-multiple: true
-      - name: Publish the release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cd assets
+          cd dist
           ls -la
-          test "$(ls | wc -l)" -eq 12
+          test "$(ls | wc -l)" -eq 6
           {
-            echo "prometheus_core modules for runtime/prometheus_core.lock, plus prometheus-check binaries for runtime/install_check.py."
+            echo "prometheus-check binaries for runtime/prometheus_core.lock."
             echo
             echo '```'
             sha256sum -- *
