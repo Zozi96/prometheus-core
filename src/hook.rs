@@ -1,15 +1,16 @@
-//! Native `PreToolUse` safety and reread guards (ADR-0010, ADR-0012).
+//! Native `PreToolUse` safety, read-budget, and command-rewrite guards (ADR-0010, ADR-0012).
 //!
 //! Answers `prometheus-kit hook <claude|cursor|devin|droid|muse>`:
 //! - Secret-path guard (`ask` on Claude/Droid/Devin/Muse, `deny` on Cursor).
-//! - Non-blocking unchanged whole-file reread warning.
+//! - Large whole-file read advisory (>= 200 lines) and non-blocking unchanged reread warning.
+//! - Deterministic shell auto-rewrite via `updatedInput` on Claude/Droid/Muse (coexisting with RTK).
 //!
-//! Every other event, tool, and command — direct `dotnet`/`cargo` checks and
-//! parent edits included — passes with `{}` (or `{"continue": true}` for
-//! Cursor's `beforeSubmitPrompt`).
+//! Every other event, tool, and edit passes with `{}` (or `{"continue": true}` for
+//! Cursor's `beforeSubmitPrompt`), and direct checks never trigger `permissionDecision`.
 
 use crate::store::{ensure_private_dir, sha256_hex};
 use serde_json::{json, Map, Value};
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -17,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const REREAD_MESSAGE: &str =
     "Unchanged whole-file reread: use the previous read or request a focused range (`prometheus-kit slice`).";
+pub const LARGE_READ_LINES: usize = 200;
 const REREAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const PARTIAL_KEYS: [&str; 10] = [
     "offset",
@@ -219,7 +221,7 @@ fn glob_secret_denied(token: &str) -> String {
     String::new()
 }
 
-fn command_token_denied(token: &str) -> String {
+pub(crate) fn command_token_denied(token: &str) -> String {
     for candidate in token.split('=') {
         let reason = secret_denied(Some(&Value::String(candidate.to_string())));
         if !reason.is_empty() {
@@ -270,6 +272,169 @@ fn split_command(text: &str) -> Vec<String> {
     tokens
 }
 
+fn is_unquoted_shell_sep(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '|' | ';' | '&' | '<' | '>' | '(' | ')' | '{' | '}' | '`')
+}
+
+fn decode_ansi_c_escape(chars: &[char], i: &mut usize, out: &mut String) {
+    if *i >= chars.len() {
+        return;
+    }
+    let esc = chars[*i];
+    *i += 1;
+    match esc {
+        'a' => out.push('\x07'),
+        'b' => out.push('\x08'),
+        'e' | 'E' => out.push('\x1b'),
+        'f' => out.push('\x0c'),
+        'n' => out.push('\n'),
+        'r' => out.push('\r'),
+        't' => out.push('\t'),
+        'v' => out.push('\x0b'),
+        '\\' | '\'' | '"' | '?' => out.push(esc),
+        'x' => {
+            let start = *i;
+            let mut count = 0usize;
+            while *i < chars.len() && count < 2 && chars[*i].is_ascii_hexdigit() {
+                *i += 1;
+                count += 1;
+            }
+            if count > 0 {
+                let hex: String = chars[start..*i].iter().collect();
+                if let Ok(val) = u32::from_str_radix(&hex, 16) {
+                    if let Some(ch) = char::from_u32(val) {
+                        out.push(ch);
+                        return;
+                    }
+                }
+            }
+            out.push('x');
+        }
+        'u' | 'U' => {
+            let max_digits = if esc == 'u' { 4 } else { 8 };
+            let start = *i;
+            let mut count = 0usize;
+            while *i < chars.len() && count < max_digits && chars[*i].is_ascii_hexdigit() {
+                *i += 1;
+                count += 1;
+            }
+            if count > 0 {
+                let hex: String = chars[start..*i].iter().collect();
+                if let Ok(val) = u32::from_str_radix(&hex, 16) {
+                    if let Some(ch) = char::from_u32(val) {
+                        out.push(ch);
+                        return;
+                    }
+                }
+            }
+            out.push(esc);
+        }
+        '0'..='7' => {
+            let start = *i - 1;
+            let mut count = 1usize;
+            while *i < chars.len() && count < 3 && matches!(chars[*i], '0'..='7') {
+                *i += 1;
+                count += 1;
+            }
+            let oct: String = chars[start..*i].iter().collect();
+            if let Ok(val) = u32::from_str_radix(&oct, 8) {
+                if let Some(ch) = char::from_u32(val & 0xff) {
+                    out.push(ch);
+                }
+            }
+        }
+        other => out.push(other),
+    }
+}
+
+/// Produce POSIX-unescaped tokens (handling `\c` escapes, `'...'`, `"..."`, and `$'...'`).
+fn posix_decoded_tokens(command: &str) -> Vec<String> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if is_unquoted_shell_sep(ch) {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '$' && i + 1 < chars.len() && chars[i + 1] == '\'' {
+            i += 2;
+            while i < chars.len() && chars[i] != '\'' {
+                if chars[i] == '\\' {
+                    i += 1;
+                    decode_ansi_c_escape(&chars, &mut i, &mut current);
+                } else {
+                    current.push(chars[i]);
+                    i += 1;
+                }
+            }
+            if i < chars.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '\'' {
+            i += 1;
+            while i < chars.len() && chars[i] != '\'' {
+                current.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    let next = chars[i + 1];
+                    if next == '\n' {
+                        i += 2;
+                    } else if matches!(next, '"' | '\\' | '$' | '`') {
+                        current.push(next);
+                        i += 2;
+                    } else {
+                        current.push('\\');
+                        current.push(next);
+                        i += 2;
+                    }
+                } else {
+                    current.push(chars[i]);
+                    i += 1;
+                }
+            }
+            if i < chars.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '\\' {
+            if i + 1 < chars.len() {
+                if chars[i + 1] != '\n' {
+                    current.push(chars[i + 1]);
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        current.push(ch);
+        i += 1;
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 fn secret_command_denied(command: Option<&Value>) -> String {
     let Some(command) = command.and_then(Value::as_str) else {
         return String::new();
@@ -307,6 +472,18 @@ fn secret_command_denied(command: Option<&Value>) -> String {
         } else {
             close
         };
+    }
+    for token in posix_decoded_tokens(command) {
+        let reason = command_token_denied(&token);
+        if !reason.is_empty() {
+            return reason;
+        }
+        for sub in split_command(&token) {
+            let reason = command_token_denied(&sub);
+            if !reason.is_empty() {
+                return reason;
+            }
+        }
     }
     String::new()
 }
@@ -394,6 +571,9 @@ const FILE_READ_KEYS: [&str; 9] = [
 ];
 
 fn command_has_secret(command: &str) -> bool {
+    if !secret_command_denied(Some(&Value::String(command.to_string()))).is_empty() {
+        return true;
+    }
     for token in split_command(command) {
         if token.is_empty() {
             continue;
@@ -562,7 +742,7 @@ fn open_nofollow_nonblock(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-fn hash_file(path: &Path) -> Option<String> {
+fn hash_file(path: &Path) -> Option<(String, usize)> {
     let mut file = open_nofollow_nonblock(path).ok()?;
     let info = file.metadata().ok()?;
     if !info.is_file() || info.len() > REREAD_MAX_BYTES {
@@ -574,12 +754,33 @@ fn hash_file(path: &Path) -> Option<String> {
     loop {
         let n = file.read(&mut chunk).ok()?;
         if n == 0 {
-            return Some(sha256_hex(&contents));
+            let mut line_count = contents.iter().filter(|&&b| b == b'\n').count();
+            if !contents.is_empty() && !contents.ends_with(b"\n") {
+                line_count += 1;
+            }
+            return Some((sha256_hex(&contents), line_count));
         }
         if contents.len() + n > REREAD_MAX_BYTES as usize {
             return None;
         }
         contents.extend_from_slice(&chunk[..n]);
+    }
+}
+
+fn large_read_advisory(path: &Path, lines: usize) -> String {
+    if lines < LARGE_READ_LINES
+        || std::env::var_os("PROMETHEUS_KIT_NO_READ_HINT").as_deref() == Some(OsStr::new("1"))
+    {
+        return String::new();
+    }
+    if crate::outline::Lang::from_path(path).is_some() {
+        format!(
+            "Large whole-file read ({lines} lines): prefer `~/.agents/prometheus/prometheus-kit outline <path>` then `slice <path>::<Symbol>` or `<path>:<start>-<end>` to stay within token budget."
+        )
+    } else {
+        format!(
+            "Large whole-file read ({lines} lines): prefer `~/.agents/prometheus/prometheus-kit slice <path>:<start>-<end>` (or `compact <log>`) instead of dumping whole large files."
+        )
     }
 }
 
@@ -730,7 +931,7 @@ pub fn whole_file_warning(host: &str, event: &Value, session_id: &str, root: Opt
     if !info.is_file() || info.len() > REREAD_MAX_BYTES {
         return String::new();
     }
-    let Some(digest) = hash_file(&target_path) else {
+    let Some((digest, line_count)) = hash_file(&target_path) else {
         return String::new();
     };
     let canonical_str = canonical.to_string_lossy();
@@ -745,7 +946,7 @@ pub fn whole_file_warning(host: &str, event: &Value, session_id: &str, root: Opt
         StoredHash::Present(stored) if stored == digest => REREAD_MESSAGE.to_string(),
         _ => {
             write_reread_state(&state, &digest);
-            String::new()
+            large_read_advisory(&target_path, line_count)
         }
     }
 }
@@ -847,6 +1048,9 @@ fn handle_claude_or_muse(host: &str, raw: &[u8]) -> Value {
     if !denial.is_empty() {
         return ask_reply(&denial);
     }
+    if let Some(reply) = crate::hook_rewrite::rewrite_command_reply(host, event) {
+        return reply;
+    }
     let warning = whole_file_warning(host, event, session_id, Some(&root));
     warn_reply(&warning)
 }
@@ -874,6 +1078,9 @@ fn handle_droid(raw: &[u8]) -> Value {
     let denial = secret_tool_denial(event);
     if !denial.is_empty() {
         return ask_reply(&denial);
+    }
+    if let Some(reply) = crate::hook_rewrite::rewrite_command_reply("droid", event) {
+        return reply;
     }
     let warning = whole_file_warning("droid", event, session_id, Some(&root));
     warn_reply(&warning)
@@ -1123,6 +1330,23 @@ mod tests {
         assert!(!secret_command_denied(Some(&json!("python3 -c \"open('.env')\""))).is_empty());
         assert!(!secret_command_denied(Some(&json!("echo \"a'b/.env'c\""))).is_empty());
         assert!(!secret_command_denied(Some(&json!("FOO=.ssh/id_rsa cmd"))).is_empty());
+        assert!(!secret_command_denied(Some(&json!(r"cat dir\.env"))).is_empty());
+        for escaped in [
+            r"sed -n '1,5p' .e\nv",
+            r"rg key .e\nv",
+            r"git diff -- .e\nv",
+            r"git -C .s\sh status",
+            r"dotnet test --settings .e\nv",
+            r"sed -n '1,5p' .s\sh/id_\rsa",
+            r"dotnet test --settings $'\x2eenv'",
+            r"cat $'\056env'",
+            r"git show HEAD:.e\nv",
+        ] {
+            assert!(
+                !secret_command_denied(Some(&json!(escaped))).is_empty(),
+                "escaped={escaped}"
+            );
+        }
         assert!(secret_command_denied(Some(&json!("cat src/*"))).is_empty());
         assert!(secret_command_denied(Some(&json!("dotnet test"))).is_empty());
         assert!(secret_command_denied(Some(&json!("cargo test"))).is_empty());
@@ -1146,9 +1370,11 @@ mod tests {
             ("CURSOR_PROJECT_DIR", None),
             ("DEVIN_PROJECT_DIR", None),
             ("GROK_SESSION_ID", None),
+            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
+            ("PROMETHEUS_KIT_NO_REWRITE", None),
         ]);
         for host in ["claude", "droid", "devin", "muse"] {
-            for cmd in ["dotnet test", "cargo test", "sudo dotnet test", "env cargo build"] {
+            for cmd in ["sudo dotnet test", "env cargo build"] {
                 let ev = json!({
                     "hook_event_name": "PreToolUse",
                     "tool_name": "Bash",
@@ -1157,6 +1383,31 @@ mod tests {
                     "session_id": "s1",
                 });
                 assert_eq!(json!({}), run_hook(host, ev.to_string().as_bytes()), "{host} {cmd}");
+            }
+            for cmd in ["dotnet test", "cargo test"] {
+                let ev = json!({
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": cmd},
+                    "cwd": tmp.0,
+                    "session_id": "s1",
+                });
+                let reply = run_hook(host, ev.to_string().as_bytes());
+                assert!(
+                    reply["hookSpecificOutput"].get("permissionDecision").is_none(),
+                    "{host} {cmd} must never ask/deny"
+                );
+                if host == "devin" {
+                    assert_eq!(json!({}), reply, "{host} {cmd}");
+                } else {
+                    let rewritten = reply["hookSpecificOutput"]["updatedInput"]["command"]
+                        .as_str()
+                        .expect("updatedInput.command");
+                    assert!(
+                        rewritten.contains("compact --mode test --"),
+                        "{host} {cmd}: {rewritten}"
+                    );
+                }
             }
             for _ in 0..6 {
                 let ev = json!({
@@ -1168,6 +1419,61 @@ mod tests {
                 });
                 assert_eq!(json!({}), run_hook(host, ev.to_string().as_bytes()));
             }
+        }
+        {
+            let _no_rw = EnvOverride::set(&[("PROMETHEUS_KIT_NO_REWRITE", Some("1"))]);
+            let ev = json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "dotnet test"},
+                "cwd": tmp.0,
+                "session_id": "s1",
+            });
+            assert_eq!(json!({}), run_hook("droid", ev.to_string().as_bytes()));
+        }
+        for escaped in [
+            r"sed -n '1,5p' .e\nv",
+            r"rg key .e\nv",
+            r"git diff -- .e\nv",
+            r"git -C .s\sh status",
+            r"dotnet test --settings .e\nv",
+            r"sed -n '1,5p' .s\sh/id_\rsa",
+            r"dotnet test --settings $'\x2eenv'",
+            r"cat $'\056env'",
+            r"git show HEAD:.e\nv",
+            r"cat dir\.env",
+        ] {
+            for host in ["claude", "droid"] {
+                let ev = json!({
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Execute",
+                    "tool_input": {"command": escaped},
+                    "cwd": tmp.0,
+                    "session_id": "s1",
+                });
+                let reply = run_hook(host, ev.to_string().as_bytes());
+                assert_eq!(
+                    "ask",
+                    reply["hookSpecificOutput"]["permissionDecision"],
+                    "{host} {escaped}"
+                );
+                assert!(
+                    reply["hookSpecificOutput"].get("updatedInput").is_none(),
+                    "{host} {escaped}"
+                );
+            }
+            let cev = json!({
+                "hook_event_name": "preToolUse",
+                "tool_name": "Shell",
+                "tool_input": {"command": escaped},
+                "workspace_roots": [tmp.0],
+                "conversation_id": "s1",
+            });
+            assert_eq!(
+                "deny",
+                run_hook("cursor", cev.to_string().as_bytes())["permission"],
+                "cursor {escaped}"
+            );
         }
     }
 
@@ -1372,5 +1678,117 @@ mod tests {
             0o755,
             fs::metadata(&bad_sess).unwrap().permissions().mode() & 0o777
         );
+    }
+
+    #[test]
+    fn large_whole_file_read_advises_outline_slice_and_respects_reread() {
+        let _g = env_guard();
+        let tmp = TempDir::new("large_read");
+        let rt = tmp.0.join("xdg");
+        fs::create_dir_all(&rt).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _env = EnvOverride::set(&[
+            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
+            ("CURSOR_PROJECT_DIR", None),
+            ("DEVIN_PROJECT_DIR", None),
+            ("GROK_SESSION_ID", None),
+            ("PROMETHEUS_KIT_NO_READ_HINT", None),
+        ]);
+        let repo = tmp.0.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        let small_rs = repo.join("small.rs");
+        fs::write(&small_rs, "fn a() {}\n".repeat(199)).unwrap();
+        let ev_small = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "small.rs"},
+            "cwd": repo,
+            "session_id": "s-large",
+        });
+        assert_eq!(json!({}), run_hook("droid", ev_small.to_string().as_bytes()));
+
+        let big_rs = repo.join("big.rs");
+        fs::write(&big_rs, "fn a() {}\n".repeat(220)).unwrap();
+        let ev_big = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "big.rs"},
+            "cwd": repo,
+            "session_id": "s-large",
+        });
+        let first = run_hook("droid", ev_big.to_string().as_bytes());
+        let first_ctx = first["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("large read advisory");
+        assert!(first_ctx.contains("220 lines"), "{first_ctx}");
+        assert!(first_ctx.contains("outline"), "{first_ctx}");
+        assert!(first_ctx.contains("slice"), "{first_ctx}");
+        assert!(first["hookSpecificOutput"].get("permissionDecision").is_none());
+
+        // Second unchanged whole-file read emits REREAD_MESSAGE.
+        let second = run_hook("droid", ev_big.to_string().as_bytes());
+        assert_eq!(REREAD_MESSAGE, second["hookSpecificOutput"]["additionalContext"]);
+
+        // Partial read on large file passes silently.
+        let partial = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "big.rs", "offset": 1, "limit": 50},
+            "cwd": repo,
+            "session_id": "s-large",
+        });
+        assert_eq!(json!({}), run_hook("droid", partial.to_string().as_bytes()));
+
+        // Large non-code log file suggests slice / compact.
+        let big_log = repo.join("run.log");
+        fs::write(&big_log, "line\n".repeat(220)).unwrap();
+        let ev_log = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "run.log"},
+            "cwd": repo,
+            "session_id": "s-large",
+        });
+        let log_reply = run_hook("droid", ev_log.to_string().as_bytes());
+        let log_ctx = log_reply["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("log advisory");
+        assert!(log_ctx.contains("slice"), "{log_ctx}");
+        assert!(log_ctx.contains("compact"), "{log_ctx}");
+
+        // Large secret .env file triggers secret ask, never advisory.
+        let big_env = repo.join(".env");
+        fs::write(&big_env, "K=V\n".repeat(220)).unwrap();
+        let ev_env = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": ".env"},
+            "cwd": repo,
+            "session_id": "s-large",
+        });
+        let env_reply = run_hook("droid", ev_env.to_string().as_bytes());
+        assert_eq!("ask", env_reply["hookSpecificOutput"]["permissionDecision"]);
+
+        // PROMETHEUS_KIT_NO_READ_HINT=1 suppresses advisory on first read, keeps reread warning.
+        {
+            let _no_hint = EnvOverride::set(&[("PROMETHEUS_KIT_NO_READ_HINT", Some("1"))]);
+            let hinted_rs = repo.join("hinted.rs");
+            fs::write(&hinted_rs, "fn b() {}\n".repeat(220)).unwrap();
+            let ev_hint = json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "hinted.rs"},
+                "cwd": repo,
+                "session_id": "s-large",
+            });
+            assert_eq!(json!({}), run_hook("droid", ev_hint.to_string().as_bytes()));
+            let second_hint = run_hook("droid", ev_hint.to_string().as_bytes());
+            assert_eq!(REREAD_MESSAGE, second_hint["hookSpecificOutput"]["additionalContext"]);
+        }
     }
 }

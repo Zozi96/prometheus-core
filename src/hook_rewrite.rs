@@ -1,0 +1,1255 @@
+//! Deterministic `PreToolUse` command auto-rewrite rules (coexists with RTK).
+//!
+//! Rewrites eligible read/search/diff/build/test shell commands into
+//! `prometheus-kit` invocations using the host `updatedInput` envelope, without
+//! changing `permissionDecision`.
+
+use crate::outline::Lang;
+use serde_json::{json, Map, Value};
+use std::ffi::OsStr;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+const MAX_HOOK_CONFIG_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellToken {
+    value: String,
+    has_expansion: bool,
+}
+
+/// Returns `true` when `PROMETHEUS_KIT_NO_REWRITE=1` is set.
+fn rewrite_disabled() -> bool {
+    std::env::var_os("PROMETHEUS_KIT_NO_REWRITE").as_deref() == Some(OsStr::new("1"))
+}
+
+fn read_config_bounded(path: &Path) -> Option<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).ok()?;
+    let info = file.metadata().ok()?;
+    if !info.is_file() || info.len() > MAX_HOOK_CONFIG_BYTES {
+        return None;
+    }
+    let cap = usize::try_from(info.len().min(MAX_HOOK_CONFIG_BYTES)).ok()?;
+    let mut contents = Vec::with_capacity(cap);
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let n = file.read(&mut chunk).ok()?;
+        if n == 0 {
+            return Some(contents);
+        }
+        if contents.len() + n > MAX_HOOK_CONFIG_BYTES as usize {
+            return None;
+        }
+        contents.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Returns `true` when RTK's hook is active for `host` (env override or hook config).
+pub fn rtk_hook_active(host: &str) -> bool {
+    if let Ok(val) = std::env::var("PROMETHEUS_KIT_RTK_COEXIST") {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => return true,
+            "0" | "false" | "no" => return false,
+            _ => {}
+        }
+    }
+    let Some(config_path) = host_hooks_config_path(host) else {
+        return false;
+    };
+    let Some(bytes) = read_config_bounded(&config_path) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    json_has_rtk_hook(&parsed)
+}
+
+fn host_hooks_config_path(host: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty()).map(PathBuf::from)?;
+    match host {
+        "droid" => Some(home.join(".factory").join("hooks.json")),
+        "claude" => Some(home.join(".claude").join("settings.json")),
+        "muse" => {
+            let xdg = std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".config"));
+            Some(xdg.join("muse").join("settings.json"))
+        }
+        _ => None,
+    }
+}
+
+fn json_has_rtk_hook(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(cmd)) = map.get("command") {
+                if command_invokes_rtk_hook(cmd) {
+                    return true;
+                }
+            }
+            map.values().any(json_has_rtk_hook)
+        }
+        Value::Array(items) => items.iter().any(json_has_rtk_hook),
+        _ => false,
+    }
+}
+
+fn command_invokes_rtk_hook(cmd: &str) -> bool {
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    words.windows(2).any(|pair| {
+        let bin = pair[0].trim_matches(&['\'', '"', ';'][..]);
+        let name = Path::new(bin)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(bin)
+            .to_ascii_lowercase();
+        (name == "rtk" || name == "rtk.exe") && pair[1].trim_matches(';').eq_ignore_ascii_case("hook")
+    })
+}
+
+fn is_shell_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "execute" | "bash" | "shell" | "run_command" | "run_shell_command" | "terminal"
+    )
+}
+
+fn kit_bin_quoted() -> Option<String> {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("prometheus-kit"));
+    try_shell_quote(&exe.to_string_lossy())
+}
+
+pub fn quote_posix(arg: &str) -> Option<String> {
+    if arg.contains(['\0', '\n', '\r']) {
+        return None;
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('\'');
+    for ch in arg.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    Some(out)
+}
+
+pub fn quote_windows(arg: &str) -> Option<String> {
+    if arg.is_empty()
+        || arg.chars().any(|c| {
+            c.is_control()
+                || matches!(
+                    c,
+                    '"' | '\''
+                        | '`'
+                        | '$'
+                        | '%'
+                        | '&'
+                        | '|'
+                        | ';'
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '^'
+                        | '!'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | ','
+                )
+        })
+    {
+        return None;
+    }
+    if arg.chars().any(char::is_whitespace) {
+        if arg.ends_with('\\') {
+            return None;
+        }
+        Some(format!("\"{arg}\""))
+    } else {
+        Some(arg.to_owned())
+    }
+}
+
+/// Quote an argument safely for the host shell, returning `None` if unsafe.
+pub fn try_shell_quote(arg: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        quote_windows(arg)
+    }
+    #[cfg(not(windows))]
+    {
+        quote_posix(arg)
+    }
+}
+
+/// Scan the command for dangerous shell metacharacters and extract at most one
+/// unquoted `&&` separator (for a leading `cd <dir> && <rest>` prefix).
+fn scan_and_split_cd_prefix(command: &str) -> Option<(Option<&str>, &str)> {
+    if command.contains('\n')
+        || command.contains('\r')
+        || command.contains('\0')
+        || command.contains('`')
+        || command.contains("$(")
+        || command.contains("$'")
+    {
+        return None;
+    }
+
+    let bytes = command.as_bytes();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut amp_pos: Option<usize> = None;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if b == b'\\' {
+                if i + 1 >= bytes.len() {
+                    return None;
+                }
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\\' => {
+                if i + 1 >= bytes.len() {
+                    return None;
+                }
+                i += 2;
+            }
+            b'\'' => {
+                in_single = true;
+                i += 1;
+            }
+            b'"' => {
+                in_double = true;
+                i += 1;
+            }
+            b'|' | b';' | b'>' | b'<' => return None,
+            b'&' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'&' {
+                    if i + 2 < bytes.len() && bytes[i + 2] == b'&' {
+                        return None;
+                    }
+                    if amp_pos.is_some() {
+                        return None;
+                    }
+                    amp_pos = Some(i);
+                    i += 2;
+                } else {
+                    return None;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    if in_single || in_double {
+        return None;
+    }
+
+    if let Some(at) = amp_pos {
+        let lhs = command[..at].trim();
+        let rhs = command[at + 2..].trim();
+        if lhs.is_empty() || rhs.is_empty() {
+            return None;
+        }
+        let lhs_tokens = shell_split(lhs)?;
+        if lhs_tokens.len() != 2
+            || lhs_tokens[0].value != "cd"
+            || lhs_tokens[1].value.is_empty()
+            || lhs_tokens[1].value == "-"
+            || !crate::hook::command_token_denied(&lhs_tokens[1].value).is_empty()
+        {
+            return None;
+        }
+        Some((Some(lhs), rhs))
+    } else {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some((None, trimmed))
+        }
+    }
+}
+
+fn is_param_start(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || matches!(
+            ch,
+            '_' | '{' | '*' | '@' | '#' | '?' | '$' | '!' | '-' | '\''
+        )
+}
+
+fn shell_split(text: &str) -> Option<Vec<ShellToken>> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        let mut value = String::new();
+        let mut has_expansion = false;
+        let mut started_unquoted_tilde = chars[i] == '~';
+
+        while i < chars.len() && !chars[i].is_whitespace() {
+            match chars[i] {
+                '\'' => {
+                    started_unquoted_tilde = false;
+                    i += 1;
+                    while i < chars.len() && chars[i] != '\'' {
+                        value.push(chars[i]);
+                        i += 1;
+                    }
+                    if i >= chars.len() {
+                        return None;
+                    }
+                    i += 1;
+                }
+                '"' => {
+                    started_unquoted_tilde = false;
+                    i += 1;
+                    while i < chars.len() && chars[i] != '"' {
+                        if chars[i] == '\\' {
+                            i += 1;
+                            if i >= chars.len() {
+                                return None;
+                            }
+                            if matches!(chars[i], '"' | '\\' | '$' | '`') {
+                                value.push(chars[i]);
+                            } else {
+                                value.push('\\');
+                                value.push(chars[i]);
+                            }
+                            i += 1;
+                        } else {
+                            if chars[i] == '$'
+                                && i + 1 < chars.len()
+                                && is_param_start(chars[i + 1])
+                            {
+                                has_expansion = true;
+                            }
+                            value.push(chars[i]);
+                            i += 1;
+                        }
+                    }
+                    if i >= chars.len() {
+                        return None;
+                    }
+                    i += 1;
+                }
+                '\\' => {
+                    i += 1;
+                    if i >= chars.len() {
+                        return None;
+                    }
+                    value.push(chars[i]);
+                    i += 1;
+                }
+                ch => {
+                    if matches!(ch, '*' | '?' | '[' | '{' | '}') {
+                        has_expansion = true;
+                    }
+                    if ch == '$' && i + 1 < chars.len() && is_param_start(chars[i + 1]) {
+                        has_expansion = true;
+                    }
+                    if value.is_empty() && ch == '~' && started_unquoted_tilde {
+                        has_expansion = true;
+                    }
+                    value.push(ch);
+                    i += 1;
+                }
+            }
+        }
+        tokens.push(ShellToken {
+            value,
+            has_expansion,
+        });
+    }
+
+    Some(tokens)
+}
+
+fn basename_lower(cmd0: &str) -> String {
+    Path::new(cmd0)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(cmd0)
+        .to_ascii_lowercase()
+}
+
+fn is_excluded_wrapper(cmd0: &str) -> bool {
+    if cmd0.contains('=') {
+        return true;
+    }
+    matches!(
+        basename_lower(cmd0).as_str(),
+        "sudo"
+            | "doas"
+            | "env"
+            | "rtk"
+            | "rtk.exe"
+            | "time"
+            | "watch"
+            | "nohup"
+            | "timeout"
+            | "prometheus-kit"
+            | "prometheus-kit.exe"
+            | "prometheus-check"
+            | "prometheus-check.exe"
+    )
+}
+
+fn parse_sed_range(expr: &str) -> Option<(usize, usize)> {
+    let body = expr.strip_suffix('p')?;
+    let (start_s, end_s) = body.split_once(',')?;
+    if start_s.is_empty()
+        || end_s.is_empty()
+        || !start_s.bytes().all(|b| b.is_ascii_digit())
+        || !end_s.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let start: usize = start_s.parse().ok()?;
+    let end: usize = end_s.parse().ok()?;
+    if start >= 1 && end >= start {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+fn is_safe_sed_path(token: &ShellToken) -> bool {
+    let p = token.value.as_str();
+    !token.has_expansion
+        && !p.is_empty()
+        && p != "-"
+        && !p.starts_with('-')
+        && !p
+            .chars()
+            .any(|c| matches!(c, '$' | '*' | '?' | '[' | ']' | '~' | '{' | '}'))
+}
+
+fn resolve_git_dir(cd_prefix: Option<&str>, git_c_dir: Option<&str>, event_cwd: Option<&Path>) -> Option<PathBuf> {
+    if let Some(dir) = git_c_dir {
+        let p = PathBuf::from(dir);
+        if p.is_absolute() {
+            return Some(p);
+        }
+        return event_cwd.map(|c| c.join(p));
+    }
+    if let Some(prefix) = cd_prefix {
+        if let Some(tokens) = shell_split(prefix) {
+            if tokens.len() == 2 && !tokens[1].has_expansion {
+                let p = PathBuf::from(&tokens[1].value);
+                if p.is_absolute() {
+                    return Some(p);
+                }
+                return event_cwd.map(|c| c.join(p));
+            }
+        }
+    }
+    event_cwd.map(Path::to_path_buf)
+}
+
+fn rewrite_git(
+    tokens: &[ShellToken],
+    kit_bin: &str,
+    cd_prefix: Option<&str>,
+    event_cwd: Option<&Path>,
+) -> Option<String> {
+    let mut idx = 1usize;
+    let mut git_c_dir: Option<&ShellToken> = None;
+
+    if idx < tokens.len() && tokens[idx].value == "-C" {
+        let dir = tokens.get(idx + 1)?;
+        if dir.value.is_empty() || dir.has_expansion {
+            return None;
+        }
+        git_c_dir = Some(dir);
+        idx += 2;
+    }
+
+    let subcmd = tokens.get(idx)?.value.as_str();
+    idx += 1;
+
+    let mut parts = vec![kit_bin.to_owned(), "diff".to_owned()];
+    if let Some(dir) = git_c_dir {
+        parts.push("--root".to_owned());
+        parts.push(try_shell_quote(&dir.value)?);
+    }
+
+    match subcmd {
+        "status" => {
+            for tok in &tokens[idx..] {
+                let arg = tok.value.as_str();
+                let allowed = matches!(arg, "--short" | "--branch")
+                    || (arg.starts_with('-')
+                        && !arg.starts_with("--")
+                        && arg.len() > 1
+                        && arg[1..].chars().all(|c| matches!(c, 's' | 'b')));
+                if !allowed {
+                    return None;
+                }
+            }
+            parts.push("--status".to_owned());
+            Some(parts.join(" "))
+        }
+        "diff" => {
+            let mut staged = false;
+            let mut stat = false;
+            let mut context: Option<usize> = None;
+            let mut base_ref: Option<&ShellToken> = None;
+            let mut paths: Vec<&ShellToken> = Vec::new();
+            let mut positional_only = false;
+
+            let mut j = idx;
+            while j < tokens.len() {
+                let tok = &tokens[j];
+                let arg = tok.value.as_str();
+                if positional_only {
+                    if tok.has_expansion {
+                        return None;
+                    }
+                    paths.push(tok);
+                    j += 1;
+                    continue;
+                }
+                match arg {
+                    "--" => positional_only = true,
+                    "--staged" | "--cached" => staged = true,
+                    "--stat" => stat = true,
+                    "--unified" => {
+                        let next = tokens.get(j + 1)?;
+                        let n: usize = next.value.parse().ok()?;
+                        context = Some(n);
+                        j += 1;
+                    }
+                    _ if arg.starts_with("--unified=") => {
+                        let n: usize = arg["--unified=".len()..].parse().ok()?;
+                        context = Some(n);
+                    }
+                    _ if arg.starts_with("-U") && arg.len() > 2 => {
+                        let n: usize = arg[2..].parse().ok()?;
+                        context = Some(n);
+                    }
+                    _ if arg.starts_with('-') => return None,
+                    _ => {
+                        if base_ref.is_some() || arg.is_empty() || arg.contains(':') || tok.has_expansion {
+                            return None;
+                        }
+                        base_ref = Some(tok);
+                    }
+                }
+                j += 1;
+            }
+
+            if let Some(candidate) = base_ref {
+                let repo_dir = resolve_git_dir(
+                    cd_prefix,
+                    git_c_dir.map(|t| t.value.as_str()),
+                    event_cwd,
+                );
+                let exists_as_path = paths.is_empty()
+                    && !positional_only
+                    && repo_dir.is_some_and(|d| d.join(&candidate.value).exists());
+                if exists_as_path {
+                    paths.push(candidate);
+                    base_ref = None;
+                } else if staged {
+                    // `prometheus-kit diff` treats --staged and --base as mutually exclusive.
+                    return None;
+                }
+            }
+
+            if staged {
+                parts.push("--staged".to_owned());
+            }
+            if stat {
+                parts.push("--stat".to_owned());
+            }
+            if let Some(n) = context {
+                parts.push("-C".to_owned());
+                parts.push(n.to_string());
+            }
+            if let Some(base) = base_ref {
+                parts.push("--base".to_owned());
+                parts.push(try_shell_quote(&base.value)?);
+            }
+            if !paths.is_empty() {
+                parts.push("--".to_owned());
+                for p in paths {
+                    parts.push(try_shell_quote(&p.value)?);
+                }
+            }
+            Some(parts.join(" "))
+        }
+        "show" => {
+            let mut stat = false;
+            let mut rev: Option<&ShellToken> = None;
+            for tok in &tokens[idx..] {
+                let arg = tok.value.as_str();
+                match arg {
+                    "--stat" => stat = true,
+                    _ if arg.starts_with('-') => return None,
+                    _ => {
+                        if rev.is_some() || arg.is_empty() || arg.contains(':') || tok.has_expansion {
+                            return None;
+                        }
+                        rev = Some(tok);
+                    }
+                }
+            }
+            let rev = rev?;
+            parts.push("--commit".to_owned());
+            parts.push(try_shell_quote(&rev.value)?);
+            if stat {
+                parts.push("--stat".to_owned());
+            }
+            Some(parts.join(" "))
+        }
+        _ => None,
+    }
+}
+
+fn rewrite_rg(tokens: &[ShellToken], kit_bin: &str) -> Option<String> {
+    let mut ignore_case = false;
+    let mut fixed_strings = false;
+    let mut word_regexp = false;
+    let mut files_only = false;
+    let mut hidden = false;
+    let mut no_ignore = false;
+    let mut globs: Vec<String> = Vec::new();
+    let mut lang_type: Option<String> = None;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut positional_only = false;
+
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        let arg = tok.value.as_str();
+        if positional_only {
+            if tok.has_expansion {
+                return None;
+            }
+            positionals.push(tok.value.clone());
+            i += 1;
+            continue;
+        }
+        match arg {
+            "--" => positional_only = true,
+            "-i" | "--ignore-case" => ignore_case = true,
+            "-F" | "--fixed-strings" => fixed_strings = true,
+            "-w" | "--word-regexp" => word_regexp = true,
+            "-l" | "--files-with-matches" => files_only = true,
+            "--hidden" => hidden = true,
+            "--no-ignore" => no_ignore = true,
+            "-g" | "--glob" => {
+                let val = tokens.get(i + 1)?;
+                if val.value.is_empty() || val.has_expansion {
+                    return None;
+                }
+                globs.push(val.value.clone());
+                i += 1;
+            }
+            _ if arg.starts_with("--glob=") => {
+                let v = &arg["--glob=".len()..];
+                if v.is_empty() || tok.has_expansion {
+                    return None;
+                }
+                globs.push(v.to_owned());
+            }
+            "-t" | "--type" => {
+                if lang_type.is_some() {
+                    return None;
+                }
+                let val = tokens.get(i + 1)?;
+                if val.has_expansion || Lang::from_name(&val.value).is_none() {
+                    return None;
+                }
+                lang_type = Some(val.value.clone());
+                i += 1;
+            }
+            _ if arg.starts_with("--type=") => {
+                if lang_type.is_some() {
+                    return None;
+                }
+                let v = &arg["--type=".len()..];
+                if tok.has_expansion || Lang::from_name(v).is_none() {
+                    return None;
+                }
+                lang_type = Some(v.to_owned());
+            }
+            _ if arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg.len() > 2
+                && arg[1..].chars().all(|c| matches!(c, 'i' | 'F' | 'w' | 'l')) =>
+            {
+                for c in arg[1..].chars() {
+                    match c {
+                        'i' => ignore_case = true,
+                        'F' => fixed_strings = true,
+                        'w' => word_regexp = true,
+                        'l' => files_only = true,
+                        _ => {}
+                    }
+                }
+            }
+            _ if arg.starts_with('-') => return None,
+            _ => {
+                if tok.has_expansion {
+                    return None;
+                }
+                positionals.push(tok.value.clone());
+            }
+        }
+        i += 1;
+    }
+
+    if positionals.is_empty() {
+        return None;
+    }
+
+    let mut parts = vec![kit_bin.to_owned(), "search".to_owned()];
+    if ignore_case {
+        parts.push("-i".to_owned());
+    }
+    if fixed_strings {
+        parts.push("-F".to_owned());
+    }
+    if word_regexp {
+        parts.push("-w".to_owned());
+    }
+    if files_only {
+        parts.push("--files-only".to_owned());
+    }
+    if hidden {
+        parts.push("--hidden".to_owned());
+    }
+    if no_ignore {
+        parts.push("--no-ignore".to_owned());
+    }
+    for g in globs {
+        parts.push("--glob".to_owned());
+        parts.push(try_shell_quote(&g)?);
+    }
+    if let Some(t) = lang_type {
+        parts.push("--type".to_owned());
+        parts.push(try_shell_quote(&t)?);
+    }
+    parts.push("--symbols".to_owned());
+    parts.push("--".to_owned());
+    for pos in positionals {
+        parts.push(try_shell_quote(&pos)?);
+    }
+    Some(parts.join(" "))
+}
+
+/// Pure command rewriter parameterized by quoted binary path, RTK status, and optional cwd.
+pub fn rewrite_command_str(
+    command: &str,
+    kit_bin: &str,
+    rtk_active: bool,
+    event_cwd: Option<&Path>,
+) -> Option<String> {
+    let (cd_prefix, rest) = scan_and_split_cd_prefix(command)?;
+    let tokens = shell_split(rest)?;
+    let first = tokens.first()?;
+    if is_excluded_wrapper(&first.value) {
+        return None;
+    }
+    if tokens
+        .iter()
+        .any(|tok| !crate::hook::command_token_denied(&tok.value).is_empty())
+    {
+        return None;
+    }
+
+    let cmd0 = basename_lower(&first.value);
+    let arg1 = tokens.get(1).map(|t| t.value.as_str());
+    let arg2 = tokens.get(2).map(|t| t.value.as_str());
+
+    let rewritten_tail = match cmd0.as_str() {
+        // --- Always eligible (gaps RTK does not cover) ---
+        "dotnet" if arg1 == Some("test") => {
+            Some(format!("{kit_bin} compact --mode test -- {rest}"))
+        }
+        "dotnet" if matches!(arg1, Some("restore" | "format")) => {
+            Some(format!("{kit_bin} compact --mode build -- {rest}"))
+        }
+        "msbuild" | "msbuild.exe" => Some(format!("{kit_bin} compact --mode build -- {rest}")),
+        "python" | "python3" if arg1 == Some("-m") && arg2 == Some("unittest") => {
+            Some(format!("{kit_bin} compact --mode test -- {rest}"))
+        }
+        "npm" if arg1 == Some("test") || (arg1 == Some("run") && arg2 == Some("test")) => {
+            Some(format!("{kit_bin} compact --mode test -- {rest}"))
+        }
+        "pnpm" | "yarn" | "bun" if arg1 == Some("test") => {
+            Some(format!("{kit_bin} compact --mode test -- {rest}"))
+        }
+        "mvn" | "gradle" | "gradlew" if arg1 == Some("test") => {
+            Some(format!("{kit_bin} compact --mode test -- {rest}"))
+        }
+        "sed" if tokens.len() == 4 && arg1 == Some("-n") => {
+            let (start, end) = parse_sed_range(&tokens[2].value)?;
+            if !is_safe_sed_path(&tokens[3]) {
+                return None;
+            }
+            let spec = format!("{}:{start}-{end}", tokens[3].value);
+            Some(format!("{kit_bin} slice {}", try_shell_quote(&spec)?))
+        }
+
+        // --- Standalone-only (delegate to RTK when RTK hook is active) ---
+        "dotnet" if !rtk_active && arg1 == Some("build") => {
+            Some(format!("{kit_bin} compact --mode build -- {rest}"))
+        }
+        "cargo"
+            if !rtk_active && matches!(arg1, Some("build" | "check" | "clippy")) =>
+        {
+            Some(format!("{kit_bin} compact --mode build -- {rest}"))
+        }
+        "go" if !rtk_active && arg1 == Some("build") => {
+            Some(format!("{kit_bin} compact --mode build -- {rest}"))
+        }
+        "tsc" if !rtk_active => Some(format!("{kit_bin} compact --mode build -- {rest}")),
+        "cargo" if !rtk_active && arg1 == Some("test") => {
+            Some(format!("{kit_bin} compact --mode test -- {rest}"))
+        }
+        "go" if !rtk_active && arg1 == Some("test") => {
+            Some(format!("{kit_bin} compact --mode test -- {rest}"))
+        }
+        "pytest" | "jest" | "vitest" if !rtk_active => {
+            Some(format!("{kit_bin} compact --mode test -- {rest}"))
+        }
+        "python" | "python3"
+            if !rtk_active && arg1 == Some("-m") && arg2 == Some("pytest") =>
+        {
+            Some(format!("{kit_bin} compact --mode test -- {rest}"))
+        }
+        "git" if !rtk_active => rewrite_git(&tokens, kit_bin, cd_prefix, event_cwd),
+        "rg" if !rtk_active => rewrite_rg(&tokens, kit_bin),
+        _ => None,
+    }?;
+
+    if let Some(prefix) = cd_prefix {
+        Some(format!("{prefix} && {rewritten_tail}"))
+    } else {
+        Some(rewritten_tail)
+    }
+}
+
+/// Evaluate a `PreToolUse` event for shell command auto-rewrite.
+/// Returns `None` when the command should pass through unchanged.
+pub fn rewrite_command_reply(host: &str, event: &Value) -> Option<Value> {
+    if !matches!(host, "claude" | "droid" | "muse") || rewrite_disabled() {
+        return None;
+    }
+    let tool = event
+        .get("tool_name")
+        .or_else(|| event.get("toolName"))
+        .and_then(Value::as_str)?;
+    if !is_shell_tool(tool) {
+        return None;
+    }
+    let tool_input = event.get("tool_input").and_then(Value::as_object)?;
+    let command = tool_input
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())?;
+
+    let event_cwd = event
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(Path::new);
+    let rtk_active = rtk_hook_active(host);
+    let kit_bin = kit_bin_quoted()?;
+    let rewritten = rewrite_command_str(command, &kit_bin, rtk_active, event_cwd)?;
+
+    let mut updated: Map<String, Value> = tool_input.clone();
+    updated.insert("command".to_owned(), Value::String(rewritten));
+
+    Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecisionReason": "prometheus-kit auto-rewrite",
+            "updatedInput": Value::Object(updated),
+        }
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::{Mutex, MutexGuard};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_guard() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    struct EnvOverride {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvOverride {
+        fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
+            let mut saved = Vec::new();
+            for &(k, v) in pairs {
+                saved.push((k, std::env::var(k).ok()));
+                match v {
+                    Some(val) => unsafe { std::env::set_var(k, val) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvOverride {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..).rev() {
+                match v {
+                    Some(val) => unsafe { std::env::set_var(k, val) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+        }
+    }
+
+    const KIT: &str = "'/opt/prometheus-kit'";
+
+    #[test]
+    fn always_eligible_rewrites_run_with_or_without_rtk() {
+        for rtk in [false, true] {
+            assert_eq!(
+                Some(format!("{KIT} compact --mode test -- dotnet test Foo.csproj --filter 'A|B'")),
+                rewrite_command_str("dotnet test Foo.csproj --filter 'A|B'", KIT, rtk, None)
+            );
+            assert_eq!(
+                Some(format!("cd '/my repo' && {KIT} compact --mode test -- dotnet test")),
+                rewrite_command_str("cd '/my repo' && dotnet test", KIT, rtk, None)
+            );
+            assert_eq!(
+                Some(format!("{KIT} compact --mode build -- dotnet restore src/App.sln")),
+                rewrite_command_str("dotnet restore src/App.sln", KIT, rtk, None)
+            );
+            assert_eq!(
+                Some(format!("{KIT} compact --mode build -- dotnet format --verify-no-changes")),
+                rewrite_command_str("dotnet format --verify-no-changes", KIT, rtk, None)
+            );
+            assert_eq!(
+                Some(format!("{KIT} compact --mode test -- python3 -m unittest discover -s tests")),
+                rewrite_command_str("python3 -m unittest discover -s tests", KIT, rtk, None)
+            );
+            assert_eq!(
+                Some(format!("{KIT} compact --mode test -- npm run test -- --watch=false")),
+                rewrite_command_str("npm run test -- --watch=false", KIT, rtk, None)
+            );
+            assert_eq!(
+                Some(format!("{KIT} compact --mode test -- pnpm test")),
+                rewrite_command_str("pnpm test", KIT, rtk, None)
+            );
+            assert_eq!(
+                Some(format!("{KIT} compact --mode test -- ./gradlew test")),
+                rewrite_command_str("./gradlew test", KIT, rtk, None)
+            );
+            assert_eq!(
+                Some(format!("{KIT} slice 'src/a b.py:10-40'")),
+                rewrite_command_str("sed -n '10,40p' 'src/a b.py'", KIT, rtk, None)
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_rewrites_defer_when_rtk_is_active() {
+        for cmd in [
+            "dotnet build App.csproj",
+            "cargo test --locked",
+            "cargo clippy",
+            "go test ./...",
+            "pytest tests/",
+            "git status -sb",
+            "git diff --staged --stat",
+            "git show HEAD~1",
+            "rg -i foo src/",
+        ] {
+            assert_eq!(None, rewrite_command_str(cmd, KIT, true, None), "rtk=true cmd={cmd}");
+            assert!(
+                rewrite_command_str(cmd, KIT, false, None).is_some(),
+                "rtk=false cmd={cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_and_rg_rewrites_map_flags_safely() {
+        assert_eq!(
+            Some(format!("{KIT} diff --root '/repo' --status")),
+            rewrite_command_str("git -C /repo status --short --branch", KIT, false, None)
+        );
+        assert_eq!(
+            None,
+            rewrite_command_str("git status --porcelain=v1", KIT, false, None)
+        );
+        assert_eq!(
+            Some(format!(
+                "{KIT} diff --root '/repo' --staged --stat -C 5 -- 'src/a.rs' 'src/b.rs'"
+            )),
+            rewrite_command_str(
+                "git -C /repo diff --cached --stat -U5 -- src/a.rs src/b.rs",
+                KIT,
+                false,
+                None
+            )
+        );
+        assert_eq!(
+            Some(format!("{KIT} diff --base 'origin/main' -- 'src/a.rs'")),
+            rewrite_command_str("git diff origin/main -- src/a.rs", KIT, false, None)
+        );
+        assert_eq!(
+            None,
+            rewrite_command_str("git diff --staged main", KIT, false, None)
+        );
+        assert_eq!(
+            None,
+            rewrite_command_str("git diff --name-only", KIT, false, None)
+        );
+        assert_eq!(
+            None,
+            rewrite_command_str("git show HEAD:.env", KIT, false, None)
+        );
+        assert_eq!(
+            Some(format!("{KIT} diff --commit 'HEAD~1' --stat")),
+            rewrite_command_str("git show --stat HEAD~1", KIT, false, None)
+        );
+        assert_eq!(
+            Some(format!(
+                "{KIT} search -i --files-only --glob '*.cs' --type 'cs' --symbols -- 'LinkActivePerks' 'src/'"
+            )),
+            rewrite_command_str(
+                "rg -i -l -g '*.cs' -t cs LinkActivePerks src/",
+                KIT,
+                false,
+                None
+            )
+        );
+        assert_eq!(
+            None,
+            rewrite_command_str("rg -A 3 foo src/", KIT, false, None)
+        );
+        assert_eq!(
+            None,
+            rewrite_command_str("rg -t nonexistentfoo bar src/", KIT, false, None)
+        );
+        assert_eq!(
+            None,
+            rewrite_command_str("rg foo src/*.cs", KIT, false, None)
+        );
+    }
+
+    #[test]
+    fn safety_passthroughs_never_rewrite() {
+        for cmd in [
+            "dotnet test | tee test.log",
+            "dotnet test; echo done",
+            "dotnet test > out.txt",
+            "dotnet test &",
+            "cd /tmp && dotnet build && dotnet test",
+            "echo ok && dotnet test",
+            "VAR=1 dotnet test",
+            "sudo dotnet test",
+            "env cargo build",
+            "rtk git status",
+            "prometheus-kit diff",
+            "~/.agents/prometheus/prometheus-check -- dotnet test",
+            "dotnet test $(pwd)",
+            "dotnet test `pwd`",
+            "dotnet test\necho hi",
+            "sed -n '0,5p' a.py",
+            "sed -n '10,5p' a.py",
+            "sed -n '1,5p' *.py",
+            "sed -n '1,5p' ~/.zshrc",
+            "sed -n '1,5p' -",
+            "sed -n '1,5p' {a,b}.rs",
+            "rg foo {a,b}",
+            "rg $- src/",
+            r"dotnet test --settings $'\x2eenv'",
+            r"sed -n '1,5p' .e\nv",
+            r"rg key .e\nv",
+            r"git diff -- .e\nv",
+            r"git -C .s\sh status",
+            r"dotnet test --settings .e\nv",
+            r"sed -n '1,5p' .s\sh/id_\rsa",
+            r"cd .s\sh && dotnet test",
+            "dotnet test 'unclosed",
+        ] {
+            assert_eq!(None, rewrite_command_str(cmd, KIT, false, None), "cmd={cmd}");
+        }
+    }
+
+    #[test]
+    fn quote_windows_and_posix_prevent_injection() {
+        for bad in [
+            "",
+            "foo&calc",
+            "foo|calc",
+            "foo>out.txt",
+            "foo<in.txt",
+            "foo;calc",
+            "a\"&calc",
+            "a'b",
+            "`calc`",
+            "$env:PATH",
+            "%PATH%",
+            "foo(bar)",
+            "foo^bar",
+            "foo!bar",
+            "*.cs",
+            "foo?bar",
+            "a[0]",
+            "{a,b}",
+            "a,b",
+            "C:\\Program Files\\bad\\",
+            "line1\nline2",
+        ] {
+            assert_eq!(None, quote_windows(bad), "bad={bad}");
+        }
+        assert_eq!(Some("src/a.rs".to_owned()), quote_windows("src/a.rs"));
+        assert_eq!(
+            Some("\"C:\\Program Files\\prometheus-kit.exe\"".to_owned()),
+            quote_windows("C:\\Program Files\\prometheus-kit.exe")
+        );
+        assert_eq!(None, quote_posix("a\nb"));
+        assert_eq!(Some("'a'\\''b'".to_owned()), quote_posix("a'b"));
+    }
+
+    #[test]
+    fn host_envelope_and_rtk_config_detection() {
+        let _g = env_guard();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!("prom_rw_{}_{nanos}", std::process::id()));
+        let factory = tmp.join(".factory");
+        fs::create_dir_all(&factory).unwrap();
+        fs::write(
+            factory.join("hooks.json"),
+            r#"{"PreToolUse":[{"matcher":"Execute","hooks":[{"type":"command","command":"rtk hook droid"}]}]}"#,
+        )
+        .unwrap();
+
+        {
+            let _env = EnvOverride::set(&[
+                ("HOME", Some(tmp.to_str().unwrap())),
+                ("PROMETHEUS_KIT_RTK_COEXIST", None),
+                ("PROMETHEUS_KIT_NO_REWRITE", None),
+            ]);
+            assert!(rtk_hook_active("droid"));
+            assert!(!rtk_hook_active("claude"));
+
+            // With RTK active on droid: git diff passes through, dotnet test rewrites & preserves metadata.
+            let git_ev = json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Execute",
+                "tool_input": {"command": "git status", "summary": "s", "riskLevel": "low"}
+            });
+            assert_eq!(None, rewrite_command_reply("droid", &git_ev));
+
+            let dotnet_ev = json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Execute",
+                "tool_input": {"command": "dotnet test App.csproj", "summary": "run tests", "riskLevel": "medium", "timeout": 120}
+            });
+            let reply = rewrite_command_reply("droid", &dotnet_ev).unwrap();
+            let out = &reply["hookSpecificOutput"];
+            assert_eq!("PreToolUse", out["hookEventName"]);
+            assert!(out.get("permissionDecision").is_none());
+            assert_eq!("run tests", out["updatedInput"]["summary"]);
+            assert_eq!("medium", out["updatedInput"]["riskLevel"]);
+            assert_eq!(120, out["updatedInput"]["timeout"]);
+            assert!(out["updatedInput"]["command"]
+                .as_str()
+                .unwrap()
+                .contains("compact --mode test -- dotnet test App.csproj"));
+
+            // Cursor and Devin never receive updatedInput.
+            assert_eq!(None, rewrite_command_reply("cursor", &dotnet_ev));
+            assert_eq!(None, rewrite_command_reply("devin", &dotnet_ev));
+        }
+
+        {
+            let _env = EnvOverride::set(&[
+                ("HOME", Some(tmp.to_str().unwrap())),
+                ("PROMETHEUS_KIT_RTK_COEXIST", None),
+                ("PROMETHEUS_KIT_NO_REWRITE", Some("1")),
+            ]);
+            let dotnet_ev = json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "dotnet test"}
+            });
+            assert_eq!(None, rewrite_command_reply("claude", &dotnet_ev));
+        }
+
+        #[cfg(unix)]
+        {
+            let fifo_home = tmp.join("fifo_home");
+            let fifo_factory = fifo_home.join(".factory");
+            fs::create_dir_all(&fifo_factory).unwrap();
+            let fifo_path = fifo_factory.join("hooks.json");
+            let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+            unsafe {
+                libc::mkfifo(c_path.as_ptr(), 0o600);
+            }
+            let _env = EnvOverride::set(&[
+                ("HOME", Some(fifo_home.to_str().unwrap())),
+                ("PROMETHEUS_KIT_RTK_COEXIST", None),
+            ]);
+            assert!(!rtk_hook_active("droid"));
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}

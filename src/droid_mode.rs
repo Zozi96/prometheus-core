@@ -82,10 +82,10 @@ pub fn load_modes(config_path: &Path) -> Result<ModesConfig, String> {
     let cfg: ModesConfig = serde_json::from_str(&raw)
         .map_err(|e| format!("invalid mode table {}: {e}", config_path.display()))?;
     for (mode_name, table) in [("off", &cfg.off), ("on", &cfg.on)] {
-        if !table
+        if table
             .session
             .get("model")
-            .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+            .is_none_or(|v| v.as_str().is_none_or(str::is_empty))
         {
             return Err(format!(
                 "{}: {mode_name}.session.model must be a non-empty string",
@@ -93,10 +93,10 @@ pub fn load_modes(config_path: &Path) -> Result<ModesConfig, String> {
             ));
         }
         for key in ["lightModel", "lightReasoningEffort"] {
-            if !table
+            if table
                 .subagents
                 .get(key)
-                .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                .is_none_or(|v| v.as_str().is_none_or(str::is_empty))
             {
                 return Err(format!(
                     "{}: {mode_name}.subagents.{key} must be a non-empty string",

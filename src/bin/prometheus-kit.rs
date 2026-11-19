@@ -7,7 +7,7 @@
 //!   search      Budgeted, grouped, line-clipped, symbol-annotated search.
 //!   diff        Compact structural git status, diff, and commit summary.
 //!   map         One-call repository tree with line counts and optional top-level symbols.
-//!   hook        PreToolUse secret-path and unchanged-reread guards.
+//!   hook        PreToolUse secret-path, large-read/reread, and shell-rewrite guards.
 //!   droid-mode  Switch installed Factory Droid model pins between on/off modes.
 
 use prometheus_core::compact::{
@@ -40,7 +40,7 @@ commands:
   search      Budgeted, grouped, line-clipped search with optional symbol labels
   diff        Compact structural git status/diff/commit viewer excluding lockfile noise
   map         Repository directory map with line counts and optional top-level symbols
-  hook        Evaluate PreToolUse secret and reread guards for a host
+  hook        Evaluate PreToolUse secret, read-budget, and rewrite guards for a host
   droid-mode  Switch installed Droid model pins between on and off modes
 
 options:
@@ -747,7 +747,8 @@ fn run_map(raw: &[String]) -> i32 {
 const HOOK_USAGE: &str = "\
 usage: prometheus-kit hook <claude|cursor|devin|droid|muse>
 
-Reads one hook event JSON object from stdin and prints the host reply JSON.";
+Reads one hook event JSON object from stdin and prints the host reply JSON
+(secret guard, large-read/reread advisory, and shell auto-rewrite).";
 
 const DROID_MODE_USAGE: &str = "\
 usage: prometheus-kit droid-mode <on|off> [--config <path>] [--home <dir>]

@@ -10,7 +10,7 @@ The native deterministic engine for `prometheus-check` and `prometheus-kit`.
 - `diff` — compact structural git status, diff, and commit summary excluding lockfile noise.
 - `droid_mode` — data-driven switcher for Factory Droid model pins (`prometheus-kit droid-mode`).
 - `fingerprint` — in-process worktree fingerprinting.
-- `hook` — native `PreToolUse` secret-path and unchanged-reread guards (`prometheus-kit hook`).
+- `hook` — native `PreToolUse` secret-path, large-read/reread, and shell-rewrite guards (`prometheus-kit hook`).
 - `impact` — impact graph and targeted selection.
 - `kit_util` — ANSI/CR normalization, noise-path classification, UTF-8 clipping, and spillover helpers.
 - `logs` — normalized test-log parsing.
