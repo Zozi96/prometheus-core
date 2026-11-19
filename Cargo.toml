@@ -1,10 +1,10 @@
 [package]
 name = "prometheus-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 publish = false
 license = "MIT"
-description = "Deterministic engine for the standalone prometheus-check runner."
+description = "Deterministic engine for prometheus-check and prometheus-kit."
 
 [lib]
 name = "prometheus_core"
@@ -14,8 +14,14 @@ crate-type = ["rlib"]
 name = "prometheus-check"
 path = "src/bin/prometheus-check.rs"
 
+[[bin]]
+name = "prometheus-kit"
+path = "src/bin/prometheus-kit.rs"
+
 [dependencies]
 gix = { version = "=0.89.0", default-features = false, features = ["sha1", "parallel", "status", "dirwalk", "index", "excludes", "attributes"] }
+ignore = "0.4"
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

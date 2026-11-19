@@ -1,21 +1,29 @@
 # prometheus-core
 
-The native deterministic engine for the standalone `prometheus-check` runner.
+The native deterministic engine for `prometheus-check` and `prometheus-kit`.
 
 ## Modules
 
 - `check` — runner, targeted selection, receipts, and host-wide Check slot.
 - `classify` — documentation and test path classification.
+- `compact` — deduplicated CLI/build/test/log compactor with lossless spillover logs.
+- `diff` — compact structural git status, diff, and commit summary excluding lockfile noise.
 - `fingerprint` — in-process worktree fingerprinting.
 - `impact` — impact graph and targeted selection.
+- `kit_util` — ANSI/CR normalization, noise-path classification, UTF-8 clipping, and spillover helpers.
 - `logs` — normalized test-log parsing.
+- `map` — one-call repository directory map with line counts and optional top-level symbols.
+- `outline` — structural outline extraction for code (C#, Razor, Rust, Python, TS/JS, Go, PowerShell), JSON/JSONL, YAML, TOML, and Markdown with token budgets.
+- `search` — budgeted, grouped, line-clipped, optionally symbol-annotated search.
+- `slice` — exact line-range and symbol/path slicing with interval merging and token budgets.
 - `store` — hashing and Check slot primitives.
 
-## Build and test
+## Build, test, and benchmark
 
 ```sh
-cargo build --release --locked --bin prometheus-check
+cargo build --release --locked --bin prometheus-check --bin prometheus-kit
 cargo test --locked
+cargo run --release --locked --example bench_kit
 ```
 
 Rust differential parity tests in `fingerprint::tests` compare the worktree

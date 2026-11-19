@@ -31,15 +31,17 @@ jobs:
           docker run --rm -v "$PWD":/io -w /io -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" "${{ matrix.image }}" bash -euxo pipefail -c '
             curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --target "${{ matrix.target }}"
             export PATH="$HOME/.cargo/bin:$PATH"
-            cargo build --release --locked --target "${{ matrix.target }}" --bin prometheus-check
-            bin="target/${{ matrix.target }}/release/prometheus-check"
-            "$bin" --version
-            max="$(objdump -T "$bin" | grep -o "GLIBC_[0-9][0-9.]*" | sed "s/^GLIBC_//" | sort -uV | tail -n1)"
-            echo "highest GLIBC version referenced: ${max:-none}"
-            test -n "$max" && test "$(printf "%s\n2.17\n" "$max" | sort -V | tail -n1)" = "2.17"
+            cargo build --release --locked --target "${{ matrix.target }}" --bin prometheus-check --bin prometheus-kit
             mkdir -p upload
-            cp "$bin" "upload/prometheus-check-${{ matrix.platform }}"
-            chmod 0755 "upload/prometheus-check-${{ matrix.platform }}"
+            for name in prometheus-check prometheus-kit; do
+              bin="target/${{ matrix.target }}/release/${name}"
+              "$bin" --version
+              max="$(objdump -T "$bin" | grep -o "GLIBC_[0-9][0-9.]*" | sed "s/^GLIBC_//" | sort -uV | tail -n1)"
+              echo "${name} highest GLIBC version referenced: ${max:-none}"
+              test -n "$max" && test "$(printf "%s\n2.17\n" "$max" | sort -V | tail -n1)" = "2.17"
+              cp "$bin" "upload/${name}-${{ matrix.platform }}"
+              chmod 0755 "upload/${name}-${{ matrix.platform }}"
+            done
             chown -R "$HOST_UID:$HOST_GID" upload
           '
       - name: Install Rust
@@ -47,27 +49,32 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Package prometheus-check
+      - name: Package binaries
         if: runner.os != 'Linux'
         shell: bash
         run: |
-          cargo build --release --locked --target "${{ matrix.target }}" --bin prometheus-check
+          cargo build --release --locked --target "${{ matrix.target }}" --bin prometheus-check --bin prometheus-kit
           mkdir -p upload
-          cp "target/${{ matrix.target }}/release/prometheus-check${{ matrix.bin_ext }}" "upload/prometheus-check-${{ matrix.platform }}${{ matrix.bin_ext }}"
+          for name in prometheus-check prometheus-kit; do
+            cp "target/${{ matrix.target }}/release/${name}${{ matrix.bin_ext }}" "upload/${name}-${{ matrix.platform }}${{ matrix.bin_ext }}"
+          done
       - name: Smoke-test
         if: matrix.test
         shell: bash
         run: |
-          bin="upload/prometheus-check-${{ matrix.platform }}${{ matrix.bin_ext }}"
-          chmod +x "$bin"
-          version="$("$bin" --version)"
-          echo "$version"
-          expected="prometheus-check $(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          test "$version" = "$expected"
-          if [ "$RUNNER_OS" = "Linux" ]; then ! ldd "$bin" | grep -qi libpython; fi
+          crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          for name in prometheus-check prometheus-kit; do
+            bin="upload/${name}-${{ matrix.platform }}${{ matrix.bin_ext }}"
+            chmod +x "$bin"
+            version="$("$bin" --version)"
+            echo "$version"
+            test "$version" = "${name} ${crate_version}"
+            if [ "$RUNNER_OS" = "Linux" ]; then ! ldd "$bin" | grep -qi libpython; fi
+          done
+          "upload/prometheus-kit-${{ matrix.platform }}${{ matrix.bin_ext }}" outline Cargo.toml >/dev/null
       - uses: actions/upload-artifact@v7
         with:
-          name: prometheus-check-${{ matrix.platform }}
+          name: prometheus-core-${{ matrix.platform }}
           path: upload/*
           if-no-files-found: error
 
@@ -88,9 +95,9 @@ jobs:
         run: |
           cd dist
           ls -la
-          test "$(ls | wc -l)" -eq 6
+          test "$(ls | wc -l)" -eq 12
           {
-            echo "prometheus-check binaries for runtime/prometheus_core.lock."
+            echo "prometheus-check and prometheus-kit binaries for runtime/prometheus_core.lock."
             echo
             echo '```'
             sha256sum -- *

@@ -24,15 +24,19 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo test --locked --no-default-features
-      - run: cargo build --locked --no-default-features --bin prometheus-check
+      - run: cargo build --locked --no-default-features --bin prometheus-check --bin prometheus-kit
       - name: Standalone version
         shell: bash
         run: |
           ext=""
           if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
-          version="$(target/debug/prometheus-check$ext --version)"
-          expected="prometheus-check $(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          test "$version" = "$expected"
+          crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          for name in prometheus-check prometheus-kit; do
+            version="$("target/debug/${name}${ext}" --version)"
+            test "$version" = "${name} ${crate_version}"
+          done
       - name: No libpython on Linux
         if: runner.os == 'Linux'
-        run: '! ldd target/debug/prometheus-check | grep -qi libpython'
+        run: |
+          ! ldd target/debug/prometheus-check | grep -qi libpython
+          ! ldd target/debug/prometheus-kit | grep -qi libpython

@@ -1,8 +1,15 @@
-//! Deterministic engine for the standalone `prometheus-check` runner.
+//! Deterministic engine for `prometheus-check` and `prometheus-kit`.
 
 pub mod check;
 pub mod classify;
+pub mod compact;
+pub mod diff;
 pub mod fingerprint;
 pub mod impact;
+pub mod kit_util;
 pub mod logs;
+pub mod map;
+pub mod outline;
+pub mod search;
+pub mod slice;
 pub mod store;
