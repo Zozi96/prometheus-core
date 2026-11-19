@@ -16,7 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const REREAD_MESSAGE: &str =
-    "Unchanged whole-file reread: use the previous read or request a focused range.";
+    "Unchanged whole-file reread: use the previous read or request a focused range (`prometheus-kit slice`).";
 const REREAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const PARTIAL_KEYS: [&str; 10] = [
     "offset",
