@@ -995,7 +995,10 @@ mod tests {
                 rewrite_command_str("./gradlew test", KIT, rtk, None)
             );
             assert_eq!(
-                Some(format!("{KIT} slice 'src/a b.py:10-40'")),
+                Some(format!(
+                    "{KIT} slice {}",
+                    try_shell_quote("src/a b.py:10-40").unwrap()
+                )),
                 rewrite_command_str("sed -n '10,40p' 'src/a b.py'", KIT, rtk, None)
             );
         }
@@ -1024,8 +1027,9 @@ mod tests {
 
     #[test]
     fn git_and_rg_rewrites_map_flags_safely() {
+        let q = |s: &str| try_shell_quote(s).unwrap();
         assert_eq!(
-            Some(format!("{KIT} diff --root '/repo' --status")),
+            Some(format!("{KIT} diff --root {} --status", q("/repo"))),
             rewrite_command_str("git -C /repo status --short --branch", KIT, false, None)
         );
         assert_eq!(
@@ -1034,7 +1038,10 @@ mod tests {
         );
         assert_eq!(
             Some(format!(
-                "{KIT} diff --root '/repo' --staged --stat -C 5 -- 'src/a.rs' 'src/b.rs'"
+                "{KIT} diff --root {} --staged --stat -C 5 -- {} {}",
+                q("/repo"),
+                q("src/a.rs"),
+                q("src/b.rs")
             )),
             rewrite_command_str(
                 "git -C /repo diff --cached --stat -U5 -- src/a.rs src/b.rs",
@@ -1044,7 +1051,11 @@ mod tests {
             )
         );
         assert_eq!(
-            Some(format!("{KIT} diff --base 'origin/main' -- 'src/a.rs'")),
+            Some(format!(
+                "{KIT} diff --base {} -- {}",
+                q("origin/main"),
+                q("src/a.rs")
+            )),
             rewrite_command_str("git diff origin/main -- src/a.rs", KIT, false, None)
         );
         assert_eq!(
@@ -1060,9 +1071,25 @@ mod tests {
             rewrite_command_str("git show HEAD:.env", KIT, false, None)
         );
         assert_eq!(
-            Some(format!("{KIT} diff --commit 'HEAD~1' --stat")),
+            Some(format!("{KIT} diff --commit {} --stat", q("HEAD~1"))),
             rewrite_command_str("git show --stat HEAD~1", KIT, false, None)
         );
+        assert_eq!(
+            Some(format!(
+                "{KIT} search -i --files-only --glob {} --type {} --symbols -- {} {}",
+                q("src/foo.cs"),
+                q("cs"),
+                q("LinkActivePerks"),
+                q("src/")
+            )),
+            rewrite_command_str(
+                "rg -i -l -g 'src/foo.cs' -t cs LinkActivePerks src/",
+                KIT,
+                false,
+                None
+            )
+        );
+        #[cfg(not(windows))]
         assert_eq!(
             Some(format!(
                 "{KIT} search -i --files-only --glob '*.cs' --type 'cs' --symbols -- 'LinkActivePerks' 'src/'"
