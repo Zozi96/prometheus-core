@@ -72,6 +72,8 @@ jobs:
             if [ "$RUNNER_OS" = "Linux" ]; then ! ldd "$bin" | grep -qi libpython; fi
           done
           "upload/prometheus-kit-${{ matrix.platform }}${{ matrix.bin_ext }}" outline Cargo.toml >/dev/null
+          "upload/prometheus-kit-${{ matrix.platform }}${{ matrix.bin_ext }}" hook --help >/dev/null
+          "upload/prometheus-kit-${{ matrix.platform }}${{ matrix.bin_ext }}" droid-mode --help >/dev/null
       - uses: actions/upload-artifact@v7
         with:
           name: prometheus-core-${{ matrix.platform }}

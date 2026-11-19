@@ -4,15 +4,19 @@
 //!   outline   Compact structural skeleton of code, JSON/JSONL, YAML, TOML, and Markdown.
 //!   slice     Targeted line-range or symbol/path slice with strict token budgets.
 //!   compact   Deduplicated CLI/build/test/log compactor with lossless log spillover.
-//!   search    Budgeted, grouped, line-clipped, symbol-annotated search.
-//!   diff      Compact structural git status, diff, and commit summary.
-//!   map       One-call repository tree with line counts and optional top-level symbols.
+//!   search      Budgeted, grouped, line-clipped, symbol-annotated search.
+//!   diff        Compact structural git status, diff, and commit summary.
+//!   map         One-call repository tree with line counts and optional top-level symbols.
+//!   hook        PreToolUse secret-path and unchanged-reread guards.
+//!   droid-mode  Switch installed Factory Droid model pins between on/off modes.
 
 use prometheus_core::compact::{
     compact_command, compact_text, render_compact_json, render_compact_text, CompactMode,
     CompactOptions,
 };
 use prometheus_core::diff::{execute_diff, render_diff_json, render_diff_text, DiffMode, DiffOptions};
+use prometheus_core::droid_mode::{apply_mode, default_home, resolve_config_path};
+use prometheus_core::hook::{is_supported_host, panic_fallback, run_hook};
 use prometheus_core::map::{execute_map, render_map_json, render_map_text, MapOptions};
 use prometheus_core::outline::{
     outline_file, read_text_file, render_outline_json, render_outline_text, Lang, OutlineOptions,
@@ -30,12 +34,14 @@ const MAIN_USAGE: &str = "\
 usage: prometheus-kit <command> [options] <args...>
 
 commands:
-  outline   Extract compact structural skeleton with line ranges (code, JSON/JSONL, YAML, TOML, Markdown)
-  slice     Extract exact line ranges or symbol/path slices with token budgets
-  compact   Compact verbose CLI/build/test output or log files (preserves exit code)
-  search    Budgeted, grouped, line-clipped search with optional symbol labels
-  diff      Compact structural git status/diff/commit viewer excluding lockfile noise
-  map       Repository directory map with line counts and optional top-level symbols
+  outline     Extract compact structural skeleton with line ranges (code, JSON/JSONL, YAML, TOML, Markdown)
+  slice       Extract exact line ranges or symbol/path slices with token budgets
+  compact     Compact verbose CLI/build/test output or log files (preserves exit code)
+  search      Budgeted, grouped, line-clipped search with optional symbol labels
+  diff        Compact structural git status/diff/commit viewer excluding lockfile noise
+  map         Repository directory map with line counts and optional top-level symbols
+  hook        Evaluate PreToolUse secret and reread guards for a host
+  droid-mode  Switch installed Droid model pins between on and off modes
 
 options:
   -h, --help      Show help
@@ -738,6 +744,131 @@ fn run_map(raw: &[String]) -> i32 {
     }
 }
 
+const HOOK_USAGE: &str = "\
+usage: prometheus-kit hook <claude|cursor|devin|droid|muse>
+
+Reads one hook event JSON object from stdin and prints the host reply JSON.";
+
+const DROID_MODE_USAGE: &str = "\
+usage: prometheus-kit droid-mode <on|off> [--config <path>] [--home <dir>]
+
+options:
+  --config <path>   Path to droid-modes.json
+  --home <dir>      Home directory holding .factory/
+  -h, --help        Show help";
+
+fn run_hook_cmd(raw: &[String]) -> i32 {
+    let mut host: Option<String> = None;
+    for arg in raw {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("{HOOK_USAGE}");
+                return 0;
+            }
+            _ if arg.starts_with('-') => {
+                eprintln!("prometheus-kit hook: unknown option `{arg}`\n{HOOK_USAGE}");
+                return 2;
+            }
+            _ => {
+                if host.is_some() {
+                    eprintln!("prometheus-kit hook: expected exactly one <host>\n{HOOK_USAGE}");
+                    return 2;
+                }
+                host = Some(arg.clone());
+            }
+        }
+    }
+    let Some(host) = host else {
+        eprintln!("prometheus-kit hook: missing <host>\n{HOOK_USAGE}");
+        return 2;
+    };
+    if !is_supported_host(&host) {
+        eprintln!("prometheus-kit hook: unsupported host `{host}`\n{HOOK_USAGE}");
+        return 2;
+    }
+    let mut buf = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut buf);
+    let reply = match std::panic::catch_unwind(|| run_hook(&host, &buf)) {
+        Ok(value) => value,
+        Err(_) => panic_fallback(&host),
+    };
+    let rendered = serde_json::to_string(&reply).unwrap_or_else(|_| "{}".to_string());
+    println!("{rendered}");
+    let _ = std::io::stdout().flush();
+    0
+}
+
+fn run_droid_mode_cmd(raw: &[String]) -> i32 {
+    let mut mode: Option<String> = None;
+    let mut config_path: Option<PathBuf> = None;
+    let mut home_dir: Option<PathBuf> = None;
+    let mut i = 0usize;
+    while i < raw.len() {
+        let arg = raw[i].as_str();
+        match arg {
+            "-h" | "--help" => {
+                println!("{DROID_MODE_USAGE}");
+                return 0;
+            }
+            "--config" => match next_val(raw, &mut i, "--config", DROID_MODE_USAGE) {
+                Ok(v) => config_path = Some(PathBuf::from(v)),
+                Err(code) => return code,
+            },
+            "--home" => match next_val(raw, &mut i, "--home", DROID_MODE_USAGE) {
+                Ok(v) => home_dir = Some(PathBuf::from(v)),
+                Err(code) => return code,
+            },
+            _ if arg.starts_with('-') => {
+                eprintln!("prometheus-kit droid-mode: unknown option `{arg}`\n{DROID_MODE_USAGE}");
+                return 2;
+            }
+            _ => {
+                if mode.is_some() {
+                    eprintln!("prometheus-kit droid-mode: expected a single mode <on|off>\n{DROID_MODE_USAGE}");
+                    return 2;
+                }
+                mode = Some(arg.to_string());
+            }
+        }
+        i += 1;
+    }
+    let Some(mode) = mode else {
+        eprintln!("{DROID_MODE_USAGE}");
+        return 2;
+    };
+    if !matches!(mode.as_str(), "on" | "off") {
+        eprintln!("{DROID_MODE_USAGE}");
+        return 2;
+    }
+    let home = match home_dir {
+        Some(h) => h,
+        None => match default_home() {
+            Ok(h) => h,
+            Err(err) => {
+                eprintln!("droid core mode unchanged: {err}");
+                return 1;
+            }
+        },
+    };
+    let config = match resolve_config_path(config_path.as_deref(), &home) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("droid core mode unchanged: {err}");
+            return 1;
+        }
+    };
+    match apply_mode(&mode, &home, &config) {
+        Ok(msg) => {
+            println!("{msg}");
+            0
+        }
+        Err(err) => {
+            eprintln!("droid core mode unchanged: {err}");
+            1
+        }
+    }
+}
+
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let Some(first) = raw.first().map(String::as_str) else {
@@ -759,6 +890,8 @@ fn main() {
         "search" => run_search(&raw[1..]),
         "diff" => run_diff(&raw[1..]),
         "map" => run_map(&raw[1..]),
+        "hook" => run_hook_cmd(&raw[1..]),
+        "droid-mode" => run_droid_mode_cmd(&raw[1..]),
         other => {
             eprintln!("prometheus-kit: unknown command `{other}`\n{MAIN_USAGE}");
             2

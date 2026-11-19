@@ -60,6 +60,8 @@ fn help_and_version_exit_zero() {
         &["search", "--help"][..],
         &["diff", "--help"][..],
         &["map", "--help"][..],
+        &["hook", "--help"][..],
+        &["droid-mode", "--help"][..],
     ] {
         let out = run_kit(args, None);
         assert_eq!(out.status.code(), Some(0), "args={args:?}");
@@ -421,4 +423,116 @@ src/B.cs(20,4): error CS0103: missing Foo [/tmp/A.csproj]\n",
     assert!(df_out.stdout.len() <= 350 * 4 + 2);
     let df_v: Value = serde_json::from_slice(&df_out.stdout).unwrap();
     assert_eq!(df_v["files"][0]["path"], "src/svc.rs");
+}
+
+fn run_kit_stdin(args: &[&str], stdin_bytes: &[u8]) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(bin())
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn prometheus-kit");
+    child.stdin.as_mut().unwrap().write_all(stdin_bytes).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn hook_subcommand_handles_all_five_hosts() {
+    let tmp = TempDir::new("hook_cli");
+    let repo = tmp.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let sample = repo.join("hello.rs");
+    fs::write(&sample, "fn main() {}\n").unwrap();
+
+    for host in ["claude", "droid", "devin", "muse"] {
+        let ev = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": ".env"},
+            "cwd": repo,
+            "session_id": format!("sess-{host}"),
+        });
+        let out = run_kit_stdin(&["hook", host], ev.to_string().as_bytes());
+        assert_eq!(out.status.code(), Some(0), "host={host}");
+        let parsed: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            "ask",
+            parsed["hookSpecificOutput"]["permissionDecision"],
+            "host={host}"
+        );
+    }
+
+    let cursor_ev = serde_json::json!({
+        "hook_event_name": "preToolUse",
+        "tool_name": "Read",
+        "tool_input": {"path": ".env"},
+        "workspace_roots": [repo],
+        "conversation_id": "sess-cursor",
+    });
+    let cursor_out = run_kit_stdin(&["hook", "cursor"], cursor_ev.to_string().as_bytes());
+    assert_eq!(cursor_out.status.code(), Some(0));
+    let cursor_parsed: Value = serde_json::from_slice(&cursor_out.stdout).unwrap();
+    assert_eq!("deny", cursor_parsed["permission"]);
+
+    // Invalid host exits 2.
+    let bad = run_kit(&["hook", "grok"], None);
+    assert_eq!(bad.status.code(), Some(2));
+}
+
+#[test]
+fn droid_mode_subcommand_round_trips_with_config_and_home() {
+    let tmp = TempDir::new("droid_cli");
+    let cfg = tmp.write(
+        "droid-modes.json",
+        br#"{
+  "off": {
+    "droids": {"argus": ["gemini-4-carbon", "medium"]},
+    "session": {"model": "gpt-6.2-sol", "reasoningEffort": "medium"},
+    "subagents": {"lightModel": "deepseek-v4.1-flash-1017", "lightReasoningEffort": "low"}
+  },
+  "on": {
+    "droids": {"argus": ["glm-5.3", "high"]},
+    "session": {"model": "kimi-k3.1-pro", "reasoningEffort": "medium"},
+    "subagents": {"lightModel": "deepseek-v4.1-flash-1017", "lightReasoningEffort": "low"}
+  }
+}"#,
+    );
+    let argus = tmp.write(
+        ".factory/droids/argus.md",
+        b"---\nname: argus\nmodel: gemini-4-carbon\nreasoningEffort: medium\n---\nReview body.\n",
+    );
+    let on = run_kit(
+        &[
+            "droid-mode",
+            "on",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--home",
+            tmp.0.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(on.status.code(), Some(0), "{}", String::from_utf8_lossy(&on.stderr));
+    let on_out = String::from_utf8_lossy(&on.stdout);
+    assert!(on_out.contains("/model kimi-k3.1-pro"));
+    let updated = fs::read_to_string(&argus).unwrap();
+    assert!(updated.contains("model: glm-5.3\nreasoningEffort: high\n"));
+
+    let off = run_kit(
+        &[
+            "droid-mode",
+            "off",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--home",
+            tmp.0.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(off.status.code(), Some(0));
+    let restored = fs::read_to_string(&argus).unwrap();
+    assert!(restored.contains("model: gemini-4-carbon\nreasoningEffort: medium\n"));
 }
