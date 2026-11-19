@@ -31,5 +31,5 @@ fingerprint with `git add -A` and `git write-tree` across randomized trees.
 
 ## Releases
 
-A `core-v*` tag publishes six `prometheus-check-<platform>[.exe]` assets.
+A `core-v*` tag publishes twelve `prometheus-check-<platform>[.exe]` and `prometheus-kit-<platform>[.exe]` assets.
 Linux builds target GLIBC 2.17 or older using manylinux2014 containers.
