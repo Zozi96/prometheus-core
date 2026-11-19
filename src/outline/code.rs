@@ -1589,16 +1589,14 @@ fn next_asi_stmt(
                     next_pos: after,
                 });
             }
-            b'\n' => {
-                if can_end_on_newline(bytes, start, i) {
-                    return Some(BraceStmt {
-                        header_start: start,
-                        header_end: i,
-                        body_open: None,
-                        body_close: None,
-                        next_pos: i + 1,
-                    });
-                }
+            b'\n' if can_end_on_newline(bytes, start, i) => {
+                return Some(BraceStmt {
+                    header_start: start,
+                    header_end: i,
+                    body_open: None,
+                    body_close: None,
+                    next_pos: i + 1,
+                });
             }
             _ => {}
         }
@@ -2143,10 +2141,7 @@ fn ps_newline_terminates(bytes: &[u8], start: usize, nl_pos: usize) -> bool {
         return false;
     }
     let next = skip_ws_and_comments(bytes, nl_pos + 1, bytes.len(), LexLang::PowerShell);
-    if next < bytes.len() && bytes[next] == b'{' {
-        return false;
-    }
-    true
+    !(next < bytes.len() && bytes[next] == b'{')
 }
 
 fn strip_ps_attributes(src: &str, mut pos: usize, end: usize) -> (usize, Option<usize>) {
