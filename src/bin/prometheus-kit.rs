@@ -66,6 +66,7 @@ usage: prometheus-kit slice [options] <spec...>
 
 spec forms:
   <path>:<line>[,<start>-<end>...]   Exact 1-based line ranges
+                                     (<path>::<start>-<end> is also accepted)
   <path>::<selector>                 Code symbol (Foo.Bar), JSON Pointer (/a/b/0),
                                      dot path (a.b[0]), JSONL filter (type=msg),
                                      or Markdown heading/slug

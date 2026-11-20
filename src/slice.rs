@@ -89,9 +89,21 @@ pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
                 "invalid slice spec `{raw}`; expected <path>::<selector>"
             ));
         }
+        // A purely numeric tail after `::` is a line-range list, not a
+        // selector: the harness instructions have long written ranges as
+        // `<path>::<start>-<end>`, so accept that form alongside
+        // `<path>:<start>-<end>` instead of failing the symbol lookup.
+        let sel = sel.trim();
+        if looks_like_range_list(sel) {
+            let ranges = parse_ranges(sel, raw)?;
+            return Ok(SliceSpec {
+                path: PathBuf::from(path_part),
+                target: SliceTarget::Ranges(ranges),
+            });
+        }
         return Ok(SliceSpec {
             path: PathBuf::from(path_part),
-            target: SliceTarget::Selector(sel.trim().to_owned()),
+            target: SliceTarget::Selector(sel.to_owned()),
         });
     }
 
@@ -694,6 +706,32 @@ mod tests {
         assert!(parse_spec(r"C:\src\OrderService.cs").is_err());
         assert!(parse_spec("foo.rs:20-10").is_err());
         assert!(parse_spec("foo.rs:0").is_err());
+    }
+
+    #[test]
+    fn parse_spec_accepts_double_colon_ranges_as_written_by_harness_instructions() {
+        // Regression: the harness instructions wrote ranges as
+        // `<path>::<start>-<end>` and every such slice failed the symbol
+        // lookup (e.g. `EmployerGroupAdminService.cs::133-224`).
+        let s = parse_spec("src/EmployerGroupAdminService.cs::133-224").unwrap();
+        assert_eq!(s.path, PathBuf::from("src/EmployerGroupAdminService.cs"));
+        assert_eq!(s.target, SliceTarget::Ranges(vec![(133, 224)]));
+
+        let list = parse_spec("src/a.rs::10-25,40").unwrap();
+        assert_eq!(
+            list.target,
+            SliceTarget::Ranges(vec![(10, 25), (40, 40)])
+        );
+
+        // A qualified symbol containing `::` stays a selector.
+        let sym = parse_spec("src/a.rs::Foo::Bar").unwrap();
+        assert_eq!(
+            sym.target,
+            SliceTarget::Selector("Foo::Bar".to_owned())
+        );
+
+        assert!(parse_spec("foo.rs::20-10").is_err());
+        assert!(parse_spec("foo.rs::0").is_err());
     }
 
     #[test]
