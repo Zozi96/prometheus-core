@@ -2497,6 +2497,8 @@ mod tests {
                 "cursor {cmd}"
             );
         }
+        // Windows quoting refuses `*` and `(`, so these never rewrite there.
+        #[cfg(not(windows))]
         for rw_cmd in ["rg 'fn .*keep_log' src", "rg 'fn .*' src", "rg '(.*)' src"] {
             let rewritten = crate::hook_rewrite::rewrite_command_str(
                 rw_cmd,
