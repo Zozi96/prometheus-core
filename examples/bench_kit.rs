@@ -152,6 +152,22 @@ fn main() {
         selector: "L200".to_owned(),
         ext: "jsonl",
     });
+    // Computed selectors (#77): count and field projection replace the
+    // inline-script parses agents otherwise spend tokens on.
+    cases.push(BenchCase {
+        name: "synth/targets.json @count (420 envs)".to_owned(),
+        lang: Lang::Json,
+        src: synth_targets_json(420),
+        selector: "/environments@count".to_owned(),
+        ext: "json",
+    });
+    cases.push(BenchCase {
+        name: "synth/session.jsonl @fields (500 lines)".to_owned(),
+        lang: Lang::Jsonl,
+        src: synth_jsonl(500),
+        selector: "type=error@fields(step,code)".to_owned(),
+        ext: "jsonl",
+    });
     cases.push(BenchCase {
         name: "synth/Tenants.razor (60 handlers)".to_owned(),
         lang: Lang::Razor,

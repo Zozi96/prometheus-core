@@ -78,6 +78,13 @@ spec forms:
   <path>::<selector>                 Code symbol (Foo.Bar), JSON Pointer (/a/b/0),
                                      dot path (a.b[0]), JSONL filter (type=msg),
                                      or Markdown heading/slug
+  <path>::<selector>@count           JSON/YAML/TOML/JSONL: number of items in the
+                                     array/object at <selector> (empty selector =
+                                     the root), or JSONL rows matching the filter
+  <path>::<selector>@keys            Keys of the object at <selector>
+  <path>::<selector>@fields(a,b)     Project fields a,b from each object row of
+                                     the array (or JSONL filter matches) at
+                                     <selector>, one compact row per line
 
 note:
   Overlapping ranges on the same file are merged; output is grouped per file

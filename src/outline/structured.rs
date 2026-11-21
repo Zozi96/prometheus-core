@@ -64,6 +64,520 @@ pub fn resolve_structured_selector(
 }
 
 // ===========================================================================
+// Computed selectors (#77): `<base>@count`, `<base>@keys`,
+// `<base>@fields(a,b)` over JSON, JSONL, YAML and TOML values.
+// ===========================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComputedOp {
+    Count,
+    Keys,
+    Fields(Vec<String>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ComputedSelection {
+    pub label: String,
+    pub lines: Vec<String>,
+}
+
+/// Split a computed-selector suffix off `selector`. Returns `None` when
+/// the part after the last `@` is not exactly `count`, `keys` or
+/// `fields(<name>,...)`, so ordinary selectors keep their meaning.
+pub fn split_computed_selector(selector: &str) -> Option<(&str, ComputedOp)> {
+    let (base, suffix) = selector.rsplit_once('@')?;
+    match suffix {
+        "count" => Some((base, ComputedOp::Count)),
+        "keys" => Some((base, ComputedOp::Keys)),
+        _ => {
+            let inner = suffix.strip_prefix("fields(")?.strip_suffix(')')?;
+            let mut fields = Vec::new();
+            for name in inner.split(',') {
+                let name = name.trim();
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '$'))
+                {
+                    return None;
+                }
+                fields.push(name.to_owned());
+            }
+            if fields.is_empty() {
+                return None;
+            }
+            Some((base, ComputedOp::Fields(fields)))
+        }
+    }
+}
+
+pub fn resolve_computed_selector(
+    src: &str,
+    idx: &LineIndex,
+    lang: Lang,
+    base: &str,
+    op: &ComputedOp,
+    full_selector: &str,
+) -> Result<ComputedSelection, String> {
+    let start = if src.starts_with('\u{FEFF}') { 3 } else { 0 };
+    let lines = match lang {
+        Lang::Json => computed_json(&src[start..], base, op, full_selector)?,
+        Lang::Jsonl => computed_jsonl(src, idx, base, op, full_selector)?,
+        Lang::Yaml => computed_yaml(src, start, idx, base, op, full_selector)?,
+        Lang::Toml => computed_toml(src, start, idx, base, op, full_selector)?,
+        _ => {
+            return Err(format!(
+                "computed selectors are not supported for {}",
+                lang.as_str()
+            ))
+        }
+    };
+    Ok(ComputedSelection {
+        label: full_selector.to_owned(),
+        lines,
+    })
+}
+
+fn computed_count(n: usize) -> Vec<String> {
+    vec![n.to_string()]
+}
+
+fn json_value_at<'a>(
+    root: &'a serde_json::Value,
+    base: &str,
+    full_selector: &str,
+) -> Result<&'a serde_json::Value, String> {
+    let segs = parse_data_path(base)?;
+    let mut cur = root;
+    for seg in &segs {
+        match (cur, seg) {
+            (serde_json::Value::Object(map), PathSeg::Key(k)) => {
+                cur = map.get(k).ok_or_else(|| {
+                    format!("JSON key `{k}` not found in selector `{full_selector}`")
+                })?;
+            }
+            (serde_json::Value::Array(elems), PathSeg::Index(i)) => {
+                cur = elems.get(*i).ok_or_else(|| {
+                    format!(
+                        "JSON array index [{i}] out of bounds (len {}) in `{full_selector}`",
+                        elems.len()
+                    )
+                })?;
+            }
+            (serde_json::Value::Array(elems), PathSeg::Key(k)) => {
+                let i: usize = k.parse().map_err(|_| {
+                    format!("cannot select key `{k}` on JSON array in `{full_selector}`")
+                })?;
+                cur = elems.get(i).ok_or_else(|| {
+                    format!(
+                        "JSON array index [{i}] out of bounds (len {}) in `{full_selector}`",
+                        elems.len()
+                    )
+                })?;
+            }
+            _ => {
+                return Err(format!(
+                    "cannot traverse into a scalar in selector `{full_selector}`"
+                ))
+            }
+        }
+    }
+    Ok(cur)
+}
+
+fn project_json_fields(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    fields: &[String],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for field in fields {
+        // A dotted field walks nested objects; the output key is its
+        // last segment. A missing field is omitted from that row.
+        let mut cur: Option<&serde_json::Value> = None;
+        for (i, part) in field.split('.').enumerate() {
+            cur = match (i, cur) {
+                (0, _) => obj.get(part),
+                (_, Some(serde_json::Value::Object(m))) => m.get(part),
+                _ => None,
+            };
+            if cur.is_none() {
+                break;
+            }
+        }
+        if let Some(value) = cur {
+            let key = field.rsplit('.').next().unwrap_or(field);
+            out.insert(key.to_owned(), value.clone());
+        }
+    }
+    out
+}
+
+fn computed_json(
+    src: &str,
+    base: &str,
+    op: &ComputedOp,
+    full_selector: &str,
+) -> Result<Vec<String>, String> {
+    let root: serde_json::Value = serde_json::from_str(src)
+        .map_err(|e| format!("computed selectors need strict JSON: {e}"))?;
+    let target = json_value_at(&root, base, full_selector)?;
+    match op {
+        ComputedOp::Count => match target {
+            serde_json::Value::Array(elems) => Ok(computed_count(elems.len())),
+            serde_json::Value::Object(map) => Ok(computed_count(map.len())),
+            _ => Err(format!(
+                "`@count` needs an array or object in `{full_selector}`"
+            )),
+        },
+        ComputedOp::Keys => match target {
+            serde_json::Value::Object(map) => {
+                Ok(map.keys().cloned().collect::<Vec<String>>())
+            }
+            _ => Err(format!("`@keys` needs an object in `{full_selector}`")),
+        },
+        ComputedOp::Fields(fields) => match target {
+            serde_json::Value::Array(elems) => {
+                let mut lines = Vec::new();
+                for el in elems {
+                    if let serde_json::Value::Object(map) = el {
+                        let projected = project_json_fields(map, fields);
+                        lines.push(
+                            serde_json::to_string(&serde_json::Value::Object(projected))
+                                .map_err(|e| e.to_string())?,
+                        );
+                    }
+                }
+                if lines.is_empty() {
+                    return Err(format!(
+                        "`@fields` found no object rows in `{full_selector}`"
+                    ));
+                }
+                Ok(lines)
+            }
+            _ => Err(format!(
+                "`@fields` needs an array of objects in `{full_selector}`"
+            )),
+        },
+    }
+}
+
+fn computed_jsonl(
+    src: &str,
+    idx: &LineIndex,
+    base: &str,
+    op: &ComputedOp,
+    full_selector: &str,
+) -> Result<Vec<String>, String> {
+    let base = base.trim();
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for ln in 1..=idx.total_lines() {
+        let trimmed = idx.line_slice(src, ln).trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            rows.push(parsed);
+        }
+    }
+    let filtered: Vec<&serde_json::Value> = if base.is_empty() {
+        rows.iter().collect()
+    } else if let Some((key, val)) = base.split_once('=') {
+        let (key, val) = (key.trim(), val.trim());
+        if key.is_empty() {
+            return Err(format!(
+                "empty filter key in JSONL selector `{full_selector}`"
+            ));
+        }
+        rows.iter()
+            .filter(|row| json_field_matches(row, key, val))
+            .collect()
+    } else {
+        return Err(format!(
+            "JSONL computed selectors take a `key=value` filter or an empty base in `{full_selector}`"
+        ));
+    };
+    match op {
+        ComputedOp::Count => Ok(computed_count(filtered.len())),
+        ComputedOp::Keys => {
+            let mut keys: Vec<String> = Vec::new();
+            for row in &filtered {
+                if let serde_json::Value::Object(map) = row {
+                    for k in map.keys() {
+                        if !keys.contains(k) {
+                            keys.push(k.clone());
+                        }
+                    }
+                }
+            }
+            if keys.is_empty() {
+                return Err(format!(
+                    "`@keys` found no object rows in `{full_selector}`"
+                ));
+            }
+            Ok(keys)
+        }
+        ComputedOp::Fields(fields) => {
+            let mut lines = Vec::new();
+            for row in &filtered {
+                if let serde_json::Value::Object(map) = row {
+                    let projected = project_json_fields(map, fields);
+                    lines.push(
+                        serde_json::to_string(&serde_json::Value::Object(projected))
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+            }
+            if lines.is_empty() {
+                return Err(format!(
+                    "`@fields` found no object rows in `{full_selector}`"
+                ));
+            }
+            Ok(lines)
+        }
+    }
+}
+
+fn yaml_node_at(
+    roots: &[YamlNode],
+    base: &str,
+    full_selector: &str,
+) -> Result<YamlNode, String> {
+    let segs = parse_data_path(base)?;
+    if segs.is_empty() {
+        return Ok(YamlNode {
+            key: None,
+            summary: String::new(),
+            start_line: 1,
+            end_line: roots.iter().map(|n| n.end_line).max().unwrap_or(1),
+            children: roots.to_vec(),
+        });
+    }
+    let mut cur_list: &[YamlNode] = roots;
+    let mut matched: Option<YamlNode> = None;
+    for seg in &segs {
+        let node = match seg {
+            PathSeg::Key(k) => {
+                if cur_list.iter().all(|n| n.key.is_none()) && !cur_list.is_empty() {
+                    if let Ok(i) = k.parse::<usize>() {
+                        cur_list.get(i).ok_or_else(|| {
+                            format!(
+                                "YAML sequence index [{i}] out of bounds (len {}) in `{full_selector}`",
+                                cur_list.len()
+                            )
+                        })?
+                    } else {
+                        return Err(format!(
+                            "YAML key `{k}` not found in `{full_selector}`"
+                        ));
+                    }
+                } else {
+                    cur_list
+                        .iter()
+                        .find(|n| n.key.as_deref() == Some(k.as_str()))
+                        .ok_or_else(|| {
+                            format!("YAML key `{k}` not found in `{full_selector}`")
+                        })?
+                }
+            }
+            PathSeg::Index(i) => {
+                let seq: Vec<&YamlNode> = cur_list.iter().filter(|n| n.key.is_none()).collect();
+                seq.get(*i).copied().ok_or_else(|| {
+                    format!(
+                        "YAML sequence index [{i}] out of bounds (len {}) in `{full_selector}`",
+                        seq.len()
+                    )
+                })?
+            }
+        };
+        matched = Some(node.clone());
+        cur_list = &node.children;
+    }
+    matched.ok_or_else(|| format!("selector `{full_selector}` matched nothing"))
+}
+
+fn yaml_value_text(node: &YamlNode) -> String {
+    if !node.summary.is_empty() {
+        return node.summary.clone();
+    }
+    if node.children.iter().any(|c| c.key.is_none()) {
+        return format!("[seq, {} items]", node.children.len());
+    }
+    if !node.children.is_empty() {
+        return format!("{{map, {} keys}}", node.children.len());
+    }
+    String::new()
+}
+
+fn computed_yaml(
+    src: &str,
+    start: usize,
+    idx: &LineIndex,
+    base: &str,
+    op: &ComputedOp,
+    full_selector: &str,
+) -> Result<Vec<String>, String> {
+    let roots = parse_yaml_tree(src, start, idx);
+    let node = yaml_node_at(&roots, base, full_selector)?;
+    match op {
+        ComputedOp::Count => {
+            if node.children.is_empty() {
+                return Err(format!(
+                    "`@count` needs a mapping or sequence in `{full_selector}`"
+                ));
+            }
+            let seq_items = node.children.iter().filter(|c| c.key.is_none()).count();
+            if seq_items > 0 {
+                Ok(computed_count(seq_items))
+            } else {
+                Ok(computed_count(node.children.len()))
+            }
+        }
+        ComputedOp::Keys => {
+            let keys: Vec<String> = node
+                .children
+                .iter()
+                .filter_map(|c| c.key.clone())
+                .collect();
+            if keys.is_empty() {
+                return Err(format!(
+                    "`@keys` needs a mapping in `{full_selector}`"
+                ));
+            }
+            Ok(keys)
+        }
+        ComputedOp::Fields(fields) => {
+            let mut lines = Vec::new();
+            for item in node.children.iter().filter(|c| c.key.is_none()) {
+                if item.children.is_empty() {
+                    continue;
+                }
+                let mut pairs = Vec::new();
+                for field in fields {
+                    if let Some(child) =
+                        item.children.iter().find(|c| c.key.as_deref() == Some(field.as_str()))
+                    {
+                        pairs.push(format!("{field}: {}", yaml_value_text(child)));
+                    }
+                }
+                if !pairs.is_empty() {
+                    lines.push(format!("{{{}}}", pairs.join(", ")));
+                }
+            }
+            if lines.is_empty() {
+                return Err(format!(
+                    "`@fields` needs a sequence of mappings in `{full_selector}`"
+                ));
+            }
+            Ok(lines)
+        }
+    }
+}
+
+fn toml_child_value(item: &OutlineItem) -> String {
+    let prefix = format!("{} = ", item.name);
+    item.signature
+        .strip_prefix(&prefix)
+        .unwrap_or(&item.signature)
+        .to_owned()
+}
+
+fn computed_toml(
+    src: &str,
+    start: usize,
+    idx: &LineIndex,
+    base: &str,
+    op: &ComputedOp,
+    full_selector: &str,
+) -> Result<Vec<String>, String> {
+    let items = parse_toml_outline(src, start, idx);
+    let segs = parse_data_path(base)?;
+    let target = segs_to_toml_dotted(&segs);
+    if target.is_empty() {
+        return match op {
+            ComputedOp::Count => Ok(computed_count(items.len())),
+            ComputedOp::Keys => Ok(items.iter().map(|it| it.name.clone()).collect()),
+            ComputedOp::Fields(_) => Err(format!(
+                "`@fields` needs an array of tables in `{full_selector}`"
+            )),
+        };
+    }
+    let flat = super::flatten_items(&items);
+    // An array of tables `[[bin]]` flattens to `bin[0]`, `bin[1]`, …
+    let array_tables: Vec<&OutlineItem> = flat
+        .iter()
+        .copied()
+        .filter(|it| {
+            it.qualified_name
+                .strip_prefix(&target)
+                .and_then(|rest| rest.strip_prefix('['))
+                .and_then(|rest| rest.strip_suffix(']'))
+                .is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                })
+        })
+        .collect();
+    let exact: Option<&OutlineItem> = flat
+        .iter()
+        .copied()
+        .find(|it| it.qualified_name == target);
+    match op {
+        ComputedOp::Count => {
+            if !array_tables.is_empty() {
+                Ok(computed_count(array_tables.len()))
+            } else if let Some(item) = exact {
+                if item.children.is_empty() {
+                    Err(format!(
+                        "`@count` needs a table or array of tables in `{full_selector}`"
+                    ))
+                } else {
+                    Ok(computed_count(item.children.len()))
+                }
+            } else {
+                Err(format!("TOML selector `{full_selector}` not found"))
+            }
+        }
+        ComputedOp::Keys => {
+            let source = array_tables.first().copied().or(exact);
+            let Some(item) = source else {
+                return Err(format!("TOML selector `{full_selector}` not found"));
+            };
+            let keys: Vec<String> = item.children.iter().map(|c| c.name.clone()).collect();
+            if keys.is_empty() {
+                return Err(format!(
+                    "`@keys` needs a table in `{full_selector}`"
+                ));
+            }
+            Ok(keys)
+        }
+        ComputedOp::Fields(fields) => {
+            if array_tables.is_empty() {
+                return Err(format!(
+                    "`@fields` needs an array of tables in `{full_selector}`"
+                ));
+            }
+            let mut lines = Vec::new();
+            for item in &array_tables {
+                let mut pairs = Vec::new();
+                for field in fields {
+                    if let Some(child) = item.children.iter().find(|c| c.name == *field) {
+                        pairs.push(format!("{field}: {}", toml_child_value(child)));
+                    }
+                }
+                if !pairs.is_empty() {
+                    lines.push(format!("{{{}}}", pairs.join(", ")));
+                }
+            }
+            if lines.is_empty() {
+                return Err(format!(
+                    "`@fields` found no matching keys in `{full_selector}`"
+                ));
+            }
+            Ok(lines)
+        }
+    }
+}
+
+// ===========================================================================
 // Shared path token parser & suggestion helper
 // ===========================================================================
 

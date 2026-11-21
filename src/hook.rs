@@ -1916,6 +1916,86 @@ pub fn read_guard(
 }
 
 // ---------------------------------------------------------------------------
+// Use-time hint (#77, ADR-0013 D2(b)): when a shell command parses a
+// structured file with an inline interpreter call, let it run unchanged
+// and show one line naming the `slice` selector form — at most once per
+// session per rule, counted by the savings counter.
+// ---------------------------------------------------------------------------
+
+const HINT_MARKER: &str = "hint-slice-selector";
+
+pub fn use_time_hint(host: &str, event: &Value, session_id: &str) -> Option<String> {
+    if !valid_session_id_str(session_id) {
+        return None;
+    }
+    let tool = casefold(tool_name(event));
+    if !matches!(
+        tool.as_str(),
+        "execute" | "bash" | "shell" | "run_command" | "run_shell_command" | "terminal"
+    ) {
+        return None;
+    }
+    let empty = Map::new();
+    let inp = get(event, "tool_input")
+        .and_then(Value::as_object)
+        .or_else(|| get(event, "input").and_then(Value::as_object))
+        .unwrap_or(&empty);
+    let command_value = inp.get("command")?;
+    let command = command_value.as_str()?;
+    if command.trim().is_empty() || !secret_command_denied(Some(command_value)).is_empty() {
+        return None;
+    }
+    let tokens = split_command(command);
+    let first = tokens.first()?;
+    let program = Path::new(first)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(first.as_str())
+        .to_ascii_lowercase();
+    let is_python = matches!(program.as_str(), "python" | "python3")
+        && (tokens.iter().any(|t| t == "-c") || command.contains("<<"));
+    let is_node = program == "node" && tokens.iter().any(|t| t == "-e");
+    let is_jq = program == "jq";
+    if !is_python && !is_node && !is_jq {
+        return None;
+    }
+    // The first structured-file operand names the file in the hint. `jq`
+    // only reads JSON; the interpreter forms accept every structured
+    // extension `slice` selectors cover.
+    let file = tokens.iter().skip(1).find(|t| {
+        let lower = t.to_ascii_lowercase();
+        lower.ends_with(".json")
+            || lower.ends_with(".jsonl")
+            || (if is_jq {
+                false
+            } else {
+                lower.ends_with(".yaml") || lower.ends_with(".yml") || lower.ends_with(".toml")
+            })
+    })?;
+    let folder = session_dir(session_id)?;
+    let marker = folder.join(HINT_MARKER);
+    // First writer wins: `create_new` fails when the marker already
+    // exists (or is a pre-planted symlink), and the hint stays silent.
+    {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(&marker).ok()?;
+    }
+    let hint = format!(
+        "Hint: `prometheus-kit slice '{file}::<selector>'` reads part of that structured file without an inline script; selectors include `@count`, `@keys` and `@fields(a,b)` — e.g. `prometheus-kit slice '{file}::@count'`."
+    );
+    if let Some(metrics_host) = Host::from_hook(host) {
+        metrics::record(metrics_host, Rule::UseTimeHint, command.len(), hint.len());
+    }
+    Some(hint)
+}
+
+// ---------------------------------------------------------------------------
 // Host adapters & envelope handling.
 // ---------------------------------------------------------------------------
 
@@ -2046,6 +2126,9 @@ fn handle_claude_or_muse(host: &str, raw: &[u8]) -> Value {
     if let Some(reply) = crate::hook_rewrite::rewrite_command_reply(host, event) {
         return reply;
     }
+    if let Some(hint) = use_time_hint(host, event, session_id) {
+        return read_guard_reply(host, ReadGuard::Warn(hint));
+    }
     read_guard_reply(
         host,
         read_guard(host, event, session_id, Some(&root)),
@@ -2078,6 +2161,9 @@ fn handle_droid(raw: &[u8]) -> Value {
     }
     if let Some(reply) = crate::hook_rewrite::rewrite_command_reply("droid", event) {
         return reply;
+    }
+    if let Some(hint) = use_time_hint("droid", event, session_id) {
+        return read_guard_reply("droid", ReadGuard::Warn(hint));
     }
     read_guard_reply(
         "droid",
@@ -2196,6 +2282,9 @@ fn handle_cursor(raw: &[u8]) -> Value {
         return cursor_deny_reply(&reason);
     }
     let roots = cursor_roots(event);
+    if let Some(hint) = use_time_hint("cursor", event, session_id) {
+        return read_guard_reply("cursor", ReadGuard::Warn(hint));
+    }
     read_guard_reply(
         "cursor",
         read_guard(
@@ -2843,6 +2932,110 @@ mod tests {
         let csecond = run_hook("cursor", cev.to_string().as_bytes());
         assert_eq!(REREAD_MESSAGE, csecond["agent_message"]);
         assert!(csecond.get("permission").is_none());
+    }
+
+    #[test]
+    fn use_time_hint_fires_once_per_session_and_leaves_the_command_unchanged() {
+        let _g = env_guard();
+        let tmp = TempDir::new("hint");
+        let rt = tmp.0.join("xdg");
+        fs::create_dir_all(&rt).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _env = EnvOverride::set(&[
+            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
+            ("CURSOR_PROJECT_DIR", None),
+            ("DEVIN_PROJECT_DIR", None),
+            ("GROK_SESSION_ID", None),
+        ]);
+        let repo = tmp.0.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        let py = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "python3 -c 'import json; d=json.load(open(\"data.json\")); print(len(d[\"users\"]))'"},
+            "cwd": repo,
+            "session_id": "s-hint",
+        });
+        let first = run_hook("claude", py.to_string().as_bytes());
+        let ctx = first["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("first inline parse gets the hint");
+        assert!(ctx.contains("prometheus-kit slice 'data.json::<selector>'"), "{ctx}");
+        assert!(ctx.contains("@count"), "{ctx}");
+        // The command runs unchanged: no rewrite, no permission decision.
+        assert!(first["hookSpecificOutput"].get("updatedInput").is_none());
+        assert!(first["hookSpecificOutput"].get("permissionDecision").is_none());
+        // Once per session per rule: the same session stays silent, even
+        // for a different interpreter shape.
+        assert_eq!(json!({}), run_hook("claude", py.to_string().as_bytes()));
+        let jq = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "jq '.users | length' data.json"},
+            "cwd": repo,
+            "session_id": "s-hint",
+        });
+        assert_eq!(json!({}), run_hook("claude", jq.to_string().as_bytes()));
+        // A new session gets the hint again (jq form).
+        let jq2 = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "jq '.users | length' data.json"},
+            "cwd": repo,
+            "session_id": "s-hint-2",
+        });
+        let jq_reply = run_hook("claude", jq2.to_string().as_bytes());
+        assert!(jq_reply["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .is_some_and(|c| c.contains("@fields")));
+        // Heredoc and node forms fire in their own sessions.
+        let heredoc = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "python3 - <<'EOF'\nimport yaml\nd = yaml.safe_load(open('cfg.yaml'))\nprint(d['meta'])\nEOF"},
+            "cwd": repo,
+            "session_id": "s-hint-3",
+        });
+        let hd = run_hook("claude", heredoc.to_string().as_bytes());
+        assert!(hd["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .is_some_and(|c| c.contains("cfg.yaml")));
+        let node = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "node -e \"console.log(Object.keys(require('./cfg.toml')))\" cfg.toml"},
+            "cwd": repo,
+            "session_id": "s-hint-4",
+        });
+        // `node -e` with the file only inside the script text has no
+        // structured-file operand token after the program, but the
+        // trailing cfg.toml operand names it.
+        let nd = run_hook("claude", node.to_string().as_bytes());
+        assert!(nd["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .is_some_and(|c| c.contains("cfg.toml")));
+        // No structured file, or no interpreter shape: silence.
+        let plain = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "python3 -c 'print(1)'"},
+            "cwd": repo,
+            "session_id": "s-hint-5",
+        });
+        assert_eq!(json!({}), run_hook("claude", plain.to_string().as_bytes()));
+        let ls = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls -la data.json"},
+            "cwd": repo,
+            "session_id": "s-hint-6",
+        });
+        assert_eq!(json!({}), run_hook("claude", ls.to_string().as_bytes()));
     }
 
     #[cfg(unix)]

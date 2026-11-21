@@ -1,7 +1,10 @@
 //! Exact line-range and structural symbol/path slicing with token budgets.
 
 use crate::outline::lexer::LineIndex;
-use crate::outline::structured::{resolve_structured_selector, suggest_candidates, ResolvedRange};
+use crate::outline::structured::{
+    resolve_computed_selector, resolve_structured_selector, split_computed_selector,
+    suggest_candidates, ComputedSelection, ResolvedRange,
+};
 use crate::outline::{flatten_items, outline_source, read_text_file, Lang, OutlineItem, OutlineOptions};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -376,54 +379,74 @@ fn resolve_code_selector(
     ))
 }
 
+enum SpecResolution {
+    Intervals(Vec<Interval>),
+    Computed(ComputedSelection),
+}
+
 fn resolve_ranges_for_spec(
     path_str: &str,
     src: &str,
     idx: &LineIndex,
     lang: Option<Lang>,
     target: &SliceTarget,
-) -> Result<Vec<Interval>, String> {
+) -> Result<SpecResolution, String> {
     match target {
-        SliceTarget::Ranges(ranges) => Ok(ranges
-            .iter()
-            .map(|&(start, end)| Interval {
-                start,
-                end,
-                label: None,
-                signature: None,
-            })
-            .collect()),
+        SliceTarget::Ranges(ranges) => Ok(SpecResolution::Intervals(
+            ranges
+                .iter()
+                .map(|&(start, end)| Interval {
+                    start,
+                    end,
+                    label: None,
+                    signature: None,
+                })
+                .collect(),
+        )),
         SliceTarget::Tail(n) => {
             let total = idx.total_lines();
             if total == 0 {
-                return Ok(Vec::new());
+                return Ok(SpecResolution::Intervals(Vec::new()));
             }
-            Ok(vec![Interval {
+            Ok(SpecResolution::Intervals(vec![Interval {
                 start: total.saturating_sub(*n - 1).max(1),
                 end: total,
                 label: None,
                 signature: None,
-            }])
+            }]))
         }
         SliceTarget::Selector(sel) => {
             let lang = lang.ok_or_else(|| {
                 format!("{path_str}: unsupported file type for symbol/path selector (pass --lang or line ranges)")
             })?;
             if lang.is_structured() {
+                // Computed selectors (#77): `<base>@count`, `<base>@keys`,
+                // `<base>@fields(a,b)` over JSON/JSONL/YAML/TOML values.
+                if !matches!(lang, Lang::Markdown) {
+                    if let Some((base, op)) = split_computed_selector(sel) {
+                        let computed =
+                            resolve_computed_selector(src, idx, lang, base, &op, sel)
+                                .map_err(|e| format!("{path_str}: {e}"))?;
+                        return Ok(SpecResolution::Computed(computed));
+                    }
+                }
                 let resolved: Vec<ResolvedRange> =
                     resolve_structured_selector(src, idx, lang, sel)
                         .map_err(|e| format!("{path_str}: {e}"))?;
-                Ok(resolved
-                    .into_iter()
-                    .map(|r| Interval {
-                        start: r.start_line,
-                        end: r.end_line,
-                        label: Some(r.label),
-                        signature: None,
-                    })
-                    .collect())
+                Ok(SpecResolution::Intervals(
+                    resolved
+                        .into_iter()
+                        .map(|r| Interval {
+                            start: r.start_line,
+                            end: r.end_line,
+                            label: Some(r.label),
+                            signature: None,
+                        })
+                        .collect(),
+                ))
             } else {
                 resolve_code_selector(path_str, src, lang, sel)
+                    .map(SpecResolution::Intervals)
             }
         }
     }
@@ -477,6 +500,7 @@ pub fn execute_slices(specs: &[SliceSpec], opts: &SliceOptions) -> Result<SliceR
     }
     let mut per_file_order: Vec<PathBuf> = Vec::new();
     let mut per_file_map: HashMap<PathBuf, FileIntervals> = HashMap::new();
+    let mut computed_blocks: Vec<(String, ComputedSelection)> = Vec::new();
 
     for spec in specs {
         let key = std::fs::canonicalize(&spec.path).unwrap_or_else(|_| spec.path.clone());
@@ -491,25 +515,32 @@ pub fn execute_slices(specs: &[SliceSpec], opts: &SliceOptions) -> Result<SliceR
         }
         let cached = cache.get(&key).unwrap();
         let display = spec.path.to_string_lossy().to_string();
-        let intervals = resolve_ranges_for_spec(
+        let resolution = resolve_ranges_for_spec(
             &display,
             &cached.src,
             &cached.idx,
             cached.lang,
             &spec.target,
         )?;
-        if !per_file_map.contains_key(&key) {
-            per_file_order.push(key.clone());
-            per_file_map.insert(
-                key.clone(),
-                FileIntervals {
-                    path: spec.path.clone(),
-                    display,
-                    intervals,
-                },
-            );
-        } else {
-            per_file_map.get_mut(&key).unwrap().intervals.extend(intervals);
+        match resolution {
+            SpecResolution::Computed(computed) => {
+                computed_blocks.push((display, computed));
+            }
+            SpecResolution::Intervals(intervals) => {
+                if !per_file_map.contains_key(&key) {
+                    per_file_order.push(key.clone());
+                    per_file_map.insert(
+                        key.clone(),
+                        FileIntervals {
+                            path: spec.path.clone(),
+                            display,
+                            intervals,
+                        },
+                    );
+                } else {
+                    per_file_map.get_mut(&key).unwrap().intervals.extend(intervals);
+                }
+            }
         }
     }
 
@@ -659,6 +690,58 @@ pub fn execute_slices(specs: &[SliceSpec], opts: &SliceOptions) -> Result<SliceR
         }
     }
 
+    // Computed selections (#77) emit synthesized lines, not source lines:
+    // they share the same token budget, and clipping them sets `truncated`
+    // so the renderer's omitted-lines notice applies.
+    for (display, computed) in computed_blocks {
+        raw_bytes += computed.lines.iter().map(|l| l.len() + 1).sum::<usize>();
+        if truncated {
+            omitted_slices += 1;
+            omitted_lines += computed.lines.len();
+            continue;
+        }
+        let header_cost = display.len() + 32;
+        if !unlimited && !kept.is_empty() && used + header_cost + RESERVE > budget_chars {
+            truncated = true;
+            omitted_slices += 1;
+            omitted_lines += computed.lines.len();
+            continue;
+        }
+        used += header_cost;
+        let mut block_lines = Vec::new();
+        for (i, text) in computed.lines.iter().enumerate() {
+            let (text, line_trunc) = if opts.truncate_long_lines {
+                truncate_long_line(text)
+            } else {
+                (text.clone(), false)
+            };
+            let cost = text.len() + 10;
+            if !unlimited && used + cost + RESERVE > budget_chars {
+                truncated = true;
+                omitted_lines += computed.lines.len() - i;
+                break;
+            }
+            used += cost;
+            block_lines.push(SliceLine {
+                line: 0,
+                text,
+                truncated: line_trunc,
+            });
+        }
+        if !block_lines.is_empty() {
+            kept.push(SliceBlock {
+                path: display,
+                label: Some(computed.label),
+                start_line: 0,
+                end_line: 0,
+                signature: None,
+                lines: block_lines,
+            });
+        } else {
+            omitted_slices += 1;
+        }
+    }
+
     Ok(SliceResult {
         slices: kept,
         truncated,
@@ -678,6 +761,20 @@ pub fn render_slice_text(result: &SliceResult, opts: &SliceOptions) -> String {
     for (i, block) in result.slices.iter().enumerate() {
         if i > 0 {
             out.push('\n');
+        }
+        // Computed selections (#77) have no source range: header names the
+        // selector, and the synthesized lines print without `L<n>:` prefixes.
+        if block.start_line == 0 && block.end_line == 0 {
+            out.push_str(&format!(
+                "=== {} ({}) ===\n",
+                block.path,
+                block.label.as_deref().unwrap_or("computed")
+            ));
+            for line in &block.lines {
+                out.push_str(&line.text);
+                out.push('\n');
+            }
+            continue;
         }
         let range = if block.start_line == block.end_line {
             format!("L{}", block.start_line)
@@ -836,6 +933,105 @@ mod tests {
         let res = execute_slices(&[big], &SliceOptions::default()).unwrap();
         assert_eq!(res.slices[0].start_line, 1);
         assert_eq!(res.slices[0].end_line, 5);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn computed_selectors_count_keys_and_project_on_each_format() {
+        // JSON
+        let pj = temp_file(
+            "data.json",
+            b"{\n  \"users\": [\n    {\"id\": 1, \"name\": \"ana\", \"role\": \"dev\"},\n    {\"id\": 2, \"name\": \"bob\", \"role\": \"ops\"}\n  ],\n  \"meta\": {\"total\": 2, \"page\": 1}\n}\n",
+        );
+        let run = |path: &PathBuf, sel: &str| {
+            let spec = parse_spec(&format!("{}::{sel}", path.display())).unwrap();
+            execute_slices(&[spec], &SliceOptions::default()).unwrap()
+        };
+        let res = run(&pj, "/users@count");
+        assert_eq!(res.slices[0].lines[0].text, "2");
+        let res = run(&pj, "@count");
+        assert_eq!(res.slices[0].lines[0].text, "2");
+        let res = run(&pj, "/meta@keys");
+        let mut keys: Vec<&str> = res.slices[0].lines.iter().map(|l| l.text.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["page", "total"]);
+        let res = run(&pj, "/users@fields(id,name)");
+        let rows: Vec<&str> = res.slices[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(rows, vec!["{\"id\":1,\"name\":\"ana\"}", "{\"id\":2,\"name\":\"bob\"}"]);
+        let rendered = render_slice_text(&res, &SliceOptions::default());
+        assert!(rendered.contains("/users@fields(id,name)"));
+        let _ = std::fs::remove_dir_all(pj.parent().unwrap());
+
+        // JSONL
+        let pl = temp_file(
+            "rows.jsonl",
+            b"{\"type\":\"msg\",\"id\":1,\"v\":10}\n{\"type\":\"err\",\"id\":2,\"v\":20}\n{\"type\":\"msg\",\"id\":3,\"v\":30}\n",
+        );
+        let res = run(&pl, "type=msg@count");
+        assert_eq!(res.slices[0].lines[0].text, "2");
+        let res = run(&pl, "@count");
+        assert_eq!(res.slices[0].lines[0].text, "3");
+        let res = run(&pl, "type=msg@fields(id,v)");
+        let rows: Vec<&str> = res.slices[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(rows, vec!["{\"id\":1,\"v\":10}", "{\"id\":3,\"v\":30}"]);
+        let res = run(&pl, "@keys");
+        let mut keys: Vec<&str> = res.slices[0].lines.iter().map(|l| l.text.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["id", "type", "v"]);
+        let _ = std::fs::remove_dir_all(pl.parent().unwrap());
+
+        // YAML
+        let py = temp_file(
+            "data.yaml",
+            b"users:\n  - id: 1\n    name: ana\n  - id: 2\n    name: bob\nmeta:\n  total: 2\n  page: 1\n",
+        );
+        let res = run(&py, "users@count");
+        assert_eq!(res.slices[0].lines[0].text, "2");
+        let res = run(&py, "meta@keys");
+        let keys: Vec<&str> = res.slices[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(keys, vec!["total", "page"]);
+        let res = run(&py, "users@fields(id,name)");
+        let rows: Vec<&str> = res.slices[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(rows, vec!["{id: 1, name: ana}", "{id: 2, name: bob}"]);
+        let _ = std::fs::remove_dir_all(py.parent().unwrap());
+
+        // TOML
+        let pt = temp_file(
+            "data.toml",
+            b"[meta]\ntotal = 2\npage = 1\n\n[[bin]]\nname = \"a\"\nsize = 3\n\n[[bin]]\nname = \"b\"\nsize = 4\n",
+        );
+        let res = run(&pt, "bin@count");
+        assert_eq!(res.slices[0].lines[0].text, "2");
+        let res = run(&pt, "meta@keys");
+        let keys: Vec<&str> = res.slices[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(keys, vec!["total", "page"]);
+        let res = run(&pt, "bin@fields(name,size)");
+        let rows: Vec<&str> = res.slices[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(rows, vec!["{name: \"a\", size: 3}", "{name: \"b\", size: 4}"]);
+        let _ = std::fs::remove_dir_all(pt.parent().unwrap());
+    }
+
+    #[test]
+    fn computed_selector_output_clips_under_the_token_budget() {
+        let mut src = String::from("{\"rows\": [");
+        for i in 0..200 {
+            if i > 0 {
+                src.push(',');
+            }
+            src.push_str(&format!("{{\"id\": {i}, \"name\": \"row-{i}\"}}"));
+        }
+        src.push_str("]}");
+        let p = temp_file("big.json", src.as_bytes());
+        let spec = parse_spec(&format!("{}::/rows@fields(id,name)", p.display())).unwrap();
+        let opts = SliceOptions {
+            max_tokens: 100,
+            ..SliceOptions::default()
+        };
+        let res = execute_slices(&[spec], &opts).unwrap();
+        assert!(res.truncated);
+        assert!(res.omitted_lines > 0);
+        let rendered = render_slice_text(&res, &opts);
+        assert!(rendered.contains("omitted lines"), "{rendered}");
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
