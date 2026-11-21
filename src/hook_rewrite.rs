@@ -624,6 +624,28 @@ fn rewrite_git(
     cd_prefix: Option<&str>,
     event_cwd: Option<&Path>,
 ) -> Option<String> {
+    rewrite_git_inner(tokens, kit_bin, cd_prefix, event_cwd, false)
+}
+
+/// With `rtk` active the kit defers every `git` form `rtk` compacts; the one
+/// exception is `git show <rev>`, which the `rtk` history shows it leaves
+/// raw (ADR-0013 D7, #75), so only that subcommand is rewritten here.
+fn rewrite_git_show_only(
+    tokens: &[ShellToken],
+    kit_bin: &str,
+    cd_prefix: Option<&str>,
+    event_cwd: Option<&Path>,
+) -> Option<String> {
+    rewrite_git_inner(tokens, kit_bin, cd_prefix, event_cwd, true)
+}
+
+fn rewrite_git_inner(
+    tokens: &[ShellToken],
+    kit_bin: &str,
+    cd_prefix: Option<&str>,
+    event_cwd: Option<&Path>,
+    show_only: bool,
+) -> Option<String> {
     let mut idx = 1usize;
     let mut git_c_dir: Option<&ShellToken> = None;
 
@@ -637,6 +659,9 @@ fn rewrite_git(
     }
 
     let subcmd = tokens.get(idx)?.value.as_str();
+    if show_only && subcmd != "show" {
+        return None;
+    }
     idx += 1;
 
     let mut parts = vec![kit_bin.to_owned(), "diff".to_owned()];
@@ -911,6 +936,270 @@ fn rewrite_rg(tokens: &[ShellToken], kit_bin: &str) -> Option<String> {
     Some(parts.join(" "))
 }
 
+/// One safe file argument for the dump rewrites (`head`/`tail`/`cat`/`nl`):
+/// the same path rules as the `sed -n` rewrite — one literal path, no
+/// expansions, no stdin marker, no flag-shaped token.
+fn dump_file_arg(token: &ShellToken) -> Option<&str> {
+    if is_safe_sed_path(token) {
+        Some(token.value.as_str())
+    } else {
+        None
+    }
+}
+
+fn parse_dump_count(value: &str) -> Option<usize> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: usize = value.parse().ok()?;
+    if n >= 1 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// `head`/`tail`/`cat`/`nl` over one safe file → `slice` (#75). These are
+/// the file dumps `rtk` leaves raw (ADR-0013 D7), so the rewrite applies
+/// whether or not `rtk` is active. Only the documented flag forms are
+/// supported; anything else (several files, `-c`, `-f`, `-q`, a pipeline —
+/// already refused by the caller's scan) returns `None` untouched.
+///
+/// - `head [-n N | -N] <file>` → `slice <file>:1-N` (default N = 10)
+/// - `tail [-n N | -N] <file>` → `slice <file>:-N` (the last N lines);
+///   `tail -n +N <file>` → `slice <file>:N-` (from line N to the end)
+/// - `cat <file>` / `nl <file>` → `slice <file>:1-` (the whole file,
+///   under slice's default token budget)
+fn rewrite_file_dump(cmd0: &str, tokens: &[ShellToken], kit_bin: &str) -> Option<String> {
+    let args = &tokens[1..];
+    // An optional `--` separator before the single file.
+    let args: &[ShellToken] = match args.first() {
+        Some(t) if t.value == "--" => &args[1..],
+        _ => args,
+    };
+    let slice_for = |spec: String| -> Option<String> {
+        Some(format!("{kit_bin} slice {}", try_shell_quote(&spec)?))
+    };
+    match cmd0 {
+        "cat" | "nl" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let file = dump_file_arg(&args[0])?;
+            slice_for(format!("{file}:1-"))
+        }
+        "head" | "tail" => {
+            let mut count: Option<usize> = None;
+            let mut from_line: Option<usize> = None;
+            let mut file: Option<&ShellToken> = None;
+            let mut i = 0usize;
+            while i < args.len() {
+                let arg = args[i].value.as_str();
+                if file.is_some() {
+                    return None;
+                }
+                match arg {
+                    "-n" | "--lines" => {
+                        let val = &args.get(i + 1)?.value;
+                        if let Some(n) = val.strip_prefix('+') {
+                            if cmd0 != "tail" {
+                                return None;
+                            }
+                            from_line = Some(parse_dump_count(n)?);
+                        } else {
+                            count = Some(parse_dump_count(val)?);
+                        }
+                        i += 1;
+                    }
+                    _ if arg.starts_with("--lines=") => {
+                        let val = &arg["--lines=".len()..];
+                        if let Some(n) = val.strip_prefix('+') {
+                            if cmd0 != "tail" {
+                                return None;
+                            }
+                            from_line = Some(parse_dump_count(n)?);
+                        } else {
+                            count = Some(parse_dump_count(val)?);
+                        }
+                    }
+                    _ if arg.starts_with('-')
+                        && arg.len() > 1
+                        && arg[1..].bytes().all(|b| b.is_ascii_digit()) =>
+                    {
+                        // The attached form: `head -5` / `tail -5`.
+                        count = Some(parse_dump_count(&arg[1..])?);
+                    }
+                    _ if arg.starts_with('-') => return None,
+                    _ => file = Some(&args[i]),
+                }
+                i += 1;
+            }
+            let file = dump_file_arg(file?)?;
+            if cmd0 == "head" {
+                if from_line.is_some() {
+                    return None;
+                }
+                let n = count.unwrap_or(10);
+                slice_for(format!("{file}:1-{n}"))
+            } else if let Some(n) = from_line {
+                slice_for(format!("{file}:{n}-"))
+            } else {
+                let n = count.unwrap_or(10);
+                slice_for(format!("{file}:-{n}"))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `grep` over files or directories → `search` (#75), with or without
+/// `rtk` active (`rtk` leaves `grep` raw; ADR-0013 D7). Only flags whose
+/// meaning `search` reproduces are supported; inverting, counting,
+/// context, colour, Perl/byte modes and similar return `None` untouched.
+/// The pattern is the first positional (or the `-e` argument); every
+/// remaining positional is a search path, exactly as in `rewrite_rg`.
+fn rewrite_grep(tokens: &[ShellToken], kit_bin: &str) -> Option<String> {
+    let mut ignore_case = false;
+    let mut fixed_strings = false;
+    let mut word_regexp = false;
+    let mut files_only = false;
+    let mut extended = false;
+    let mut pattern: Option<String> = None;
+    let mut globs: Vec<String> = Vec::new();
+    let mut positionals: Vec<String> = Vec::new();
+    let mut positional_only = false;
+
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        let arg = tok.value.as_str();
+        if positional_only {
+            if tok.has_expansion {
+                return None;
+            }
+            positionals.push(tok.value.clone());
+            i += 1;
+            continue;
+        }
+        match arg {
+            "--" => positional_only = true,
+            "-i" | "--ignore-case" => ignore_case = true,
+            "-F" | "--fixed-strings" => fixed_strings = true,
+            "-w" | "--word-regexp" => word_regexp = true,
+            "-l" | "--files-with-matches" => files_only = true,
+            "-E" | "--extended-regexp" => extended = true,
+            // Output-shape flags `search` already matches: it prints
+            // grouped, line-numbered matches, one per line.
+            "-n" | "--line-number" | "-H" | "--with-filename" | "-h" | "--no-filename"
+            | "-r" | "-R" | "--recursive" | "-s" | "--no-messages" => {}
+            "-e" | "--regexp" => {
+                if pattern.is_some() {
+                    return None;
+                }
+                let val = tokens.get(i + 1)?;
+                if val.value.is_empty() || val.has_expansion {
+                    return None;
+                }
+                pattern = Some(val.value.clone());
+                i += 1;
+            }
+            _ if arg.starts_with("--regexp=") => {
+                if pattern.is_some() {
+                    return None;
+                }
+                let v = &arg["--regexp=".len()..];
+                if v.is_empty() || tok.has_expansion {
+                    return None;
+                }
+                pattern = Some(v.to_owned());
+            }
+            _ if arg.starts_with("--include=") => {
+                let v = &arg["--include=".len()..];
+                if v.is_empty() || tok.has_expansion {
+                    return None;
+                }
+                globs.push(v.to_owned());
+            }
+            "--include" => {
+                let val = tokens.get(i + 1)?;
+                if val.value.is_empty() || val.has_expansion {
+                    return None;
+                }
+                globs.push(val.value.clone());
+                i += 1;
+            }
+            _ if arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg.len() > 1
+                && arg[1..]
+                    .chars()
+                    .all(|c| matches!(c, 'i' | 'F' | 'w' | 'l' | 'E' | 'n' | 'H' | 'h' | 'r' | 'R' | 's')) =>
+            {
+                for c in arg[1..].chars() {
+                    match c {
+                        'i' => ignore_case = true,
+                        'F' => fixed_strings = true,
+                        'w' => word_regexp = true,
+                        'l' => files_only = true,
+                        'E' => extended = true,
+                        _ => {}
+                    }
+                }
+            }
+            _ if arg.starts_with('-') => return None,
+            _ => {
+                if tok.has_expansion {
+                    return None;
+                }
+                positionals.push(tok.value.clone());
+            }
+        }
+        i += 1;
+    }
+    let _ = extended; // `search` patterns are regexes, like `grep -E`.
+
+    let pattern = match pattern {
+        Some(p) => p,
+        None => {
+            if positionals.is_empty() {
+                return None;
+            }
+            positionals.remove(0)
+        }
+    };
+    // `grep` needs at least one explicit path here: with none it reads
+    // stdin or the working tree implicitly, which `search` does not
+    // reproduce faithfully enough to rewrite blind.
+    if positionals.is_empty() {
+        return None;
+    }
+
+    let mut parts = vec![kit_bin.to_owned(), "search".to_owned()];
+    if ignore_case {
+        parts.push("-i".to_owned());
+    }
+    if fixed_strings {
+        parts.push("-F".to_owned());
+    }
+    if word_regexp {
+        parts.push("-w".to_owned());
+    }
+    if files_only {
+        parts.push("--files-only".to_owned());
+    }
+    for g in globs {
+        parts.push("--glob".to_owned());
+        parts.push(try_shell_quote(&g)?);
+    }
+    parts.push("--symbols".to_owned());
+    parts.push("--".to_owned());
+    parts.push(try_shell_quote(&pattern)?);
+    for pos in positionals {
+        parts.push(try_shell_quote(&pos)?);
+    }
+    Some(parts.join(" "))
+}
+
 /// Literal-prefix predicate for the measured RTK 1.2.0 piped replies: the
 /// claimed form must end at a literal ASCII space — a tab or extra spacing
 /// right after the command does not count.
@@ -1058,6 +1347,11 @@ pub fn rewrite_command_str(
                 Some(format!("{kit_bin} slice {}", try_shell_quote(&spec)?))
             }
             "git" if !rtk_active => rewrite_git(&tokens, kit_bin, cd_prefix, event_cwd),
+            // With `rtk` active, only the forms its history leaves raw are
+            // taken (#75): `git show`, the file dumps, and `grep`.
+            "git" => rewrite_git_show_only(&tokens, kit_bin, cd_prefix, event_cwd),
+            "head" | "tail" | "cat" | "nl" => rewrite_file_dump(&cmd0, &tokens, kit_bin),
+            "grep" => rewrite_grep(&tokens, kit_bin),
             "rg" if !rtk_active => rewrite_rg(&tokens, kit_bin),
             _ => runner_mode(&cmd0, arg1, arg2, rtk_active, None)
                 .map(|mode| format!("{kit_bin} compact --mode {mode} -- {rest}")),
@@ -1209,6 +1503,123 @@ mod tests {
     }
 
     #[test]
+    fn rtk_gap_rewrites_run_with_or_without_rtk() {
+        // #75: the forms `rtk` leaves raw are rewritten in both states.
+        let q = |s: &str| try_shell_quote(s).unwrap();
+        for rtk in [false, true] {
+            assert_eq!(
+                Some(format!("{KIT} slice {}", q("src/a.py:1-20"))),
+                rewrite_command_str("head -n 20 src/a.py", KIT, rtk, None),
+                "rtk={rtk}"
+            );
+            assert_eq!(
+                Some(format!("{KIT} slice {}", q("src/a.py:1-5"))),
+                rewrite_command_str("head -5 src/a.py", KIT, rtk, None),
+                "rtk={rtk}"
+            );
+            assert_eq!(
+                Some(format!("{KIT} slice {}", q("src/a.py:1-10"))),
+                rewrite_command_str("head src/a.py", KIT, rtk, None),
+                "rtk={rtk}"
+            );
+            assert_eq!(
+                Some(format!("{KIT} slice {}", q("src/a.py:-20"))),
+                rewrite_command_str("tail -n 20 src/a.py", KIT, rtk, None),
+                "rtk={rtk}"
+            );
+            assert_eq!(
+                Some(format!("{KIT} slice {}", q("src/a.py:50-"))),
+                rewrite_command_str("tail -n +50 src/a.py", KIT, rtk, None),
+                "rtk={rtk}"
+            );
+            assert_eq!(
+                Some(format!("{KIT} slice {}", q("src/a.py:1-"))),
+                rewrite_command_str("cat src/a.py", KIT, rtk, None),
+                "rtk={rtk}"
+            );
+            assert_eq!(
+                Some(format!("{KIT} slice {}", q("src/a.py:1-"))),
+                rewrite_command_str("nl src/a.py", KIT, rtk, None),
+                "rtk={rtk}"
+            );
+            assert_eq!(
+                Some(format!(
+                    "{KIT} search -i -F --symbols -- {} {}",
+                    q("needle"),
+                    q("src/")
+                )),
+                rewrite_command_str("grep -i -F needle src/", KIT, rtk, None),
+                "rtk={rtk}"
+            );
+            assert_eq!(
+                Some(format!(
+                    "{KIT} search --symbols -- {} {} {}",
+                    q("needle"),
+                    q("src/a.py"),
+                    q("src/b.py")
+                )),
+                rewrite_command_str("grep -rn needle src/a.py src/b.py", KIT, rtk, None),
+                "rtk={rtk}"
+            );
+            assert_eq!(
+                Some(format!("{KIT} diff --commit {}", q("HEAD~1"))),
+                rewrite_command_str("git show HEAD~1", KIT, rtk, None),
+                "rtk={rtk}"
+            );
+            assert_eq!(
+                Some(format!("{KIT} diff --commit {} --stat", q("HEAD~1"))),
+                rewrite_command_str("git show --stat HEAD~1", KIT, rtk, None),
+                "rtk={rtk}"
+            );
+            // A `cd` prefix is preserved, as with the other rewrites.
+            assert_eq!(
+                Some(format!(
+                    "cd '/my repo' && {KIT} slice {}",
+                    q("src/a.py:1-")
+                )),
+                rewrite_command_str("cd '/my repo' && cat src/a.py", KIT, rtk, None),
+                "rtk={rtk}"
+            );
+        }
+    }
+
+    #[test]
+    fn rtk_gap_rewrites_leave_unsupported_forms_untouched() {
+        for rtk in [false, true] {
+            for cmd in [
+                // Several paths, unsupported flags, stdin, expansions.
+                "head -n 5 src/a.py src/b.py",
+                "head -c 100 src/a.py",
+                "head -n 0 src/a.py",
+                "tail -f src/a.py",
+                "tail -n 5 -",
+                "cat src/a.py src/b.py",
+                "cat -e src/a.py",
+                "cat $FILE",
+                "cat *.py",
+                "nl -b a src/a.py",
+                "grep -v needle src/",
+                "grep -c needle src/",
+                "grep -A 3 needle src/",
+                "grep needle",
+                "grep $PAT src/",
+                // Secret paths: the guard check inside the rewriter
+                // refuses these before any rewrite is produced.
+                "cat .env",
+                "head -n 5 .env.local",
+                "grep needle .env",
+                "git show HEAD:.env",
+            ] {
+                assert_eq!(
+                    None,
+                    rewrite_command_str(cmd, KIT, rtk, None),
+                    "rtk={rtk} cmd={cmd}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn standalone_rewrites_defer_when_rtk_is_active() {
         for cmd in [
             "dotnet build App.csproj",
@@ -1218,7 +1629,6 @@ mod tests {
             "pytest tests/",
             "git status -sb",
             "git diff --staged --stat",
-            "git show HEAD~1",
             "rg -i foo src/",
         ] {
             assert_eq!(None, rewrite_command_str(cmd, KIT, true, None), "rtk=true cmd={cmd}");

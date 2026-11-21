@@ -13,6 +13,10 @@ const MAX_LINE_CHARS: usize = 2000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SliceTarget {
     Ranges(Vec<(usize, usize)>),
+    /// The last `n` lines of the file (`<path>:-<n>`), resolved once the
+    /// file's length is known. Used by the hook's `tail -n` rewrite, which
+    /// cannot know the length when it rewrites the command.
+    Tail(usize),
     Selector(String),
 }
 
@@ -100,6 +104,12 @@ pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
         // `<path>::<start>-<end>`, so accept that form alongside
         // `<path>:<start>-<end>` instead of failing the symbol lookup.
         let sel = sel.trim();
+        if let Some(n) = parse_tail_count(sel) {
+            return Ok(SliceSpec {
+                path: PathBuf::from(path_part),
+                target: SliceTarget::Tail(n),
+            });
+        }
         if looks_like_range_list(sel) {
             let ranges = parse_ranges(sel, raw)?;
             return Ok(SliceSpec {
@@ -115,6 +125,14 @@ pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
 
     if let Some((path_part, range_part)) = trimmed.rsplit_once(':') {
         let is_drive_prefix = path_part.len() == 1 && range_part.starts_with(['\\', '/']);
+        if !path_part.is_empty() && !is_drive_prefix {
+            if let Some(n) = parse_tail_count(range_part) {
+                return Ok(SliceSpec {
+                    path: PathBuf::from(path_part),
+                    target: SliceTarget::Tail(n),
+                });
+            }
+        }
         if !path_part.is_empty() && !is_drive_prefix && looks_like_range_list(range_part) {
             let ranges = parse_ranges(range_part, raw)?;
             return Ok(SliceSpec {
@@ -135,6 +153,21 @@ fn looks_like_range_list(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || b == b'-' || b == b',')
 }
 
+/// `<path>:-<n>` (n >= 1): the last `n` lines. Returns `None` for any other
+/// shape, including `-0`, so malformed specs keep their existing errors.
+fn parse_tail_count(part: &str) -> Option<usize> {
+    let digits = part.strip_prefix('-')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: usize = digits.parse().ok()?;
+    if n >= 1 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
 fn parse_ranges(part: &str, full_spec: &str) -> Result<Vec<(usize, usize)>, String> {
     let mut out = Vec::new();
     for seg in part.split(',') {
@@ -146,9 +179,15 @@ fn parse_ranges(part: &str, full_spec: &str) -> Result<Vec<(usize, usize)>, Stri
             let start = a
                 .parse::<usize>()
                 .map_err(|_| format!("invalid start line `{a}` in `{full_spec}`"))?;
-            let end = b
-                .parse::<usize>()
-                .map_err(|_| format!("invalid end line `{b}` in `{full_spec}`"))?;
+            // An open end (`<start>-`) runs to the end of the file; the
+            // merge step clamps it to the file's actual length. This is
+            // the whole-file form the hook emits for `cat`/`nl`.
+            let end = if b.is_empty() {
+                usize::MAX
+            } else {
+                b.parse::<usize>()
+                    .map_err(|_| format!("invalid end line `{b}` in `{full_spec}`"))?
+            };
             if start == 0 || end < start {
                 return Err(format!(
                     "invalid line range `{seg}` in `{full_spec}` (start must be >= 1 and <= end)"
@@ -354,6 +393,18 @@ fn resolve_ranges_for_spec(
                 signature: None,
             })
             .collect()),
+        SliceTarget::Tail(n) => {
+            let total = idx.total_lines();
+            if total == 0 {
+                return Ok(Vec::new());
+            }
+            Ok(vec![Interval {
+                start: total.saturating_sub(*n - 1).max(1),
+                end: total,
+                label: None,
+                signature: None,
+            }])
+        }
         SliceTarget::Selector(sel) => {
             let lang = lang.ok_or_else(|| {
                 format!("{path_str}: unsupported file type for symbol/path selector (pass --lang or line ranges)")
@@ -753,6 +804,39 @@ mod tests {
 
         assert!(parse_spec("foo.rs::20-10").is_err());
         assert!(parse_spec("foo.rs::0").is_err());
+    }
+
+    #[test]
+    fn parse_and_execute_open_ended_and_tail_specs() {
+        // `<path>:<start>-` runs to the end of the file (the hook's
+        // `cat`/`nl` form); `<path>:-<n>` is the last n lines (its
+        // `tail -n` form), in both the `:` and `::` spellings.
+        let open = parse_spec("src/a.rs:1-").unwrap();
+        assert_eq!(open.target, SliceTarget::Ranges(vec![(1, usize::MAX)]));
+        let tail = parse_spec("src/a.rs:-3").unwrap();
+        assert_eq!(tail.target, SliceTarget::Tail(3));
+        let tail2 = parse_spec("src/a.rs::-3").unwrap();
+        assert_eq!(tail2.target, SliceTarget::Tail(3));
+        assert!(parse_spec("src/a.rs:-0").is_err() || parse_spec("src/a.rs:-0").unwrap().target != SliceTarget::Tail(0));
+
+        let p = temp_file("sample.txt", b"l1\nl2\nl3\nl4\nl5\n");
+        let whole = parse_spec(&format!("{}:1-", p.display())).unwrap();
+        let res = execute_slices(&[whole], &SliceOptions::default()).unwrap();
+        assert_eq!(res.slices[0].start_line, 1);
+        assert_eq!(res.slices[0].end_line, 5);
+
+        let last = parse_spec(&format!("{}:-2", p.display())).unwrap();
+        let res = execute_slices(&[last], &SliceOptions::default()).unwrap();
+        assert_eq!(res.slices[0].start_line, 4);
+        assert_eq!(res.slices[0].end_line, 5);
+        assert_eq!(res.slices[0].lines[0].text, "l4");
+
+        // A tail larger than the file clamps to the whole file.
+        let big = parse_spec(&format!("{}:-99", p.display())).unwrap();
+        let res = execute_slices(&[big], &SliceOptions::default()).unwrap();
+        assert_eq!(res.slices[0].start_line, 1);
+        assert_eq!(res.slices[0].end_line, 5);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
     #[test]
