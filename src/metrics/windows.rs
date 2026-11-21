@@ -2,10 +2,11 @@
 //!
 //! Mirrors the Unix fd-walk: `savings.jsonl` is reached only through pinned
 //! directory handles that refuse `FILE_SHARE_DELETE` and reparse points,
-//! missing fixed directories are created only for writes (the metrics
-//! directory atomically with an owner-only protected DACL), and the private
-//! directory plus file are validated through `GetSecurityInfo` against the
-//! process token's user SID. Unsafe objects are refused, never repaired.
+//! missing fixed directories are created only for writes (each atomically
+//! with the token user as explicit owner and an owner-only protected DACL),
+//! and the private directory plus file are validated through `GetSecurityInfo`
+//! against the process token's user SID. Unsafe objects are refused, never
+//! repaired.
 
 use std::fs::File;
 use std::os::windows::ffi::OsStrExt;
@@ -232,25 +233,18 @@ fn open_dir(path: &Path) -> Option<WinHandle> {
     )
 }
 
-/// Create a fixed directory; `private` supplies an owner-only protected DACL
-/// with the token user as explicit owner. `false` covers both "already
-/// exists" and refused creation — callers reopen and validate either way.
-fn create_dir(path: &Path, private: bool, owner: PSID) -> bool {
+/// Create a fixed directory with the token user as explicit owner and a
+/// protected owner-only DACL, so a directory made under a parent without
+/// inheritable ACEs still validates. `false` covers both "already exists"
+/// and refused creation — callers reopen and validate either way.
+fn create_dir(path: &Path, owner: PSID) -> bool {
     let wide = wide_path(path);
-    let (created, err) = if private {
-        let Some(desc) = PrivateDescriptor::new(owner) else {
-            return false;
-        };
-        let sa = desc.attributes();
-        let created = unsafe { CreateDirectoryW(wide.as_ptr(), &sa) };
-        let err = unsafe { GetLastError() };
-        (created, err)
-    } else {
-        let created = unsafe { CreateDirectoryW(wide.as_ptr(), null()) };
-        let err = unsafe { GetLastError() };
-        (created, err)
+    let Some(desc) = PrivateDescriptor::new(owner) else {
+        return false;
     };
-    created != 0 || err == ERROR_ALREADY_EXISTS
+    let sa = desc.attributes();
+    let created = unsafe { CreateDirectoryW(wide.as_ptr(), &sa) };
+    created != 0 || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS
 }
 
 /// Owner SID must equal the token user; with `strict_dacl` the DACL must be
@@ -346,7 +340,7 @@ fn pinned_dir(path: &Path, write: bool, private: bool, owner: PSID) -> Option<Wi
     let handle = match open_dir(path) {
         Some(h) => h,
         None if write => {
-            let _ = create_dir(path, private, owner);
+            let _ = create_dir(path, owner);
             open_dir(path)?
         }
         None => return None,

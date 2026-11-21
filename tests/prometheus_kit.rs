@@ -563,6 +563,30 @@ impl MetricsHome {
         let runtime = root.0.join("runtime");
         let repo = root.0.join("repo");
         fs::create_dir_all(&home).unwrap();
+        // Elevated Windows runners create objects owned by the Administrators
+        // group rather than the token user, which the private-route owner
+        // check refuses. Re-own only this disposable fixture home.
+        #[cfg(windows)]
+        {
+            let out = Command::new("whoami")
+                .args(["/user", "/fo", "csv", "/nh"])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let text = String::from_utf8_lossy(&out.stdout);
+            let sid = text.trim().rsplit(',').next().unwrap().trim_matches('"');
+            assert!(sid.starts_with("S-1-"));
+            let out = Command::new("icacls")
+                .arg(&home)
+                .arg("/setowner")
+                .arg(format!("*{sid}"))
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "icacls /setowner on temporary HOME: {out:?}"
+            );
+        }
         fs::create_dir_all(&runtime).unwrap();
         fs::create_dir_all(&repo).unwrap();
         Self {
@@ -629,9 +653,25 @@ impl MetricsHome {
     }
 
     fn rows(&self) -> Vec<Value> {
-        fs::read_to_string(self.metrics_file())
-            .unwrap()
-            .lines()
+        let file = self.metrics_file();
+        let text = fs::read_to_string(&file).unwrap_or_else(|err| {
+            let probe = |p: &Path| {
+                if p.exists() {
+                    "exists"
+                } else {
+                    "missing"
+                }
+            };
+            panic!(
+                "metrics store unreadable at {}: {err}; .agents={}, .agents/prometheus={}, metrics={}, file={}",
+                file.display(),
+                probe(&self.home.join(".agents")),
+                probe(&self.home.join(".agents").join("prometheus")),
+                probe(&self.home.join(".agents").join("prometheus").join("metrics")),
+                probe(&file),
+            )
+        });
+        text.lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     }
@@ -925,17 +965,24 @@ fn metrics_records_each_clipped_output_command() {
 
     // compact -- <cmd>: raw_bytes is child stdout + stderr byte totals before
     // lossy conversion. Unix uses sh printf emitting one non-UTF8 byte each
-    // way (raw = 4); Windows uses cmd builtins with CRLF (raw = 6).
+    // way (raw = 4); Windows cmd echo whitespace is platform-dependent, so
+    // the expected total is measured by running the same argv once.
     #[cfg(unix)]
-    let (cmd_argv, expected_cmd_raw): (&[&str], u64) = (
-        &["sh", "-c", "printf 'O\\377'; printf 'E\\376' >&2"],
-        4,
-    );
+    let cmd_argv: &[&str] = &["sh", "-c", "printf 'O\\377'; printf 'E\\376' >&2"];
     #[cfg(windows)]
-    let (cmd_argv, expected_cmd_raw): (&[&str], u64) = (
-        &["cmd", "/D", "/C", "echo O&echo E 1>&2"],
-        6,
-    );
+    let cmd_argv: &[&str] = &["cmd", "/D", "/C", "echo O&1>&2 echo E"];
+    #[cfg(unix)]
+    let expected_cmd_raw = 4u64;
+    #[cfg(windows)]
+    let expected_cmd_raw = {
+        let probe = Command::new(cmd_argv[0])
+            .args(&cmd_argv[1..])
+            .output()
+            .unwrap();
+        assert!(probe.status.success());
+        assert!(!probe.stdout.is_empty() && !probe.stderr.is_empty());
+        (probe.stdout.len() + probe.stderr.len()) as u64
+    };
     let mut argv: Vec<&str> = vec!["compact", "--no-spillover", "--"];
     argv.extend_from_slice(cmd_argv);
     let compact_cmd = home.command(&argv).output().unwrap();
