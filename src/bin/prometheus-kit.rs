@@ -12,14 +12,15 @@
 //!   metrics     Print local hook-rule totals by host and rule (maintainer aid).
 
 use prometheus_core::compact::{
-    compact_command, compact_text, render_compact_json, render_compact_text, CompactMode,
-    CompactOptions,
+    capture_command_log, compact_command, compact_text, render_compact_json, render_compact_text,
+    CompactMode, CompactOptions,
 };
 use prometheus_core::diff::{
     execute_diff, render_diff_json, render_diff_text, DiffMode, DiffOptions, DiffOutput,
 };
 use prometheus_core::droid_mode::{apply_mode, default_home, resolve_config_path};
 use prometheus_core::hook::{is_supported_host, panic_fallback, run_hook};
+use prometheus_core::kit_util::write_private_spillover;
 use prometheus_core::map::{execute_map, render_map_json, render_map_text, MapOptions};
 use prometheus_core::metrics::{self, Rule};
 use prometheus_core::outline::{
@@ -101,6 +102,10 @@ options:
   --tail <n>          Tail lines when showing generic/failure context (default: 25)
   --save-log <path>   Always save raw output to <path>
   --no-spillover      Do not write automatic temp spillover logs
+  --keep-log          With `-- <command...>`: keep full raw output in a private
+                      temp log and print a `log:` pointer (conflicts with
+                      --save-log, --no-spillover, --json); a tiny --max-tokens
+                      budget prints the pointer only
   --json              Emit compact JSON
   -h, --help          Show help";
 
@@ -413,6 +418,7 @@ fn run_slice(raw: &[String]) -> i32 {
 fn run_compact(raw: &[String]) -> i32 {
     let mut opts = CompactOptions::default();
     let mut json_mode = false;
+    let mut keep_log = false;
     let mut command: Vec<String> = Vec::new();
     let mut file_path: Option<PathBuf> = None;
     let mut i = 0usize;
@@ -455,6 +461,7 @@ fn run_compact(raw: &[String]) -> i32 {
                 Err(code) => return code,
             },
             "--no-spillover" => opts.allow_spillover = false,
+            "--keep-log" => keep_log = true,
             "--json" => json_mode = true,
             _ if arg.starts_with('-') && arg != "-" => {
                 eprintln!("prometheus-kit compact: unknown option `{arg}`\n{COMPACT_USAGE}");
@@ -476,6 +483,16 @@ fn run_compact(raw: &[String]) -> i32 {
     if !command.is_empty() && file_path.is_some() {
         eprintln!("prometheus-kit compact: pass either `[path]` or `-- <command...>`, not both");
         return 2;
+    }
+
+    if keep_log {
+        if command.is_empty() || opts.save_log.is_some() || !opts.allow_spillover || json_mode {
+            eprintln!(
+                "prometheus-kit compact: --keep-log requires `-- <command...>` and conflicts with --save-log, --no-spillover, --json\n{COMPACT_USAGE}"
+            );
+            return 2;
+        }
+        return run_kept_command(&command, opts);
     }
 
     let (result, exit_code) = if !command.is_empty() {
@@ -519,6 +536,76 @@ fn run_compact(raw: &[String]) -> i32 {
     // Every compaction counts as a reduction, including render overhead.
     emit_measured(Rule::Compact, result.raw_bytes, true, &rendered);
     exit_code
+}
+
+/// `compact --keep-log -- <cmd>`: capture the command's merged output once,
+/// persist the raw bytes in an owner-private temp log, and print the compact
+/// summary led by an always-recoverable `log:` pointer. When the private log
+/// cannot be written — or the capture broke mid-stream — the raw bytes go to
+/// stdout byte-for-byte with a diagnostic where needed: no added newline, no
+/// JSON, no normalization, no compaction row, and the command's own status.
+fn run_kept_command(command: &[String], mut opts: CompactOptions) -> i32 {
+    let (raw, code, read_error) = match capture_command_log(command) {
+        Ok(captured) => captured,
+        Err(err) => {
+            let cmd0 = command.first().map(String::as_str).unwrap_or("command");
+            eprintln!("prometheus-kit compact: {cmd0}: {err}");
+            return spawn_exit_code(&err);
+        }
+    };
+    if let Some(err) = read_error {
+        // The pipe broke mid-capture: the bytes and status are real but the
+        // log would be incomplete, so nothing is persisted or compacted.
+        eprintln!("prometheus-kit compact: incomplete capture: {err}");
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(&raw);
+        let _ = out.flush();
+        return code;
+    }
+    let Some(log_path) = write_private_spillover(&raw) else {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(&raw);
+        let _ = out.flush();
+        return code;
+    };
+    // The raw log already exists; compact_text must not spill a second copy.
+    opts.allow_spillover = false;
+    // Lead with the pointer so budget clipping can never remove it, and
+    // reserve its share of the token budget for the summary that follows. A
+    // tiny positive budget keeps the pointer and drops the summary entirely;
+    // zero stays unlimited.
+    let log_line = format!("log: {}\n", log_path.display());
+    let reserved = log_line.len().div_ceil(4);
+    if opts.max_tokens != 0 && opts.max_tokens <= reserved {
+        emit_measured(Rule::Compact, raw.len(), true, &log_line);
+        return code;
+    }
+    opts.max_tokens = opts.max_tokens.saturating_sub(reserved);
+    let text = String::from_utf8_lossy(&raw);
+    let mut result = compact_text(&text, Some(code), &opts);
+    result.raw_bytes = raw.len();
+    let summary = render_compact_text(&result, opts.max_tokens);
+    let rendered = format!("{log_line}{summary}");
+    emit_measured(Rule::Compact, raw.len(), true, &rendered);
+    code
+}
+
+/// Shell-style status for a command that never started: 127 when the
+/// executable is missing, 126 when it cannot be executed — Unix only; other
+/// platforms report a plain failure.
+fn spawn_exit_code(err: &std::io::Error) -> i32 {
+    #[cfg(unix)]
+    let code = match err.kind() {
+        std::io::ErrorKind::NotFound => 127,
+        std::io::ErrorKind::PermissionDenied => 126,
+        _ => 1,
+    };
+    #[cfg(not(unix))]
+    let code = {
+        let _ = err;
+        1
+    };
+    code
 }
 
 fn run_search(raw: &[String]) -> i32 {

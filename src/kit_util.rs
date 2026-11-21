@@ -268,6 +268,87 @@ pub fn write_spillover_log(explicit: Option<&Path>, prefix: &str, raw: &str) -> 
     if ensure_private_dir(&dir).is_err() {
         return None;
     }
+    claim_temp_log(&dir, prefix, raw.as_bytes(), false)
+}
+
+/// Temp-only private spillover for `compact --keep-log`: the raw captured
+/// bytes are stored unnormalized under `<slot>/kit-logs` with a fixed
+/// `compact-*` name. The route is refused — returning None so the caller
+/// emits the raw stream instead — whenever the slot sits inside the working
+/// tree or any git worktree, an ancestor is insecure, a `.git` marker
+/// appears in the route, or the private directory route, a printable path,
+/// or an exclusive private file cannot be established.
+pub fn write_private_spillover(raw: &[u8]) -> Option<PathBuf> {
+    let slot = host_slot_dir();
+    if !slot.is_absolute() {
+        return None;
+    }
+    // `.git` as a route component is refused outright.
+    if slot.components().any(|c| c.as_os_str() == ".git") {
+        return None;
+    }
+    // Canonicalize the slot's parent so symlinked runtime dirs cannot smuggle
+    // the route into the worktree; the slot's own name is kept verbatim and
+    // revalidated by `ensure_private_dir`/the Windows pins below.
+    let parent = slot.parent()?.canonicalize().ok()?;
+    let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+    // A runtime dir inside the working tree — or anywhere under a git
+    // worktree — would leak command output into source control. Any
+    // `.git` entry (directory or gitfile) on an ancestor refuses the route.
+    if parent.starts_with(&cwd)
+        || parent.ancestors().any(|p| match std::fs::symlink_metadata(p.join(".git")) {
+            Ok(_) => true,
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        })
+    {
+        return None;
+    }
+    #[cfg(unix)]
+    if !ancestors_allow_private_logs(&parent) {
+        return None;
+    }
+    let base = parent.join(slot.file_name()?);
+    let dir = base.join("kit-logs");
+    // An existing `.git` inside the slot or log dir — file or directory —
+    // refuses the route before anything is created.
+    for target in [&base, &dir] {
+        match std::fs::symlink_metadata(target.join(".git")) {
+            Ok(_) => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    // The `log:` pointer must be printable; control characters or a non-UTF8
+    // path fall back to raw output rather than advertising an unreachable log.
+    let dir_text = dir.to_str()?;
+    if dir_text.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        ensure_private_dir(&base).ok()?;
+        ensure_private_dir(&dir).ok()?;
+        claim_named_log(&dir, "compact", raw, |path| open_log_new(path, true))
+    }
+    #[cfg(windows)]
+    {
+        crate::metrics::windows::write_private_log(&base, raw)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// Unique create-new claim inside `dir` using the shared
+/// `{prefix}-{millis}-{pid}-{attempt}.log` naming; `open` supplies the
+/// platform-private create for each candidate.
+pub(crate) fn claim_named_log(
+    dir: &Path,
+    prefix: &str,
+    raw: &[u8],
+    open: impl Fn(&Path) -> Option<std::fs::File>,
+) -> Option<PathBuf> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -275,22 +356,76 @@ pub fn write_spillover_log(explicit: Option<&Path>, prefix: &str, raw: &str) -> 
     let pid = std::process::id();
     for attempt in 0u32..16 {
         let candidate = dir.join(format!("{prefix}-{stamp}-{pid}-{attempt}.log"));
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+        let Some(mut file) = open(&candidate) else {
+            continue;
+        };
+        if file.write_all(raw).is_ok() {
+            return Some(candidate);
         }
-        if let Ok(mut file) = opts.open(&candidate) {
-            if file.write_all(raw.as_bytes()).is_ok() {
-                return Some(candidate);
-            }
-            let _ = std::fs::remove_file(&candidate);
-            return None;
-        }
+        let _ = std::fs::remove_file(&candidate);
+        return None;
     }
     None
+}
+
+fn claim_temp_log(dir: &Path, prefix: &str, raw: &[u8], private: bool) -> Option<PathBuf> {
+    claim_named_log(dir, prefix, raw, |path| open_log_new(path, private))
+}
+
+/// Canonical-parent ancestors must be real directories owned by root or this
+/// user, and never group/world-writable without the sticky bit — the same
+/// posture `ensure_private_dir` demands of the directories it creates.
+#[cfg(unix)]
+fn ancestors_allow_private_logs(parent: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    parent.ancestors().all(|dir| {
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return false;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return false;
+        }
+        if meta.uid() != 0 && meta.uid() != unsafe { libc::getuid() } {
+            return false;
+        }
+        meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0
+    })
+}
+
+/// Open `path` with create-new semantics for a log file. `private` adds
+/// O_NOFOLLOW on Unix; the Windows kept-log route creates through the strict
+/// private descriptor in `metrics::windows` instead, so this open always
+/// matches the legacy spillover writer there.
+#[cfg(unix)]
+fn open_log_new(path: &Path, private: bool) -> Option<std::fs::File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+        if private {
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+    }
+    opts.open(path).ok()
+}
+
+#[cfg(windows)]
+fn open_log_new(path: &Path, _private: bool) -> Option<std::fs::File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_log_new(path: &Path, _private: bool) -> Option<std::fs::File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .ok()
 }
 
 #[cfg(test)]

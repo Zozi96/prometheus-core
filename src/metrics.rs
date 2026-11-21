@@ -272,7 +272,7 @@ fn open_metrics_file(dir: &File, write: bool) -> Option<File> {
 }
 
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 
 #[cfg(windows)]
 fn open_metrics(write: bool) -> Option<File> {

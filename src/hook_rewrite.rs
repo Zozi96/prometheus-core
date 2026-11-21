@@ -199,6 +199,135 @@ pub fn try_shell_quote(arg: &str) -> Option<String> {
     }
 }
 
+/// True when the truncated-runner prefix holds shell syntax the compact
+/// rewrite cannot faithfully re-emit: an unquoted comment-start `#`, an
+/// unquoted escape gluing words across a boundary (`\ `, `\<tab>`), unquoted
+/// subshell parentheses, or the `$"…"` locale form. Mid-word `#`, quoted
+/// occurrences, and other literal text stay allowed.
+fn unsupported_truncated_syntax(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_single {
+            if c == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'\\' => {
+                if i + 1 < b.len() && matches!(b[i + 1], b' ' | b'\t') {
+                    return true;
+                }
+                i += 1;
+            }
+            b'#' => {
+                let word_start = i == 0 || matches!(b[i - 1], b' ' | b'\t' | b'(' | b')');
+                if word_start {
+                    return true;
+                }
+            }
+            b'(' | b')' => return true,
+            b'$' if b.get(i + 1) == Some(&b'"') => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The tail after a terminal `|` must be exactly `head` or `tail` followed by
+/// nothing, `-N`, or `-n N` (N ascii decimal digits) — space/tab separators
+/// only. Anything else (other filters, flags, redirects, extra words,
+/// attached `-nN`, signed counts) is not a plain truncation.
+fn valid_trunc_tail(tail: &str) -> bool {
+    let t = tail.trim_matches([' ', '\t']);
+    for verb in ["head", "tail"] {
+        let Some(rest) = t.strip_prefix(verb) else {
+            continue;
+        };
+        if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+            return false;
+        }
+        let rest = rest.trim_matches([' ', '\t']);
+        if rest.is_empty() {
+            return true;
+        }
+        if let Some(digits) = rest.strip_prefix('-') {
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                return true;
+            }
+        }
+        if let Some(after_n) = rest.strip_prefix("-n") {
+            if !after_n.starts_with([' ', '\t']) {
+                return false;
+            }
+            let digits = after_n.trim_start_matches([' ', '\t']);
+            return !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+        }
+        return false;
+    }
+    false
+}
+
+/// Terminal `| head`/`| tail [-n] N` truncation pipe: return the verbatim
+/// runner prefix (cd prefix included, quotes and flags untouched) when the
+/// tail is a plain bounded truncation. Anything ambiguous — nested or
+/// additional pipes, comments, redirects, non-shell whitespace, unbalanced
+/// quoting — returns None and the command passes through untouched.
+fn truncated_runner(command: &str) -> Option<&str> {
+    // Only space/tab may separate shell words; CR/LF/NUL and other Unicode
+    // whitespace never appear in a safe one-line command.
+    if command.contains('\0')
+        || command
+            .chars()
+            .any(|c| c.is_whitespace() && c != ' ' && c != '\t')
+    {
+        return None;
+    }
+    let (prefix, tail) = command.rsplit_once('|')?;
+    if !valid_trunc_tail(tail) {
+        return None;
+    }
+    let mut runner = prefix.trim_end_matches([' ', '\t']);
+    // One pass refuses comment starts, boundary-glued escapes, subshell
+    // parens, and the `$"…"` locale form before the redirect is stripped —
+    // a `#` at a word boundary would have commented out the pipe itself.
+    if unsupported_truncated_syntax(runner) {
+        return None;
+    }
+    // Optional literal ` 2>&1` (stderr folded into stdout, which compact
+    // captures anyway): strip only at a word boundary.
+    if let Some(head) = runner.strip_suffix("2>&1") {
+        if head.ends_with([' ', '\t']) {
+            runner = head.trim_end_matches([' ', '\t']);
+        }
+    }
+    // A trailing escape would bind to whatever follows; quote balance and
+    // metacharacters are enforced by the strict scan/split in the caller.
+    if runner.ends_with('\\') {
+        return None;
+    }
+    Some(runner)
+}
+
 /// Scan the command for dangerous shell metacharacters and extract at most one
 /// unquoted `&&` separator (for a leading `cd <dir> && <rest>` prefix).
 fn scan_and_split_cd_prefix(command: &str) -> Option<(Option<&str>, &str)> {
@@ -782,6 +911,100 @@ fn rewrite_rg(tokens: &[ShellToken], kit_bin: &str) -> Option<String> {
     Some(parts.join(" "))
 }
 
+/// Literal-prefix predicate for the measured RTK 1.2.0 piped replies: the
+/// claimed form must end at a literal ASCII space — a tab or extra spacing
+/// right after the command does not count.
+fn word_prefix(s: &str, prefix: &str) -> bool {
+    s.strip_prefix(prefix)
+        .is_some_and(|tail| tail.is_empty() || tail.starts_with(' '))
+}
+
+/// Whether the raw piped runner `rest` (truncation and cd prefix already
+/// stripped) spells a form RTK 1.2.0 claims: literal `pytest` or
+/// `python[3] -m pytest` prefixes matched with single spaces, or a
+/// cargo/dotnet/go/mvn command followed by a space and an eligible
+/// subcommand — extra whitespace or tabs after that first separator still
+/// match, per the measured replies. Everything else keeps the kit log.
+fn rtk_claims_piped(rest: &str, cmd: &str, arg1: Option<&str>, arg2: Option<&str>) -> bool {
+    if word_prefix(rest, "pytest")
+        || word_prefix(rest, "python -m pytest")
+        || word_prefix(rest, "python3 -m pytest")
+    {
+        return true;
+    }
+    if !matches!(cmd, "cargo" | "dotnet" | "go" | "mvn") {
+        return false;
+    }
+    if !matches!(
+        (cmd, arg1, arg2),
+        ("cargo", Some("build" | "check" | "clippy" | "test"), _)
+            | ("dotnet", Some("restore" | "build"), _)
+            | ("go", Some("build" | "test"), _)
+            | ("mvn", Some("test"), _)
+    ) {
+        return false;
+    }
+    rest.strip_prefix(cmd)
+        .and_then(|s| s.strip_prefix(' '))
+        .is_some_and(|s| {
+            s.trim_start_matches([' ', '\t'])
+                .strip_prefix(arg1.unwrap_or(""))
+                .is_some_and(|tail| tail.is_empty() || tail.starts_with([' ', '\t']))
+        })
+}
+
+/// Runner command → compact mode (`"build"`/`"test"`), or None when the
+/// command is not an eligible runner or RTK claims it. `piped` carries the
+/// raw runner text for truncated forms — RTK's piped claims were measured
+/// on literal spellings only, so path-qualified or quoted runners are never
+/// deferred. Plain commands keep the original always/standalone split.
+fn runner_mode(
+    cmd: &str,
+    arg1: Option<&str>,
+    arg2: Option<&str>,
+    rtk_active: bool,
+    piped: Option<&str>,
+) -> Option<&'static str> {
+    // Empirical split (rtk 1.2.0 probes): piped `dotnet restore|build`,
+    // `cargo build|check|clippy|test`, `go build|test`, `mvn test`, `pytest`,
+    // and `python[3] -m pytest` are claimed by RTK; tsc/jest/vitest,
+    // dotnet test/format, msbuild, unittest, npm/pnpm/yarn/bun test, and
+    // gradle/gradlew test are not, so kit keeps their logs.
+    let rtk_defers = rtk_active
+        && match piped {
+            Some(rest) => rtk_claims_piped(rest, cmd, arg1, arg2),
+            None => matches!(
+                (cmd, arg1, arg2),
+                ("dotnet", Some("build"), _)
+                    | ("cargo", Some("build" | "check" | "clippy" | "test"), _)
+                    | ("go", Some("build" | "test"), _)
+                    | ("tsc", _, _)
+                    | ("pytest" | "jest" | "vitest", _, _)
+                    | ("python" | "python3", Some("-m"), Some("pytest"))
+            ),
+        };
+    if rtk_defers {
+        return None;
+    }
+    match (cmd, arg1, arg2) {
+        ("dotnet", Some("test"), _) => Some("test"),
+        ("dotnet", Some("restore" | "format" | "build"), _) => Some("build"),
+        ("msbuild" | "msbuild.exe", _, _) => Some("build"),
+        ("python" | "python3", Some("-m"), Some("unittest")) => Some("test"),
+        ("npm", Some("test"), _) | ("npm", Some("run"), Some("test")) => Some("test"),
+        ("pnpm" | "yarn" | "bun", Some("test"), _) => Some("test"),
+        ("mvn" | "gradle" | "gradlew", Some("test"), _) => Some("test"),
+        ("tsc", _, _) => Some("build"),
+        ("cargo", Some("build" | "check" | "clippy"), _) => Some("build"),
+        ("cargo", Some("test"), _) => Some("test"),
+        ("go", Some("build"), _) => Some("build"),
+        ("go", Some("test"), _) => Some("test"),
+        ("pytest" | "jest" | "vitest", _, _) => Some("test"),
+        ("python" | "python3", Some("-m"), Some("pytest")) => Some("test"),
+        _ => None,
+    }
+}
+
 /// Pure command rewriter parameterized by quoted binary path, RTK status, and optional cwd.
 pub fn rewrite_command_str(
     command: &str,
@@ -789,8 +1012,20 @@ pub fn rewrite_command_str(
     rtk_active: bool,
     event_cwd: Option<&Path>,
 ) -> Option<String> {
-    let (cd_prefix, rest) = scan_and_split_cd_prefix(command)?;
+    let truncated = truncated_runner(command);
+    let (cd_prefix, rest) = scan_and_split_cd_prefix(truncated.unwrap_or(command))?;
     let tokens = shell_split(rest)?;
+    // Piped truncation additionally refuses token expansions anywhere in the
+    // runner or its `cd` prefix — an expanded word could resolve to anything,
+    // so the command passes through untouched.
+    if truncated.is_some()
+        && (tokens.iter().any(|t| t.has_expansion)
+            || cd_prefix.is_some_and(|prefix| {
+                shell_split(prefix).is_none_or(|ts| ts.iter().any(|t| t.has_expansion))
+            }))
+    {
+        return None;
+    }
     let first = tokens.first()?;
     if is_excluded_wrapper(&first.value) {
         return None;
@@ -806,67 +1041,28 @@ pub fn rewrite_command_str(
     let arg1 = tokens.get(1).map(|t| t.value.as_str());
     let arg2 = tokens.get(2).map(|t| t.value.as_str());
 
-    let rewritten_tail = match cmd0.as_str() {
-        // --- Always eligible (gaps RTK does not cover) ---
-        "dotnet" if arg1 == Some("test") => {
-            Some(format!("{kit_bin} compact --mode test -- {rest}"))
-        }
-        "dotnet" if matches!(arg1, Some("restore" | "format")) => {
-            Some(format!("{kit_bin} compact --mode build -- {rest}"))
-        }
-        "msbuild" | "msbuild.exe" => Some(format!("{kit_bin} compact --mode build -- {rest}")),
-        "python" | "python3" if arg1 == Some("-m") && arg2 == Some("unittest") => {
-            Some(format!("{kit_bin} compact --mode test -- {rest}"))
-        }
-        "npm" if arg1 == Some("test") || (arg1 == Some("run") && arg2 == Some("test")) => {
-            Some(format!("{kit_bin} compact --mode test -- {rest}"))
-        }
-        "pnpm" | "yarn" | "bun" if arg1 == Some("test") => {
-            Some(format!("{kit_bin} compact --mode test -- {rest}"))
-        }
-        "mvn" | "gradle" | "gradlew" if arg1 == Some("test") => {
-            Some(format!("{kit_bin} compact --mode test -- {rest}"))
-        }
-        "sed" if tokens.len() == 4 && arg1 == Some("-n") => {
-            let (start, end) = parse_sed_range(&tokens[2].value)?;
-            if !is_safe_sed_path(&tokens[3]) {
-                return None;
+    let rewritten_tail = if truncated.is_some() {
+        // Piped truncation: runners only (no sed/git/rg fallback) — compact
+        // keeps the guaranteed raw log instead of the pipe's silent cut. The
+        // RTK deferral matches the literal spellings its replies claimed.
+        let mode = runner_mode(&cmd0, arg1, arg2, rtk_active, Some(rest))?;
+        format!("{kit_bin} compact --mode {mode} --keep-log -- {rest}")
+    } else {
+        match cmd0.as_str() {
+            "sed" if tokens.len() == 4 && arg1 == Some("-n") => {
+                let (start, end) = parse_sed_range(&tokens[2].value)?;
+                if !is_safe_sed_path(&tokens[3]) {
+                    return None;
+                }
+                let spec = format!("{}:{start}-{end}", tokens[3].value);
+                Some(format!("{kit_bin} slice {}", try_shell_quote(&spec)?))
             }
-            let spec = format!("{}:{start}-{end}", tokens[3].value);
-            Some(format!("{kit_bin} slice {}", try_shell_quote(&spec)?))
-        }
-
-        // --- Standalone-only (delegate to RTK when RTK hook is active) ---
-        "dotnet" if !rtk_active && arg1 == Some("build") => {
-            Some(format!("{kit_bin} compact --mode build -- {rest}"))
-        }
-        "cargo"
-            if !rtk_active && matches!(arg1, Some("build" | "check" | "clippy")) =>
-        {
-            Some(format!("{kit_bin} compact --mode build -- {rest}"))
-        }
-        "go" if !rtk_active && arg1 == Some("build") => {
-            Some(format!("{kit_bin} compact --mode build -- {rest}"))
-        }
-        "tsc" if !rtk_active => Some(format!("{kit_bin} compact --mode build -- {rest}")),
-        "cargo" if !rtk_active && arg1 == Some("test") => {
-            Some(format!("{kit_bin} compact --mode test -- {rest}"))
-        }
-        "go" if !rtk_active && arg1 == Some("test") => {
-            Some(format!("{kit_bin} compact --mode test -- {rest}"))
-        }
-        "pytest" | "jest" | "vitest" if !rtk_active => {
-            Some(format!("{kit_bin} compact --mode test -- {rest}"))
-        }
-        "python" | "python3"
-            if !rtk_active && arg1 == Some("-m") && arg2 == Some("pytest") =>
-        {
-            Some(format!("{kit_bin} compact --mode test -- {rest}"))
-        }
-        "git" if !rtk_active => rewrite_git(&tokens, kit_bin, cd_prefix, event_cwd),
-        "rg" if !rtk_active => rewrite_rg(&tokens, kit_bin),
-        _ => None,
-    }?;
+            "git" if !rtk_active => rewrite_git(&tokens, kit_bin, cd_prefix, event_cwd),
+            "rg" if !rtk_active => rewrite_rg(&tokens, kit_bin),
+            _ => runner_mode(&cmd0, arg1, arg2, rtk_active, None)
+                .map(|mode| format!("{kit_bin} compact --mode {mode} -- {rest}")),
+        }?
+    };
 
     if let Some(prefix) = cd_prefix {
         Some(format!("{prefix} && {rewritten_tail}"))
@@ -1286,5 +1482,401 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn truncated_runner_table_covers_groups_tails_counts_and_rtk() {
+        // Every eligible runner group -> expected compact mode.
+        let runners: &[(&str, &str)] = &[
+            ("dotnet test", "test"),
+            ("dotnet restore", "build"),
+            ("dotnet build", "build"),
+            ("dotnet format", "build"),
+            ("msbuild", "build"),
+            ("msbuild.exe", "build"),
+            ("python -m unittest", "test"),
+            ("python3 -m unittest", "test"),
+            ("python -m pytest", "test"),
+            ("python3 -m pytest", "test"),
+            ("npm test", "test"),
+            ("npm run test", "test"),
+            ("pnpm test", "test"),
+            ("yarn test", "test"),
+            ("bun test", "test"),
+            ("mvn test", "test"),
+            ("gradle test", "test"),
+            ("gradlew test", "test"),
+            ("./gradlew test", "test"),
+            ("cargo build", "build"),
+            ("cargo check", "build"),
+            ("cargo clippy", "build"),
+            ("cargo test", "test"),
+            ("go build", "build"),
+            ("go test", "test"),
+            ("tsc", "build"),
+            ("pytest", "test"),
+            ("jest", "test"),
+            ("vitest", "test"),
+        ];
+        // Groups RTK verifiably claims in piped form (rtk 1.2.0 probes) defer
+        // when rtk_active; every other runner keeps the keep-log rewrite.
+        let rtk_deferred = |runner: &str| {
+            matches!(
+                runner,
+                "dotnet restore"
+                    | "dotnet build"
+                    | "cargo build"
+                    | "cargo check"
+                    | "cargo clippy"
+                    | "cargo test"
+                    | "go build"
+                    | "go test"
+                    | "mvn test"
+                    | "pytest"
+                    | "python -m pytest"
+                    | "python3 -m pytest"
+            )
+        };
+        let tails = [
+            "| tail",
+            "| tail -5",
+            "| tail -n 5",
+            "| tail -n  5",
+            "| head",
+            "| head -3",
+            "| head -n 3",
+            "|tail -5",
+        ];
+        for &(runner, mode) in runners {
+            for tail in tails {
+                for redirect in ["", " 2>&1"] {
+                    let input = format!("{runner}{redirect} {tail}");
+                    let expected = Some(format!(
+                        "{KIT} compact --mode {mode} --keep-log -- {runner}"
+                    ));
+                    assert_eq!(
+                        expected,
+                        rewrite_command_str(&input, KIT, false, None),
+                        "rtk=false input={input}"
+                    );
+                    let expected_rtk = if rtk_deferred(runner) {
+                        None
+                    } else {
+                        expected.clone()
+                    };
+                    assert_eq!(
+                        expected_rtk,
+                        rewrite_command_str(&input, KIT, true, None),
+                        "rtk=true input={input}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_runner_rejects_ambiguous_and_unsafe_forms() {
+        for cmd in [
+            // Not a plain head/tail truncation.
+            "dotnet test | tee out.log",
+            "dotnet test | wc -l",
+            "dotnet test | tail -5 | head -3",
+            "dotnet test | tail -5 | tail -2",
+            "dotnet test | tail -5; echo done",
+            "dotnet test | tail -5 && echo ok",
+            "dotnet test | tail -5 > out.txt",
+            "dotnet test | tail -n5",
+            "dotnet test | tail -n +5",
+            "dotnet test | tail -n -5",
+            "dotnet test | tail -c 5",
+            "dotnet test | tail -f",
+            "dotnet test | tail --lines=5",
+            "dotnet test | tail -5 extra",
+            "dotnet test | tail -5 'x'",
+            "dotnet test | Tail -5",
+            "dotnet test | tail -",
+            "dotnet test | tail -n",
+            "dotnet test | tail -n ",
+            "dotnet test | heads -5",
+            "dotnet test | tailx",
+            // Redirects and operators inside the runner part.
+            "dotnet test > out.txt | tail -5",
+            "dotnet test 2>err.log | tail -5",
+            "dotnet test >&2 | tail -5",
+            "dotnet test || tail -5",
+            "dotnet test | tail -5 || echo x",
+            "dotnet test & tail -5",
+            // Comments: the pipe may sit inside the comment.
+            "dotnet test # note | tail -5",
+            "dotnet test # | tail -5",
+            // Wrappers and env prefixes stay excluded.
+            "sudo dotnet test | tail -5",
+            "VAR=1 dotnet test | tail -5",
+            "env dotnet test | tail -5",
+            // Whitespace, quoting, and escape hazards.
+            "dotnet test |\u{a0}tail -5",
+            "dotnet test | tail -5\n",
+            "dotnet test | tail -5\r",
+            "dotnet test\0| tail -5",
+            "dotnet test 'unclosed | tail -5",
+            "dotnet test \"unclosed | tail -5",
+            "dotnet test x2>&1 | tail -5",
+            "dotnet test 2>&1 2>&1 | tail -5",
+            // Piped non-runners get no fallback to sed/git/rg rewrites.
+            "ls -la | tail -5",
+            "sed -n '1,5p' f.py | tail -3",
+            "git status | tail -2",
+            "rg foo src/ | tail -5",
+            "echo hi | tail -3",
+        ] {
+            assert_eq!(None, rewrite_command_str(cmd, KIT, false, None), "cmd={cmd}");
+            assert_eq!(None, rewrite_command_str(cmd, KIT, true, None), "rtk cmd={cmd}");
+        }
+    }
+
+    #[test]
+    fn truncated_runner_preserves_quotes_cd_prefix_and_literals() {
+        assert_eq!(
+            Some(format!(
+                "{KIT} compact --mode test --keep-log -- dotnet test --filter 'A|B'"
+            )),
+            rewrite_command_str("dotnet test --filter 'A|B' | tail -40", KIT, false, None)
+        );
+        assert_eq!(
+            Some(format!(
+                "{KIT} compact --mode test --keep-log -- dotnet test --filter \"A|B\""
+            )),
+            rewrite_command_str("dotnet test --filter \"A|B\" | tail -40", KIT, false, None)
+        );
+        assert_eq!(
+            Some(format!(
+                "cd '/my repo' && {KIT} compact --mode test --keep-log -- dotnet test"
+            )),
+            rewrite_command_str("cd '/my repo' && dotnet test 2>&1 | tail -20", KIT, false, None)
+        );
+        // Mid-word and quoted `#` are literal arguments, not comments.
+        assert_eq!(
+            Some(format!(
+                "{KIT} compact --mode test --keep-log -- dotnet test --name 'C#' arg#x"
+            )),
+            rewrite_command_str("dotnet test --name 'C#' arg#x | tail -5", KIT, false, None)
+        );
+        // Tab separators are shell whitespace; a glued pipe still splits.
+        assert_eq!(
+            Some(format!("{KIT} compact --mode test --keep-log -- dotnet test")),
+            rewrite_command_str("dotnet test\t|\ttail\t-5", KIT, false, None)
+        );
+        assert_eq!(
+            Some(format!("{KIT} compact --mode build --keep-log -- cargo build")),
+            rewrite_command_str("cargo build|tail -3", KIT, false, None)
+        );
+    }
+
+    #[test]
+    fn truncated_runner_secret_args_still_refused() {
+        for cmd in [
+            "dotnet test --settings .env | tail -5",
+            "dotnet test .env | tail -5",
+            "dotnet test cert.pem | tail -5",
+            "dotnet test --filter 'A|B' --config id_rsa | tail -5",
+        ] {
+            assert_eq!(None, rewrite_command_str(cmd, KIT, false, None), "cmd={cmd}");
+            assert_eq!(None, rewrite_command_str(cmd, KIT, true, None), "rtk cmd={cmd}");
+        }
+    }
+
+    #[test]
+    fn truncated_runner_rtk_deferral_requires_literal_spelling() {
+        // (input, keep-log rewrite when not deferred). RTK 1.2.0 claims only
+        // the literal raw spellings its replies matched; path-qualified,
+        // quoted, tab-separated, or case-differing forms keep the kit log.
+        let cases: &[(&str, &str)] = &[
+            (
+                "/usr/bin/pytest | tail -5",
+                "compact --mode test --keep-log -- /usr/bin/pytest",
+            ),
+            (
+                "./pytest | tail -5",
+                "compact --mode test --keep-log -- ./pytest",
+            ),
+            (
+                "\"pytest\" | tail -5",
+                "compact --mode test --keep-log -- \"pytest\"",
+            ),
+            (
+                "'/usr/bin/pytest' | tail -5",
+                "compact --mode test --keep-log -- '/usr/bin/pytest'",
+            ),
+            ("PyTest | tail -5", "compact --mode test --keep-log -- PyTest"),
+            (
+                "python -m pytest | tail -5",
+                "compact --mode test --keep-log -- python -m pytest",
+            ),
+            (
+                "python \"-m\" pytest | tail -5",
+                "compact --mode test --keep-log -- python \"-m\" pytest",
+            ),
+            (
+                "python -m \"pytest\" | tail -5",
+                "compact --mode test --keep-log -- python -m \"pytest\"",
+            ),
+            (
+                "/usr/bin/python -m pytest | tail -5",
+                "compact --mode test --keep-log -- /usr/bin/python -m pytest",
+            ),
+            (
+                "dotnet restore | tail -5",
+                "compact --mode build --keep-log -- dotnet restore",
+            ),
+            (
+                "dotnet \"restore\" | tail -5",
+                "compact --mode build --keep-log -- dotnet \"restore\"",
+            ),
+            (
+                "cargo \"test\" | tail -5",
+                "compact --mode test --keep-log -- cargo \"test\"",
+            ),
+            (
+                "mvn \"test\" | tail -5",
+                "compact --mode test --keep-log -- mvn \"test\"",
+            ),
+        ];
+        for &(input, expected_tail) in cases {
+            let expected = Some(format!("{KIT} {expected_tail}"));
+            // Without RTK every eligible runner rewrites the same way.
+            assert_eq!(expected, rewrite_command_str(input, KIT, false, None), "rtk=false {input}");
+            // With RTK only the literal claimed spellings defer (None); the
+            // rest keep the same keep-log rewrite.
+            let deferred = matches!(
+                input,
+                "python -m pytest | tail -5" | "dotnet restore | tail -5"
+            );
+            let expected_rtk = if deferred { None } else { expected.clone() };
+            assert_eq!(expected_rtk, rewrite_command_str(input, KIT, true, None), "rtk=true {input}");
+        }
+        // Literal claimed spellings still defer under RTK — including tabs
+        // between later flag tokens and space-tab before the subcommand,
+        // with or without the folded `2>&1`.
+        for input in [
+            "pytest | tail -5",
+            "pytest tests -q | tail -20",
+            "pytest tests -q 2>&1 | tail -20",
+            "python3 -m pytest | tail -5",
+            "cargo test | tail -5",
+            "cargo test\t-q | tail -5",
+            "cargo \ttest | tail -5",
+            "cargo test 2>&1 | tail -5",
+            "dotnet build\t-v | tail -5",
+            "go test\t-race | tail -5",
+            "mvn test | tail -5",
+        ] {
+            assert_eq!(None, rewrite_command_str(input, KIT, true, None), "rtk defer {input}");
+            assert!(
+                rewrite_command_str(input, KIT, false, None).is_some(),
+                "rtk=false rewrite {input}"
+            );
+        }
+        // Measured non-claims: a tab right after the executable, doubled or
+        // tabbed spacing inside the literal python prefix, and a tab where
+        // RTK demands the ASCII-space boundary all keep the kit log.
+        for (input, expected_tail) in [
+            ("cargo\ttest | tail -5", "compact --mode test --keep-log -- cargo\ttest"),
+            ("pytest\t-q | tail -5", "compact --mode test --keep-log -- pytest\t-q"),
+            (
+                "python  -m pytest | tail -5",
+                "compact --mode test --keep-log -- python  -m pytest",
+            ),
+            (
+                "python -m pytest\t-q | tail -5",
+                "compact --mode test --keep-log -- python -m pytest\t-q",
+            ),
+            (
+                "python\t-m pytest | tail -5",
+                "compact --mode test --keep-log -- python\t-m pytest",
+            ),
+        ] {
+            let expected = Some(format!("{KIT} {expected_tail}"));
+            assert_eq!(expected, rewrite_command_str(input, KIT, true, None), "rtk={input}");
+            assert_eq!(expected, rewrite_command_str(input, KIT, false, None), "plain={input}");
+        }
+    }
+
+    #[test]
+    fn truncated_runner_rejects_token_expansions() {
+        for cmd in [
+            "dotnet test $FILTER | tail -5",
+            "dotnet test *.cs | tail -5",
+            "dotnet test ~ | tail -5",
+            "pytest tests/${DIR} | tail -5",
+            "cd $HOME && dotnet test | tail -5",
+            "cd ~/src && dotnet test | tail -5",
+        ] {
+            assert_eq!(None, rewrite_command_str(cmd, KIT, false, None), "cmd={cmd}");
+            assert_eq!(None, rewrite_command_str(cmd, KIT, true, None), "rtk cmd={cmd}");
+        }
+        // Plain (non-piped) commands keep their existing expansion tolerance.
+        assert!(
+            rewrite_command_str("dotnet test $FILTER", KIT, false, None).is_some(),
+            "plain commands are unchanged"
+        );
+    }
+
+    #[test]
+    fn truncated_runner_rejects_escaped_whitespace() {
+        for cmd in [
+            "dotnet test --filter=A\\ B | tail -5",
+            "dotnet test foo\\ bar | tail -5",
+            "pytest tests\\ -q | tail -5",
+        ] {
+            assert_eq!(None, rewrite_command_str(cmd, KIT, false, None), "cmd={cmd}");
+            assert_eq!(None, rewrite_command_str(cmd, KIT, true, None), "rtk cmd={cmd}");
+        }
+        // A quoted backslash-space is literal argument text, not an escape.
+        assert_eq!(
+            Some(format!(
+                "{KIT} compact --mode test --keep-log -- dotnet test 'a\\ b'"
+            )),
+            rewrite_command_str("dotnet test 'a\\ b' | tail -5", KIT, false, None)
+        );
+    }
+
+    #[test]
+    fn truncated_runner_unsupported_syntax_and_chains_pass_through() {
+        // Quoted parentheses and a single-quoted dollar stay literal args.
+        assert_eq!(
+            Some(format!(
+                "{KIT} compact --mode test --keep-log -- dotnet test --filter='(a|b)'"
+            )),
+            rewrite_command_str("dotnet test --filter='(a|b)' | tail -5", KIT, false, None)
+        );
+        assert_eq!(
+            Some(format!(
+                "{KIT} compact --mode test --keep-log -- dotnet test --name='$x'"
+            )),
+            rewrite_command_str("dotnet test --name='$x' | tail -5", KIT, false, None)
+        );
+        assert_eq!(
+            Some(format!(
+                "{KIT} compact --mode test --keep-log -- dotnet test \"foo$\""
+            )),
+            rewrite_command_str("dotnet test \"foo$\" | tail -5", KIT, false, None)
+        );
+        // Unquoted parens, the `$"…"` locale form, an extra filter in the
+        // chain, and a second `cd` all pass through untouched — matcher
+        // only, nothing is executed.
+        for cmd in [
+            "dotnet test (release) | tail -5",
+            "dotnet test foo) | tail -5",
+            "jest () ( echo hi ) | tail -5",
+            "pytest !(slow) | tail -5",
+            "dotnet test $\"hello\" | tail -5",
+            "dotnet test $\".env\" | tail -5",
+            "dotnet test | grep FAIL",
+            "dotnet test | grep error | tail -5",
+            "cd a && cd b && dotnet test | tail -5",
+        ] {
+            assert_eq!(None, rewrite_command_str(cmd, KIT, false, None), "cmd={cmd}");
+            assert_eq!(None, rewrite_command_str(cmd, KIT, true, None), "rtk cmd={cmd}");
+        }
     }
 }

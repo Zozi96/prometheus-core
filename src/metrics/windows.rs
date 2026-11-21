@@ -29,7 +29,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    CREATE_NEW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -182,16 +182,25 @@ fn wide_str(s: &str) -> Vec<u16> {
 /// other non-disk prefixes are refused before any handle is opened.
 fn local_drive_home() -> Option<PathBuf> {
     let home = crate::droid_mode::default_home().ok()?;
-    if !home.is_absolute() {
-        return None;
+    if local_drive(&home) {
+        Some(home)
+    } else {
+        None
     }
-    match home.components().next() {
-        Some(Component::Prefix(prefix)) => match prefix.kind() {
-            std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_) => Some(home),
-            _ => None,
-        },
-        _ => None,
-    }
+}
+
+/// Absolute path on a local drive (`C:\…`, `\\?\C:\…`); UNC, device, and
+/// other non-disk prefixes are refused.
+fn local_drive(path: &Path) -> bool {
+    path.is_absolute()
+        && matches!(
+            path.components().next(),
+            Some(Component::Prefix(prefix))
+                if matches!(
+                    prefix.kind(),
+                    std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+                )
+        )
 }
 
 /// `CreateFileW` with fixed flags; `sa` only matters when the call creates.
@@ -318,19 +327,21 @@ fn sid_is_owner_rights(sid: PSID) -> bool {
     unsafe { IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0 }
 }
 
+/// The handle must reference a real directory with no reparse point.
+fn real_dir(handle: HANDLE) -> bool {
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+        return false;
+    }
+    let attrs = info.dwFileAttributes;
+    attrs & FILE_ATTRIBUTE_DIRECTORY != 0 && attrs & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
 /// A pinned directory handle must be a real directory (not a reparse point)
 /// owned by the token user; `private` additionally requires the owner-only
 /// DACL used for the metrics directory.
 fn valid_dir(handle: &WinHandle, private: bool, owner: PSID) -> bool {
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 {
-        return false;
-    }
-    let attrs = info.dwFileAttributes;
-    if attrs & FILE_ATTRIBUTE_DIRECTORY == 0 || attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return false;
-    }
-    security_ok(handle.0, owner, private)
+    real_dir(handle.0) && security_ok(handle.0, owner, private)
 }
 
 /// Open `path` as a pinned directory handle, creating it first when `write`
@@ -352,22 +363,18 @@ fn pinned_dir(path: &Path, write: bool, private: bool, owner: PSID) -> Option<Wi
     }
 }
 
-/// Open `savings.jsonl` under the pinned metrics directory. The writer opens
-/// read+write with `OPEN_ALWAYS` (Windows `try_lock` needs a seekable handle;
-/// Unix stays `O_APPEND`); the reader opens `OPEN_EXISTING` read-only. The
-/// handle must be a single-link regular file with no reparse point and an
-/// owner-only DACL.
-fn open_metrics_file(file_path: &Path, write: bool, owner: PSID) -> Option<File> {
-    let access = if write {
-        GENERIC_READ | GENERIC_WRITE
-    } else {
-        GENERIC_READ
-    };
-    let disposition = if write { OPEN_ALWAYS } else { OPEN_EXISTING };
-    // A write-open supplies the private descriptor so `OPEN_ALWAYS` creates a
-    // private file even when the metrics directory DACL has no inheritable
-    // ACEs; reads never create and pass no security attributes.
-    let desc = if write {
+/// Open `path` with the given access/disposition, optionally supplying the
+/// private descriptor so a creating open stays owner-private even under a
+/// non-inheriting parent. The resulting handle must be a single-link regular
+/// file with no reparse point and an owner-only DACL.
+fn open_file_checked(
+    file_path: &Path,
+    access: u32,
+    disposition: u32,
+    private_desc: bool,
+    owner: PSID,
+) -> Option<File> {
+    let desc = if private_desc {
         Some(PrivateDescriptor::new(owner)?)
     } else {
         None
@@ -394,6 +401,20 @@ fn open_metrics_file(file_path: &Path, write: bool, owner: PSID) -> Option<File>
     Some(unsafe { File::from_raw_handle(raw) })
 }
 
+/// Open `savings.jsonl` under the pinned metrics directory. The writer opens
+/// read+write with `OPEN_ALWAYS` (Windows `try_lock` needs a seekable handle;
+/// Unix stays `O_APPEND`) and the private descriptor so `OPEN_ALWAYS` creates
+/// a private file even when the metrics directory DACL has no inheritable
+/// ACEs; the reader opens `OPEN_EXISTING` read-only and never creates.
+fn open_metrics_file(file_path: &Path, write: bool, owner: PSID) -> Option<File> {
+    let (access, disposition) = if write {
+        (GENERIC_READ | GENERIC_WRITE, OPEN_ALWAYS)
+    } else {
+        (GENERIC_READ, OPEN_EXISTING)
+    };
+    open_file_checked(file_path, access, disposition, write, owner)
+}
+
 /// Open `<home>/.agents/prometheus/metrics/savings.jsonl` with the same
 /// refusal posture as the Unix implementation: absolute local-drive home
 /// only, every ancestor pinned by a handle that refuses delete-sharing and
@@ -410,4 +431,55 @@ pub(super) fn open_metrics(write: bool) -> Option<File> {
     let metrics_path = prometheus_path.join("metrics");
     let _metrics = pinned_dir(&metrics_path, write, true, user.sid)?;
     open_metrics_file(&metrics_path.join("savings.jsonl"), write, user.sid)
+}
+
+/// Create `path` as a new owner-private file for kept logs: `CREATE_NEW`
+/// never truncates an existing name, the private descriptor supplies an
+/// owner-only DACL even under a non-inheriting parent, and the handle is
+/// validated like the metrics file (regular, single-link, no reparse point,
+/// strict owner-only DACL). Returns a writable `File` or None.
+fn create_file_private(path: &Path) -> Option<File> {
+    let user = token_user()?;
+    open_file_checked(
+        path,
+        GENERIC_READ | GENERIC_WRITE,
+        CREATE_NEW,
+        true,
+        user.sid,
+    )
+}
+
+/// Pin `path` as a real directory handle — no reparse point — without any
+/// ownership or DACL requirement, for ancestors that need not belong to the
+/// token user (temp roots, system dirs). The handle's share mode still
+/// refuses delete/rename while it is held.
+fn pin_plain_dir(path: &Path) -> Option<WinHandle> {
+    let handle = open_dir(path)?;
+    if real_dir(handle.0) {
+        Some(handle)
+    } else {
+        None
+    }
+}
+
+/// Write `raw` bytes as a new owner-private log under `base/kit-logs` for
+/// `compact --keep-log`. The canonical parent chain and both fixed
+/// directories are pinned by handles — refusing reparse points and delete
+/// sharing — for the whole create-and-write, so the route cannot be renamed
+/// or swapped mid-flight. `base` itself must already be absolute on a local
+/// drive; non-local prefixes are refused. Returns the log path or None.
+pub(crate) fn write_private_log(base: &Path, raw: &[u8]) -> Option<PathBuf> {
+    let user = token_user()?;
+    let parent = base.parent()?.canonicalize().ok()?;
+    if !local_drive(&parent) {
+        return None;
+    }
+    let mut pins: Vec<WinHandle> = Vec::new();
+    for ancestor in parent.ancestors() {
+        pins.push(pin_plain_dir(ancestor)?);
+    }
+    let _slot = pinned_dir(base, true, true, user.sid)?;
+    let dir = base.join("kit-logs");
+    let _log_dir = pinned_dir(&dir, true, true, user.sid)?;
+    crate::kit_util::claim_named_log(&dir, "compact", raw, create_file_private)
 }

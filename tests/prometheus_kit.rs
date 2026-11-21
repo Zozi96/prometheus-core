@@ -589,6 +589,15 @@ impl MetricsHome {
         }
         fs::create_dir_all(&runtime).unwrap();
         fs::create_dir_all(&repo).unwrap();
+        // umask 0002 leaves these 0775; the POSIX ancestor walk for private
+        // logs refuses group-writable dirs, so pin the fixture dirs owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [&root.0, &home, &runtime, &repo] {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
         Self {
             _root: root,
             home,
@@ -1401,4 +1410,462 @@ fn metrics_windows_refuses_permissive_metrics_dir() {
         1,
         "permissive metrics dir must refuse appends"
     );
+}
+
+// ---------------------------------------------------------------------------
+// compact --keep-log: truncated-runner hook rewrites capture the runner once,
+// persist the raw merged bytes in a private temp log, and fall back to
+// byte-exact stdout when the private route cannot be established.
+// ---------------------------------------------------------------------------
+
+fn keep_log_event(command: &str, cwd: &Path) -> Value {
+    serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Execute",
+        "tool_input": {"command": command, "summary": "s", "riskLevel": "low", "timeout": 30},
+        "cwd": cwd.to_str().unwrap(),
+        "session_id": "sess-keeplog",
+    })
+}
+
+#[cfg(unix)]
+fn fake_executable(dir: &Path, name: &str, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+fn fixture_path(fakebin: &Path) -> String {
+    format!("{}:{}", fakebin.display(), std::env::var("PATH").unwrap())
+}
+
+#[cfg(unix)]
+#[test]
+fn keep_log_rewrite_runs_runner_once_and_preserves_raw_log() {
+    let home = MetricsHome::new("keeplog_exec");
+    let fakebin = home.repo.join("fakebin");
+    fs::create_dir_all(&fakebin).unwrap();
+    let marker = home.repo.join("dotnet-ran.marker");
+    // dash printf octal escapes: \377 \376 are invalid UTF-8, \033 is ESC,
+    // \r is CR; the output deliberately ends without a newline.
+    fake_executable(
+        &fakebin,
+        "dotnet",
+        &format!(
+            "#!/bin/sh\n\
+             echo ran >> '{}'\n\
+             printf 'out-1\\n'\n\
+             printf 'err-1\\n' >&2\n\
+             printf 'out-2\\r\\n'\n\
+             printf '\\033[31mRED\\033[0m\\n'\n\
+             printf '\\377\\376tail'\n\
+             exit 23\n",
+            marker.display()
+        ),
+    );
+    let expected_raw: &[u8] = b"out-1\nerr-1\nout-2\r\n\x1b[31mRED\x1b[0m\n\xff\xfetail";
+
+    // Consume the real hook reply, then execute the rewritten command.
+    let ev = keep_log_event("dotnet test | tail -40", &home.repo);
+    let hook_out = home.hook("droid", &ev);
+    assert_eq!(hook_out.status.code(), Some(0));
+    let reply: Value = serde_json::from_slice(&hook_out.stdout).unwrap();
+    let rewritten = reply["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .expect("piped runner rewrites to keep-log compact");
+    assert!(
+        rewritten.contains("compact --mode test --keep-log -- dotnet test"),
+        "rewritten={rewritten}"
+    );
+    // Untouched event fields survive the rewrite.
+    let updated = &reply["hookSpecificOutput"]["updatedInput"];
+    assert_eq!(updated["summary"], "s");
+    assert_eq!(updated["riskLevel"], "low");
+    assert_eq!(updated["timeout"], 30);
+
+    let run = Command::new("sh")
+        .arg("-c")
+        .arg(rewritten)
+        .env("HOME", &home.home)
+        .env("USERPROFILE", &home.home)
+        .env("XDG_RUNTIME_DIR", &home.runtime)
+        .env("PATH", fixture_path(&fakebin))
+        .env("PROMETHEUS_KIT_NO_METRICS", "1")
+        .output()
+        .expect("failed to execute rewritten command");
+
+    // Runner status is preserved end-to-end.
+    assert_eq!(
+        run.status.code(),
+        Some(23),
+        "stderr={}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    // The runner executed exactly once.
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "ran\n");
+    // The summary leads with a printable log pointer.
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let log_path = stdout
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("log: "))
+        .expect("keep-log output leads with the log pointer");
+    assert!(stdout.contains("exit 23"), "stdout={stdout}");
+    // The private log holds the exact merged bytes, ordering included.
+    assert_eq!(fs::read(log_path).unwrap(), expected_raw);
+    let kit_logs = home.runtime.join("prometheus").join("kit-logs");
+    assert_eq!(fs::read_dir(&kit_logs).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn keep_log_short_success_and_plain_compact_writes_no_log() {
+    let home = MetricsHome::new("keeplog_short");
+    let fakebin = home.repo.join("fakebin");
+    fs::create_dir_all(&fakebin).unwrap();
+    fake_executable(&fakebin, "npm", "#!/bin/sh\nprintf 'all tests passed\\n'\nexit 0\n");
+    let path = fixture_path(&fakebin);
+
+    // A short successful keep-log run still keeps the raw log.
+    let out = home
+        .command(&["compact", "--mode", "test", "--keep-log", "--", "npm", "test"])
+        .env("PATH", &path)
+        .env("PROMETHEUS_KIT_NO_METRICS", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let log_path = stdout
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("log: "))
+        .expect("keep-log leads with the log pointer");
+    assert_eq!(fs::read(log_path).unwrap(), b"all tests passed\n");
+
+    // An ordinary non-truncated short command spills nothing.
+    let kit_logs = home.runtime.join("prometheus").join("kit-logs");
+    let before = fs::read_dir(&kit_logs).map(|d| d.count()).unwrap_or(0);
+    let plain = home
+        .command(&["compact", "--mode", "test", "--", "npm", "test"])
+        .env("PATH", &path)
+        .env("PROMETHEUS_KIT_NO_METRICS", "1")
+        .output()
+        .unwrap();
+    assert_eq!(plain.status.code(), Some(0));
+    assert!(!String::from_utf8_lossy(&plain.stdout).contains("log:"));
+    let after = fs::read_dir(&kit_logs).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(before, after, "plain compact must not create spillover logs");
+}
+
+#[cfg(unix)]
+#[test]
+fn keep_log_private_route_failure_falls_back_to_raw_stdout() {
+    let home = MetricsHome::new("keeplog_fallback");
+    let fakebin = home.repo.join("fakebin");
+    fs::create_dir_all(&fakebin).unwrap();
+    let marker = home.repo.join("dotnet-ran.marker");
+    fake_executable(
+        &fakebin,
+        "dotnet",
+        &format!(
+            "#!/bin/sh\n\
+             echo ran >> '{}'\n\
+             printf 'bad-\\377\\376-output\\r\\n'\n\
+             printf 'no-newline-tail'\n\
+             exit 23\n",
+            marker.display()
+        ),
+    );
+    let expected_raw: &[u8] = b"bad-\xff\xfe-output\r\nno-newline-tail";
+
+    // Obstruct the runtime slot: XDG_RUNTIME_DIR/prometheus is a plain file,
+    // so no private kit-logs directory can be established. The fixture root
+    // is pinned owner-only first so the ancestor walk accepts it and the
+    // obstruction — not an insecure parent — is what refuses the route.
+    let obstruct = TempDir::new("keeplog_obstruct");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&obstruct.0, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(obstruct.0.join("prometheus"), b"occupied").unwrap();
+
+    let out = home
+        .command(&["compact", "--mode", "test", "--keep-log", "--", "dotnet", "test"])
+        .env("PATH", fixture_path(&fakebin))
+        .env("XDG_RUNTIME_DIR", &obstruct.0)
+        .env("PROMETHEUS_KIT_NO_METRICS", "1")
+        .output()
+        .unwrap();
+
+    // Fallback emits the captured bytes unchanged — invalid UTF-8, CR, and
+    // no synthetic trailing newline — with the runner's own status, once.
+    assert_eq!(out.status.code(), Some(23));
+    assert_eq!(out.stdout, expected_raw, "fallback must be byte-exact");
+    assert!(out.stderr.is_empty(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "ran\n");
+}
+
+#[test]
+fn keep_log_rejects_conflicting_options_before_execution() {
+    for args in [
+        &["compact", "--keep-log"][..],
+        &["compact", "--keep-log", "--json", "--", "dotnet", "test"][..],
+        &["compact", "--keep-log", "--no-spillover", "--", "dotnet", "test"][..],
+        &[
+            "compact",
+            "--keep-log",
+            "--save-log",
+            "x.log",
+            "--",
+            "dotnet",
+            "test",
+        ][..],
+        &["compact", "--keep-log", "somefile.txt"][..],
+    ] {
+        let out = run_kit(args, None);
+        assert_eq!(out.status.code(), Some(2), "args={args:?}");
+    }
+}
+
+#[test]
+fn keep_log_issue_examples_trace_with_and_without_rtk() {
+    let home = MetricsHome::new("keeplog_examples");
+    // (command, expected rewritten tail, rtk claims it in piped form)
+    let cases: &[(&str, &str, bool)] = &[
+        ("dotnet test", "compact --mode test -- dotnet test", false),
+        (
+            "dotnet test | tail -40",
+            "compact --mode test --keep-log -- dotnet test",
+            false,
+        ),
+        (
+            "pytest tests -q 2>&1 | tail -20",
+            "compact --mode test --keep-log -- pytest tests -q",
+            true,
+        ),
+        (
+            "npm test 2>&1 | head -50",
+            "compact --mode test --keep-log -- npm test",
+            false,
+        ),
+    ];
+    for rtk in [false, true] {
+        for &(command, expected_tail, rtk_claims) in cases {
+            let ev = keep_log_event(command, &home.repo);
+            let extra: &[(&str, &str)] = if rtk {
+                &[("PROMETHEUS_KIT_RTK_COEXIST", "1")]
+            } else {
+                &[]
+            };
+            let out = home.hook_env("droid", &ev, extra);
+            assert_eq!(out.status.code(), Some(0), "rtk={rtk} cmd={command}");
+            let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+            let rewritten = reply
+                .pointer("/hookSpecificOutput/updatedInput/command")
+                .and_then(Value::as_str);
+            if rtk && rtk_claims {
+                assert!(
+                    rewritten.is_none(),
+                    "rtk={rtk} cmd={command} must defer to RTK: {reply}"
+                );
+                continue;
+            }
+            let rewritten = rewritten.unwrap_or_else(|| {
+                panic!("no rewrite rtk={rtk} cmd={command} reply={reply}")
+            });
+            assert!(
+                rewritten.contains(expected_tail),
+                "rtk={rtk} cmd={command} -> {rewritten}"
+            );
+            assert!(rewritten.contains(bin()), "kit bin missing: {rewritten}");
+            // Only the piped forms carry --keep-log.
+            assert_eq!(
+                command.contains('|'),
+                rewritten.contains("--keep-log"),
+                "rtk={rtk} cmd={command} -> {rewritten}"
+            );
+            // Untouched fields are preserved.
+            let updated = &reply["hookSpecificOutput"]["updatedInput"];
+            assert_eq!(updated["summary"], "s");
+            assert_eq!(updated["riskLevel"], "low");
+            assert_eq!(updated["timeout"], 30);
+        }
+    }
+}
+
+#[test]
+fn keep_log_secret_command_is_denied_before_rewrite() {
+    let home = MetricsHome::new("keeplog_secret");
+    let ev = keep_log_event("dotnet test --settings .env | tail -5", &home.repo);
+    let out = home.hook("droid", &ev);
+    assert_eq!(out.status.code(), Some(0));
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        reply
+            .pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(Value::as_str),
+        Some("ask"),
+        "reply={reply}"
+    );
+    assert!(
+        reply.pointer("/hookSpecificOutput/updatedInput").is_none(),
+        "secret events must refuse before rewrite: {reply}"
+    );
+}
+
+#[cfg(unix)]
+fn keep_log_fake_runner(fakebin: &Path) {
+    fake_executable(
+        fakebin,
+        "dotnet",
+        "#!/bin/sh\nprintf 'raw-out\\377\\n'\nprintf 'err-line\\376\\n' >&2\nexit 7\n",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn keep_log_git_tree_or_cwd_runtime_falls_back_without_dirs() {
+    let home = MetricsHome::new("keeplog_gittree");
+    let fakebin = home.repo.join("fakebin");
+    fs::create_dir_all(&fakebin).unwrap();
+    keep_log_fake_runner(&fakebin);
+    let args = [
+        "compact", "--mode", "test", "--keep-log", "--", "dotnet", "test",
+    ];
+    let expected: &[u8] = b"raw-out\xff\nerr-line\xfe\n";
+    let run_with = |rt: &Path, cwd: &Path| {
+        home.command(&args)
+            .env("PATH", fixture_path(&fakebin))
+            .env("XDG_RUNTIME_DIR", rt)
+            .env("PROMETHEUS_KIT_NO_METRICS", "1")
+            .current_dir(cwd)
+            .output()
+            .unwrap()
+    };
+
+    // Runtime dir is a sibling of the nested cwd inside a synthetic git tree:
+    // the canonical parent has a `.git` ancestor, so the route is refused.
+    let repo = TempDir::new("keeplog_repo");
+    fs::create_dir_all(repo.0.join(".git")).unwrap();
+    let rt = repo.0.join("rt");
+    fs::create_dir_all(&rt).unwrap();
+    let nested = repo.0.join("a").join("b");
+    fs::create_dir_all(&nested).unwrap();
+    let out = run_with(&rt, &nested);
+    assert_eq!(out.status.code(), Some(7), "stdout={:?}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(out.stdout, expected, "byte-exact raw fallback");
+    assert_eq!(fs::read_dir(&rt).unwrap().count(), 0, "no dirs in repo runtime");
+
+    // Via symlink the canonical parent resolves into the same git tree.
+    let linkdir = TempDir::new("keeplog_link");
+    let link = linkdir.0.join("rtlink");
+    std::os::unix::fs::symlink(&rt, &link).unwrap();
+    let out = run_with(&link, &nested);
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(out.stdout, expected);
+    assert_eq!(fs::read_dir(&rt).unwrap().count(), 0);
+
+    // An unrelated world-writable non-sticky runtime parent also falls back.
+    let badroot = TempDir::new("keeplog_insec");
+    let bad = badroot.0.join("rt");
+    fs::create_dir_all(&bad).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    let out = run_with(&bad, &nested);
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(out.stdout, expected);
+    assert_eq!(fs::read_dir(&bad).unwrap().count(), 0, "no dirs in insecure parent");
+}
+
+#[cfg(unix)]
+#[test]
+fn keep_log_tiny_budget_keeps_pointer_only() {
+    let home = MetricsHome::new("keeplog_tiny");
+    let out = home
+        .command(&[
+            "compact",
+            "--mode",
+            "test",
+            "--keep-log",
+            "--max-tokens",
+            "3",
+            "--",
+            "sh",
+            "-c",
+            "printf 'tiny-out\\n'",
+        ])
+        .env("PROMETHEUS_KIT_NO_METRICS", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "tiny budget must keep only the pointer: {stdout:?}");
+    let log = lines[0].strip_prefix("log: ").expect("pointer line");
+    assert_eq!(fs::read(log).unwrap(), b"tiny-out\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn keep_log_spawn_failures_use_shell_status() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = MetricsHome::new("keeplog_spawn");
+    let out = home
+        .command(&["compact", "--keep-log", "--", "definitely-missing-bin-9x7"])
+        .env("PROMETHEUS_KIT_NO_METRICS", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(127), "missing binary -> 127");
+    let fakebin = home.repo.join("fakebin");
+    fs::create_dir_all(&fakebin).unwrap();
+    let noexec = fakebin.join("noexec");
+    fs::write(&noexec, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&noexec, fs::Permissions::from_mode(0o644)).unwrap();
+    let out = home
+        .command(&["compact", "--keep-log", "--", noexec.to_str().unwrap()])
+        .env("PROMETHEUS_KIT_NO_METRICS", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(126), "non-executable -> 126");
+}
+
+#[cfg(windows)]
+#[test]
+fn keep_log_windows_private_route_writes_log() {
+    let home = MetricsHome::new("keeplog_win");
+    let wintemp = home.repo.join("wintemp");
+    fs::create_dir_all(&wintemp).unwrap();
+    let out = home
+        .command(&[
+            "compact",
+            "--mode",
+            "test",
+            "--keep-log",
+            "--",
+            "cmd",
+            "/d",
+            "/c",
+            "echo O&1>&2 echo E",
+        ])
+        .env("TEMP", &wintemp)
+        .env("TMP", &wintemp)
+        .env("PROMETHEUS_KIT_NO_METRICS", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let log = lines
+        .first()
+        .and_then(|l| l.strip_prefix("log: "))
+        .expect("log pointer");
+    let bytes = fs::read(log).expect("private log readable");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains('O') && text.contains('E'), "log={text:?}");
 }

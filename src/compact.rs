@@ -155,6 +155,53 @@ pub fn compact_command(
     Ok((result, exit_code))
 }
 
+/// Run `command` exactly once, capturing merged stdout+stderr bytes in write
+/// order plus the exit status. Unlike [`compact_command`] the raw `Vec<u8>`
+/// keeps CR, ANSI escapes, and invalid UTF-8 untouched — `compact
+/// --keep-log` persists it as the guaranteed full log. Unix signal deaths
+/// report `128 + signal`; other platforms fall back to 1. A mid-capture pipe
+/// read error is returned alongside the partial bytes and status in the
+/// third tuple element so the caller can emit what arrived without claiming
+/// a complete log.
+pub fn capture_command_log(
+    command: &[String],
+) -> std::io::Result<(Vec<u8>, i32, Option<std::io::Error>)> {
+    use std::io::Read;
+    if command.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty command",
+        ));
+    }
+    // One pipe shared by both streams preserves interleaved write order.
+    let (mut reader, writer) = std::io::pipe()?;
+    let stdout = writer.try_clone()?;
+    let mut child = Command::new(&command[0])
+        .args(&command[1..])
+        .stdout(stdout)
+        .stderr(writer)
+        .spawn()?;
+    // The builder's writer copies close with it after spawn; only the
+    // child's fds remain, so EOF arrives when the child exits.
+
+    let mut raw = Vec::new();
+    let read_error = reader.read_to_end(&mut raw).err();
+    // Drop our end so a blocked writer sees EPIPE instead of deadlocking the
+    // reap below; bytes already read and the exit status stay authoritative.
+    drop(reader);
+    let status = child.wait()?;
+    #[cfg(unix)]
+    let code = {
+        use std::os::unix::process::ExitStatusExt;
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+    };
+    #[cfg(not(unix))]
+    let code = status.code().unwrap_or(1);
+    Ok((raw, code, read_error))
+}
+
 struct Regexes {
     msbuild: Regex,
     msbuild_tool: Regex,
