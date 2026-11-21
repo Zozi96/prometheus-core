@@ -52,9 +52,11 @@ credit), and at most one row per `compact`, `outline`, `slice`, `search`,
 `diff`, or `map` invocation whose output was actually reduced or clipped —
 `compact` counts every compaction including render overhead. For command
 rows `raw_bytes` minus `emitted_bytes` is the measured saving; warning rows
-add bytes, so only compare deltas within a single `rule_id`. For `slice` and
-`search` on files that are not valid UTF-8, `raw_bytes` counts the selected
-*decoded* text bytes, which can differ from the on-disk byte count.
+add bytes, so only compare deltas within a single `rule_id` — the reread
+guard's net is `reread-denial` and `allowed-retry` taken together. For
+`slice` and `search` on files that are not valid UTF-8, `raw_bytes` counts
+the selected *decoded* text bytes, which can differ from the on-disk byte
+count.
 
 The file is capped at 1 MiB and is opened only through owner-checked,
 no-follow paths: on Unix every component must be a real directory owned by

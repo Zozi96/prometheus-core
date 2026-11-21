@@ -1498,7 +1498,8 @@ fn read_failure_allows(host: &str, event: &Value) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Unchanged whole-file reread warning: mirrors runtime/read_warning.py.
+// Unchanged-reread guard: warn below LARGE_READ_LINES, deny once at or
+// above (ADR-0013 D6).
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -1732,7 +1733,11 @@ fn read_path(event: &Value, host: &str) -> Option<(String, Vec<(String, Value)>)
         .iter()
         .filter_map(|(key, value)| {
             let lower = casefold(key);
-            PARTIAL_KEYS.contains(&lower.as_str()).then(|| (lower, value.clone()))
+            // A null partial parameter is an omitted one: whole-file read.
+            if value.is_null() || !PARTIAL_KEYS.contains(&lower.as_str()) {
+                return None;
+            }
+            Some((lower, value.clone()))
         })
         .collect();
     partial.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1747,7 +1752,8 @@ fn read_path(event: &Value, host: &str) -> Option<(String, Vec<(String, Value)>)
 }
 
 /// Bytes the read would return: the whole file for a whole-file read; for an
-/// `offset`/`limit`-only range a proportional slice; 0 for any other shape.
+/// `offset`/`limit`-only range a proportional slice of the 1-based offset;
+/// 0 for any other shape.
 fn read_bytes_estimate(partial: &[(String, Value)], file_bytes: usize, lines: usize) -> usize {
     if partial.is_empty() {
         return file_bytes;
@@ -1776,9 +1782,8 @@ fn read_bytes_estimate(partial: &[(String, Value)], file_bytes: usize, lines: us
         return 0;
     }
     let lines = lines as u128;
-    let want = limit
-        .unwrap_or(lines)
-        .min(lines.saturating_sub(offset));
+    let start = offset.saturating_sub(1);
+    let want = limit.unwrap_or(lines).min(lines.saturating_sub(start));
     (file_bytes as u128 * want / lines) as usize
 }
 
@@ -3188,5 +3193,115 @@ mod tests {
             );
         }
         fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn null_partial_parameters_count_as_a_whole_file_read() {
+        let _g = env_guard();
+        let tmp = TempDir::new("null_partial");
+        let rt = tmp.0.join("xdg");
+        fs::create_dir_all(&rt).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _env = EnvOverride::set(&[
+            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
+            ("CURSOR_PROJECT_DIR", None),
+            ("DEVIN_PROJECT_DIR", None),
+            ("GROK_SESSION_ID", None),
+        ]);
+        let repo = tmp.0.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("big.rs"), "fn a() {}\n".repeat(220)).unwrap();
+
+        let ev = |session: &str, nulls: bool| {
+            let mut input = json!({"file_path": "big.rs"});
+            if nulls {
+                input["offset"] = Value::Null;
+                input["limit"] = Value::Null;
+            }
+            json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Read",
+                "tool_input": input,
+                "cwd": repo,
+                "session_id": session,
+            })
+        };
+
+        // A plain read then the same read with null offset/limit shares the
+        // whole-file state key, so the second is the once-only denial.
+        let whole = ev("s-null-a", false);
+        let first = run_hook("claude", whole.to_string().as_bytes());
+        assert!(first["hookSpecificOutput"]["additionalContext"].is_string());
+        let nulled = ev("s-null-a", true);
+        let second = run_hook("claude", nulled.to_string().as_bytes());
+        assert_eq!(
+            "deny",
+            second["hookSpecificOutput"]["permissionDecision"]
+        );
+        assert_eq!(
+            REREAD_DENIAL_MESSAGE,
+            second["hookSpecificOutput"]["permissionDecisionReason"]
+        );
+
+        // On a fresh session the null-variant first read is the advisory.
+        let fresh = ev("s-null-b", true);
+        let advisory = run_hook("claude", fresh.to_string().as_bytes());
+        assert!(advisory["hookSpecificOutput"]["additionalContext"].is_string());
+        assert!(advisory["hookSpecificOutput"].get("permissionDecision").is_none());
+    }
+
+    #[test]
+    fn read_bytes_estimate_matches_range_shapes() {
+        let p = |items: Vec<(&str, Value)>| -> Vec<(String, Value)> {
+            items
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect()
+        };
+        assert_eq!(read_bytes_estimate(&[], 1000, 250), 1000);
+        assert_eq!(
+            read_bytes_estimate(&p(vec![("offset", json!(1))]), 1000, 250),
+            1000
+        );
+        assert_eq!(
+            read_bytes_estimate(
+                &p(vec![("offset", json!(200)), ("limit", json!(1))]),
+                2000,
+                200
+            ),
+            10
+        );
+        assert_eq!(
+            read_bytes_estimate(
+                &p(vec![("offset", json!(0)), ("limit", json!(50))]),
+                2500,
+                250
+            ),
+            500
+        );
+        assert_eq!(
+            read_bytes_estimate(&p(vec![("start_line", json!(3))]), 1000, 250),
+            0
+        );
+        assert_eq!(
+            read_bytes_estimate(&p(vec![("offset", json!("5"))]), 1000, 250),
+            0
+        );
+        assert_eq!(
+            read_bytes_estimate(
+                &p(vec![("offset", json!(1)), ("offset", json!(2))]),
+                1000,
+                250
+            ),
+            0
+        );
+        assert_eq!(
+            read_bytes_estimate(&p(vec![("limit", json!(5))]), 100, 0),
+            0
+        );
     }
 }
