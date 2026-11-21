@@ -2,7 +2,7 @@
 //!
 //! Answers `prometheus-kit hook <claude|cursor|devin|droid|muse>`:
 //! - Secret-path guard (`ask` on Claude/Droid/Devin/Muse, `deny` on Cursor).
-//! - Large whole-file read advisory (>= 200 lines) and non-blocking unchanged reread warning.
+//! - Large whole-file read advisory (>= 200 lines); unchanged rereads are denied once at >= 200 lines and warned below.
 //! - Deterministic shell auto-rewrite via `updatedInput` on Claude/Droid/Muse (coexisting with RTK).
 //!
 //! Every other event, tool, and edit passes with `{}` (or `{"continue": true}` for
@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const REREAD_MESSAGE: &str =
     "Unchanged whole-file reread: use the previous read or request a focused range (`prometheus-kit slice`).";
+pub const REREAD_DENIAL_MESSAGE: &str = "Unchanged reread denied once: reuse the earlier read or request a focused range (`prometheus-kit slice <path>:<start>-<end>`). Retry the same read if that content left your context.";
 pub const LARGE_READ_LINES: usize = 200;
 const REREAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const PARTIAL_KEYS: [&str; 10] = [
@@ -1621,7 +1622,7 @@ fn large_read_advisory(path: &Path, lines: usize) -> String {
 enum StoredHash {
     Absent,
     Malformed,
-    Present(String),
+    Present { digest: String, denied: bool },
 }
 
 fn read_reread_state(path: &Path) -> StoredHash {
@@ -1660,28 +1661,37 @@ fn read_reread_state(path: &Path) -> StoredHash {
     let Ok(raw) = std::str::from_utf8(&buf[..total]) else {
         return StoredHash::Malformed;
     };
-    let text = raw.trim().to_string();
-    let valid = text.len() == 64
-        && text
+    // Exactly two shapes: "<64 lowercase hex>" (seen) or the same plus a
+    // " denied" suffix (denial issued, retry pending).
+    let text = raw.trim();
+    let (digest, denied) = match text.strip_suffix(" denied") {
+        Some(head) => (head, true),
+        None => (text, false),
+    };
+    let valid = digest.len() == 64
+        && digest
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
     if valid {
-        StoredHash::Present(text)
+        StoredHash::Present {
+            digest: digest.to_string(),
+            denied,
+        }
     } else {
         StoredHash::Malformed
     }
 }
 
-fn write_reread_state(path: &Path, digest: &str) {
+fn write_reread_state(path: &Path, digest: &str, denied: bool) -> bool {
     use std::io::Write;
     if std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
     {
-        return;
+        return false;
     }
     let Some(parent) = path.parent() else {
-        return;
+        return false;
     };
     let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = parent.join(format!(".reread-{}-{seq}.tmp", std::process::id()));
@@ -1693,16 +1703,23 @@ fn write_reread_state(path: &Path, digest: &str) {
         options.mode(0o600);
     }
     let Ok(mut file) = options.open(&tmp) else {
-        return;
+        return false;
     };
-    let write_ok = file.write_all(format!("{digest}\n").as_bytes()).is_ok();
+    let suffix = if denied { " denied" } else { "" };
+    let write_ok = file
+        .write_all(format!("{digest}{suffix}\n").as_bytes())
+        .is_ok();
     drop(file);
     if !write_ok || std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return false;
     }
+    true
 }
 
-fn read_path(event: &Value, host: &str) -> Option<String> {
+/// Read-tool path plus the partial-read entries (casefolded key, value)
+/// sorted by key; an empty vec means a whole-file read.
+fn read_path(event: &Value, host: &str) -> Option<(String, Vec<(String, Value)>)> {
     if host == "omp" || casefold(tool_name(event)) != "read" {
         return None;
     }
@@ -1711,40 +1728,94 @@ fn read_path(event: &Value, host: &str) -> Option<String> {
         .and_then(Value::as_object)
         .or_else(|| get(event, "input").and_then(Value::as_object))
         .unwrap_or(&empty);
-    for key in inp.keys() {
-        let lower = casefold(key);
-        if PARTIAL_KEYS.iter().any(|partial| *partial == lower) {
-            return None;
-        }
-    }
+    let mut partial: Vec<(String, Value)> = inp
+        .iter()
+        .filter_map(|(key, value)| {
+            let lower = casefold(key);
+            PARTIAL_KEYS.contains(&lower.as_str()).then(|| (lower, value.clone()))
+        })
+        .collect();
+    partial.sort_by(|a, b| a.0.cmp(&b.0));
     for key in ["file_path", "filePath", "path"] {
         if let Some(Value::String(text)) = inp.get(key) {
             if !text.trim().is_empty() {
-                return Some(text.clone());
+                return Some((text.clone(), partial));
             }
         }
     }
     None
 }
 
-pub fn whole_file_warning(host: &str, event: &Value, session_id: &str, root: Option<&Path>) -> String {
-    let Some(raw) = read_path(event, host) else {
-        return String::new();
+/// Bytes the read would return: the whole file for a whole-file read; for an
+/// `offset`/`limit`-only range a proportional slice; 0 for any other shape.
+fn read_bytes_estimate(partial: &[(String, Value)], file_bytes: usize, lines: usize) -> usize {
+    if partial.is_empty() {
+        return file_bytes;
+    }
+    let mut offset = 0u128;
+    let mut limit = None::<u128>;
+    let mut seen_offset = false;
+    let mut seen_limit = false;
+    for (key, value) in partial {
+        let Some(num) = value.as_u64() else {
+            return 0;
+        };
+        match key.as_str() {
+            "offset" if !seen_offset => {
+                seen_offset = true;
+                offset = u128::from(num);
+            }
+            "limit" if !seen_limit => {
+                seen_limit = true;
+                limit = Some(u128::from(num));
+            }
+            _ => return 0,
+        }
+    }
+    if lines == 0 {
+        return 0;
+    }
+    let lines = lines as u128;
+    let want = limit
+        .unwrap_or(lines)
+        .min(lines.saturating_sub(offset));
+    (file_bytes as u128 * want / lines) as usize
+}
+
+/// The read-budget guard verdict for one Read event: pass, warn, or deny.
+#[derive(Debug, PartialEq)]
+pub enum ReadGuard {
+    Pass,
+    Warn(String),
+    Deny(String),
+}
+
+/// Unchanged-reread guard (ADR-0013 D6): whole-file and identical-range
+/// rereads of a file at or above `LARGE_READ_LINES` are denied once, the
+/// retry passes, and smaller files keep the non-blocking warning.
+pub fn read_guard(
+    host: &str,
+    event: &Value,
+    session_id: &str,
+    root: Option<&Path>,
+) -> ReadGuard {
+    let Some((raw, partial)) = read_path(event, host) else {
+        return ReadGuard::Pass;
     };
     if !valid_session_id_str(session_id) {
-        return String::new();
+        return ReadGuard::Pass;
     }
     let Some(folder) = session_dir(session_id) else {
-        return String::new();
+        return ReadGuard::Pass;
     };
     if !secret_path_denied(&raw).is_empty() {
-        return String::new();
+        return ReadGuard::Pass;
     }
     let base: PathBuf = match root {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => match get(event, "cwd").and_then(Value::as_str) {
             Some(c) if !c.is_empty() => PathBuf::from(c),
-            _ => return String::new(),
+            _ => return ReadGuard::Pass,
         },
     };
     let canonical = resolve_loose(&base);
@@ -1757,43 +1828,86 @@ pub fn whole_file_warning(host: &str, event: &Value, session_id: &str, root: Opt
     let target_path = resolve_loose(&joined);
     let target_str = target_path.to_string_lossy();
     if !secret_path_denied(&target_str).is_empty() {
-        return String::new();
+        return ReadGuard::Pass;
     }
     let Ok(info) = std::fs::metadata(&target_path) else {
-        return String::new();
+        return ReadGuard::Pass;
     };
     if !info.is_file() || info.len() > REREAD_MAX_BYTES {
-        return String::new();
+        return ReadGuard::Pass;
     }
     let Some((digest, line_count)) = hash_file(&target_path) else {
-        return String::new();
+        return ReadGuard::Pass;
     };
+    // A ranged read of a small file never touches reread state.
+    if !partial.is_empty() && line_count < LARGE_READ_LINES {
+        return ReadGuard::Pass;
+    }
     let canonical_str = canonical.to_string_lossy();
     let mut key_bytes = Vec::with_capacity(canonical_str.len() + 1 + target_str.len());
     key_bytes.extend_from_slice(canonical_str.as_bytes());
     key_bytes.push(0);
     key_bytes.extend_from_slice(target_str.as_bytes());
+    if !partial.is_empty() {
+        let signature = partial
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("\0");
+        key_bytes.push(0);
+        key_bytes.extend_from_slice(signature.as_bytes());
+    }
     let key = sha256_hex(&key_bytes);
     let state = folder.join(format!("reread-{key}"));
-    let (rule, warning) = match read_reread_state(&state) {
-        StoredHash::Malformed => return String::new(),
-        StoredHash::Present(stored) if stored == digest => {
-            (Rule::RereadWarning, REREAD_MESSAGE.to_string())
-        }
-        _ => {
-            write_reread_state(&state, &digest);
-            (
-                Rule::LargeReadAdvisory,
-                large_read_advisory(&target_path, line_count),
-            )
+    let large = line_count >= LARGE_READ_LINES;
+    let estimate = read_bytes_estimate(&partial, info.len() as usize, line_count);
+    let record = |rule: Rule, raw: usize, emitted: usize| {
+        if let Some(host) = Host::from_hook(host) {
+            metrics::record(host, rule, raw, emitted);
         }
     };
-    if !warning.is_empty() {
-        if let Some(host) = Host::from_hook(host) {
-            metrics::record(host, rule, 0, warning.len());
+    match read_reread_state(&state) {
+        StoredHash::Malformed => ReadGuard::Pass,
+        StoredHash::Present {
+            digest: stored,
+            denied,
+        } if stored == digest => {
+            if denied {
+                // The retry re-pays the bytes the denial was credited for, so
+                // denial+retry nets to minus the message; record it even if
+                // the state advance fails.
+                write_reread_state(&state, &digest, false);
+                record(Rule::AllowedRetry, 0, estimate);
+                ReadGuard::Pass
+            } else if large {
+                // Fail open when the marker cannot advance: a state we cannot
+                // write must never deny forever.
+                if write_reread_state(&state, &digest, true) {
+                    record(Rule::RereadDenial, estimate, REREAD_DENIAL_MESSAGE.len());
+                    ReadGuard::Deny(REREAD_DENIAL_MESSAGE.to_string())
+                } else {
+                    ReadGuard::Pass
+                }
+            } else {
+                record(Rule::RereadWarning, 0, REREAD_MESSAGE.len());
+                ReadGuard::Warn(REREAD_MESSAGE.to_string())
+            }
+        }
+        _ => {
+            write_reread_state(&state, &digest, false);
+            if partial.is_empty() {
+                let advisory = large_read_advisory(&target_path, line_count);
+                if advisory.is_empty() {
+                    ReadGuard::Pass
+                } else {
+                    record(Rule::LargeReadAdvisory, 0, advisory.len());
+                    ReadGuard::Warn(advisory)
+                }
+            } else {
+                ReadGuard::Pass
+            }
         }
     }
-    warning
 }
 
 // ---------------------------------------------------------------------------
@@ -1820,6 +1934,37 @@ fn warn_reply(text: &str) -> Value {
                 "additionalContext": text,
             }
         })
+    }
+}
+
+/// Host envelope for the read guard: warnings keep each host's existing
+/// context channel; denials use that host's blocking reply shape.
+fn read_guard_reply(host: &str, guard: ReadGuard) -> Value {
+    match guard {
+        ReadGuard::Pass => json!({}),
+        ReadGuard::Warn(text) => {
+            if host == "cursor" {
+                json!({"agent_message": text})
+            } else {
+                warn_reply(&text)
+            }
+        }
+        ReadGuard::Deny(text) => match host {
+            "claude" | "droid" | "muse" => json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": text,
+                }
+            }),
+            "devin" => json!({"decision": "block", "reason": text}),
+            "cursor" => json!({
+                "permission": "deny",
+                "user_message": text,
+                "agent_message": text,
+            }),
+            _ => json!({}),
+        },
     }
 }
 
@@ -1896,8 +2041,10 @@ fn handle_claude_or_muse(host: &str, raw: &[u8]) -> Value {
     if let Some(reply) = crate::hook_rewrite::rewrite_command_reply(host, event) {
         return reply;
     }
-    let warning = whole_file_warning(host, event, session_id, Some(&root));
-    warn_reply(&warning)
+    read_guard_reply(
+        host,
+        read_guard(host, event, session_id, Some(&root)),
+    )
 }
 
 fn handle_droid(raw: &[u8]) -> Value {
@@ -1927,8 +2074,10 @@ fn handle_droid(raw: &[u8]) -> Value {
     if let Some(reply) = crate::hook_rewrite::rewrite_command_reply("droid", event) {
         return reply;
     }
-    let warning = whole_file_warning("droid", event, session_id, Some(&root));
-    warn_reply(&warning)
+    read_guard_reply(
+        "droid",
+        read_guard("droid", event, session_id, Some(&root)),
+    )
 }
 
 fn devin_candidate(event: &Value) -> Option<PathBuf> {
@@ -1955,8 +2104,10 @@ fn handle_devin(raw: &[u8]) -> Value {
     if casefold(tool_name(event)) == "read" && read_failure_allows("devin", event) {
         let session_id = as_str(get(event, "session_id"));
         let candidate = devin_candidate(event);
-        let warning = whole_file_warning("devin", event, session_id, candidate.as_deref());
-        return warn_reply(&warning);
+        return read_guard_reply(
+            "devin",
+            read_guard("devin", event, session_id, candidate.as_deref()),
+        );
     }
     let session_id = as_str(get(event, "session_id"));
     if !valid_session_id_str(session_id) {
@@ -1974,8 +2125,10 @@ fn handle_devin(raw: &[u8]) -> Value {
     if !denial.is_empty() {
         return ask_reply(&denial);
     }
-    let warning = whole_file_warning("devin", event, session_id, Some(&root));
-    warn_reply(&warning)
+    read_guard_reply(
+        "devin",
+        read_guard("devin", event, session_id, Some(&root)),
+    )
 }
 
 fn push_root(roots: &mut Vec<PathBuf>, candidate: &Path) {
@@ -2038,12 +2191,15 @@ fn handle_cursor(raw: &[u8]) -> Value {
         return cursor_deny_reply(&reason);
     }
     let roots = cursor_roots(event);
-    let warning = whole_file_warning("cursor", event, session_id, roots.first().map(PathBuf::as_path));
-    if warning.is_empty() {
-        json!({})
-    } else {
-        json!({"agent_message": warning})
-    }
+    read_guard_reply(
+        "cursor",
+        read_guard(
+            "cursor",
+            event,
+            session_id,
+            roots.first().map(PathBuf::as_path),
+        ),
+    )
 }
 
 pub fn is_supported_host(host: &str) -> bool {
@@ -2648,7 +2804,8 @@ mod tests {
         assert_eq!(REREAD_MESSAGE, second["hookSpecificOutput"]["additionalContext"]);
         assert!(second["hookSpecificOutput"].get("permissionDecision").is_none());
 
-        // Partial read does not warn and does not reset stored hash.
+        // Partial read does not warn, does not reset stored hash, and — on a
+        // small file — never touches reread state, so it passes every time.
         let partial = json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "Read",
@@ -2656,6 +2813,7 @@ mod tests {
             "cwd": repo,
             "session_id": "s-reread",
         });
+        assert_eq!(json!({}), run_hook("claude", partial.to_string().as_bytes()));
         assert_eq!(json!({}), run_hook("claude", partial.to_string().as_bytes()));
         let third = run_hook("claude", ev.to_string().as_bytes());
         assert_eq!(REREAD_MESSAGE, third["hookSpecificOutput"]["additionalContext"]);
@@ -2698,8 +2856,8 @@ mod tests {
         symlink(&secret, &link).unwrap();
 
         assert_eq!(
-            "",
-            whole_file_warning(
+            ReadGuard::Pass,
+            read_guard(
                 "claude",
                 &json!({"tool_name": "Read", "tool_input": {"file_path": link}}),
                 "s-sec",
@@ -2707,8 +2865,8 @@ mod tests {
             )
         );
         assert_eq!(
-            "",
-            whole_file_warning(
+            ReadGuard::Pass,
+            read_guard(
                 "claude",
                 &json!({"tool_name": "Read", "tool_input": {"file_path": link}}),
                 "s-sec",
@@ -2716,21 +2874,24 @@ mod tests {
             )
         );
 
-        // Insecure 0o755 session dir is refused and never chmod'd.
+        // Insecure 0o755 session dir is refused and never chmod'd — even for
+        // a large file read twice, which must fail open rather than deny.
         let bad_sess = rt.join("prometheus").join("s-bad");
         fs::create_dir_all(&bad_sess).unwrap();
         fs::set_permissions(&bad_sess, fs::Permissions::from_mode(0o755)).unwrap();
         let file = repo.join("a.py");
-        fs::write(&file, "x = 1\n").unwrap();
-        assert_eq!(
-            "",
-            whole_file_warning(
-                "claude",
-                &json!({"tool_name": "Read", "tool_input": {"file_path": file}}),
-                "s-bad",
-                Some(&repo),
-            )
-        );
+        fs::write(&file, "x = 1\n".repeat(220)).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                ReadGuard::Pass,
+                read_guard(
+                    "claude",
+                    &json!({"tool_name": "Read", "tool_input": {"file_path": file}}),
+                    "s-bad",
+                    Some(&repo),
+                )
+            );
+        }
         assert_eq!(
             0o755,
             fs::metadata(&bad_sess).unwrap().permissions().mode() & 0o777
@@ -2787,15 +2948,62 @@ mod tests {
         assert!(first_ctx.contains("slice"), "{first_ctx}");
         assert!(first["hookSpecificOutput"].get("permissionDecision").is_none());
 
-        // Second unchanged whole-file read emits REREAD_MESSAGE.
+        // Second unchanged whole-file read is denied once with the exact
+        // envelope — no additionalContext — then the retry passes, then a
+        // further unchanged read denies again.
+        let deny_env = || {
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": REREAD_DENIAL_MESSAGE,
+                }
+            })
+        };
         let second = run_hook("droid", ev_big.to_string().as_bytes());
-        assert_eq!(REREAD_MESSAGE, second["hookSpecificOutput"]["additionalContext"]);
+        assert_eq!(deny_env(), second);
+        assert!(second["hookSpecificOutput"].get("additionalContext").is_none());
+        assert_eq!(json!({}), run_hook("droid", ev_big.to_string().as_bytes()));
+        let fourth = run_hook("droid", ev_big.to_string().as_bytes());
+        assert_eq!(deny_env(), fourth);
 
-        // Partial read on large file passes silently.
+        // An edit while a denial is pending clears it: the next read is the
+        // advisory again, and the one after denies once more.
+        fs::write(&big_rs, "fn b() {}\n".repeat(220)).unwrap();
+        let fifth = run_hook("droid", ev_big.to_string().as_bytes());
+        let fifth_ctx = fifth["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("advisory after edit");
+        assert!(fifth_ctx.contains("220 lines"), "{fifth_ctx}");
+        assert!(fifth["hookSpecificOutput"].get("permissionDecision").is_none());
+        let sixth = run_hook("droid", ev_big.to_string().as_bytes());
+        assert_eq!(deny_env(), sixth);
+
+        // Identical ranges on a large file deny once too, on their own key;
+        // a different range is a first read and passes.
+        let range = |offset: u64, limit: u64| {
+            json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "big.rs", "offset": offset, "limit": limit},
+                "cwd": repo,
+                "session_id": "s-large",
+            })
+        };
+        assert_eq!(json!({}), run_hook("droid", range(1, 50).to_string().as_bytes()));
+        assert_eq!(deny_env(), run_hook("droid", range(1, 50).to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook("droid", range(1, 50).to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook("droid", range(51, 50).to_string().as_bytes()));
+        // Range reads never touched the whole-file key: its pending denial
+        // resolves as the allowed retry, then denies again.
+        assert_eq!(json!({}), run_hook("droid", ev_big.to_string().as_bytes()));
+        assert_eq!(deny_env(), run_hook("droid", ev_big.to_string().as_bytes()));
+
+        // Partial read on large file with a fresh range passes silently.
         let partial = json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "Read",
-            "tool_input": {"file_path": "big.rs", "offset": 1, "limit": 50},
+            "tool_input": {"file_path": "big.rs", "offset": 1, "limit": 10},
             "cwd": repo,
             "session_id": "s-large",
         });
@@ -2831,7 +3039,8 @@ mod tests {
         let env_reply = run_hook("droid", ev_env.to_string().as_bytes());
         assert_eq!("ask", env_reply["hookSpecificOutput"]["permissionDecision"]);
 
-        // PROMETHEUS_KIT_NO_READ_HINT=1 suppresses advisory on first read, keeps reread warning.
+        // PROMETHEUS_KIT_NO_READ_HINT=1 suppresses the advisory on first read;
+        // the deny-once reread guard is unaffected.
         {
             let _no_hint = EnvOverride::set(&[("PROMETHEUS_KIT_NO_READ_HINT", Some("1"))]);
             let hinted_rs = repo.join("hinted.rs");
@@ -2845,7 +3054,137 @@ mod tests {
             });
             assert_eq!(json!({}), run_hook("droid", ev_hint.to_string().as_bytes()));
             let second_hint = run_hook("droid", ev_hint.to_string().as_bytes());
-            assert_eq!(REREAD_MESSAGE, second_hint["hookSpecificOutput"]["additionalContext"]);
+            assert_eq!(
+                "deny",
+                second_hint["hookSpecificOutput"]["permissionDecision"]
+            );
         }
+    }
+
+    #[test]
+    fn reread_denial_uses_each_host_envelope() {
+        assert!(REREAD_DENIAL_MESSAGE.contains("prometheus-kit slice"));
+        let _g = env_guard();
+        let tmp = TempDir::new("deny_hosts");
+        let rt = tmp.0.join("xdg");
+        fs::create_dir_all(&rt).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _env = EnvOverride::set(&[
+            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
+            ("CURSOR_PROJECT_DIR", None),
+            ("DEVIN_PROJECT_DIR", None),
+            ("GROK_SESSION_ID", None),
+        ]);
+        let repo = tmp.0.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("big.rs"), "fn a() {}\n".repeat(220)).unwrap();
+
+        for (host, session) in [
+            ("claude", "s-deny-claude"),
+            ("cursor", "s-deny-cursor"),
+            ("devin", "s-deny-devin"),
+            ("droid", "s-deny-droid"),
+            ("muse", "s-deny-muse"),
+        ] {
+            let ev = match host {
+                "cursor" => json!({
+                    "hook_event_name": "preToolUse",
+                    "tool_name": "Read",
+                    "tool_input": {"path": "big.rs"},
+                    "workspace_roots": [repo],
+                    "conversation_id": session,
+                }),
+                "devin" => json!({
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "read",
+                    "tool_input": {"file_path": "big.rs"},
+                    "cwd": repo,
+                    "session_id": session,
+                }),
+                _ => json!({
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "big.rs"},
+                    "cwd": repo,
+                    "session_id": session,
+                }),
+            };
+            let bytes = ev.to_string().into_bytes();
+            // First read is never a denial (advisory or pass).
+            let first = run_hook(host, &bytes);
+            let first_text = first.to_string();
+            assert!(
+                !first_text.contains("\"deny\"") && !first_text.contains("\"block\""),
+                "host={host} first={first}"
+            );
+            let second = run_hook(host, &bytes);
+            let expected = match host {
+                "claude" | "droid" | "muse" => json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": REREAD_DENIAL_MESSAGE,
+                    }
+                }),
+                "devin" => json!({"decision": "block", "reason": REREAD_DENIAL_MESSAGE}),
+                "cursor" => json!({
+                    "permission": "deny",
+                    "user_message": REREAD_DENIAL_MESSAGE,
+                    "agent_message": REREAD_DENIAL_MESSAGE,
+                }),
+                _ => unreachable!(),
+            };
+            assert_eq!(expected, second, "host={host}");
+            assert_eq!(json!({}), run_hook(host, &bytes), "host={host} retry");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reread_denial_fails_open_when_state_cannot_advance() {
+        use std::os::unix::fs::PermissionsExt;
+        if my_uid() == 0 {
+            // Root ignores directory permission bits; the fail-open path is
+            // covered by the non-root run.
+            return;
+        }
+        let _g = env_guard();
+        let tmp = TempDir::new("deny_failopen");
+        let rt = tmp.0.join("xdg");
+        fs::create_dir_all(&rt).unwrap();
+        fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
+        let _env = EnvOverride::set(&[("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap()))]);
+        let repo = tmp.0.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("big.rs"), "fn a() {}\n".repeat(220)).unwrap();
+        let session = "s-failopen";
+        let folder = rt.join("prometheus").join(session);
+        let ev = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "big.rs"},
+            "cwd": repo,
+            "session_id": session,
+        });
+        let bytes = ev.to_string().into_bytes();
+        // First read stores (digest, false) and warns.
+        let first = run_hook("claude", &bytes);
+        assert!(first["hookSpecificOutput"]["additionalContext"].is_string());
+        // Lock the session dir read-only: the denial marker cannot be
+        // written, so the guard must fail open — never deny.
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o500)).unwrap();
+        for _ in 0..2 {
+            let reply = run_hook("claude", &bytes);
+            assert_ne!(
+                "deny",
+                reply["hookSpecificOutput"]["permissionDecision"],
+                "unwritable state must never deny"
+            );
+        }
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
     }
 }

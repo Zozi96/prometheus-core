@@ -46,7 +46,9 @@ multiple distinct markers report `standalone`.
 
 What counts: shell command rewrites (original command bytes → replacement
 bytes), large-read advisories and reread warnings (zero raw bytes → warning
-length), and at most one row per `compact`, `outline`, `slice`, `search`,
+length), reread denials (estimated read bytes → denial message length),
+allowed retries (zero raw bytes → the same estimate, cancelling the denial's
+credit), and at most one row per `compact`, `outline`, `slice`, `search`,
 `diff`, or `map` invocation whose output was actually reduced or clipped —
 `compact` counts every compaction including render overhead. For command
 rows `raw_bytes` minus `emitted_bytes` is the measured saving; warning rows

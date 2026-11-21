@@ -1,3 +1,4 @@
+use prometheus_core::hook::REREAD_DENIAL_MESSAGE;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -696,27 +697,27 @@ fn rewrite_event(tool: &str, cwd: &Path, session: &str) -> Value {
     })
 }
 
-fn read_event(host: &str, cwd: &Path) -> Value {
+fn read_event(host: &str, cwd: &Path, file: &str) -> Value {
     let session = format!("sess-{host}");
     match host {
         "cursor" => serde_json::json!({
             "hook_event_name": "preToolUse",
             "tool_name": "Read",
-            "tool_input": {"path": "big.rs"},
+            "tool_input": {"path": file},
             "workspace_roots": [cwd.to_str().unwrap()],
             "conversation_id": session,
         }),
         "devin" => serde_json::json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "read",
-            "tool_input": {"file_path": "big.rs"},
+            "tool_input": {"file_path": file},
             "cwd": cwd.to_str().unwrap(),
             "session_id": session,
         }),
         _ => serde_json::json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "Read",
-            "tool_input": {"file_path": "big.rs"},
+            "tool_input": {"file_path": file},
             "cwd": cwd.to_str().unwrap(),
             "session_id": session,
         }),
@@ -780,32 +781,96 @@ fn metrics_records_shell_rewrite_for_rewrite_hosts() {
 }
 
 #[test]
-fn metrics_records_read_warnings_for_all_hosts() {
-    let home = MetricsHome::new("warn_metrics");
+fn metrics_records_read_denials_for_all_hosts() {
+    let home = MetricsHome::new("deny_metrics");
     let mut big = String::new();
     for i in 0..250 {
         big.push_str(&format!("fn func_{i}() {{}}\n"));
     }
-    fs::write(home.repo.join("big.rs"), big).unwrap();
+    fs::write(home.repo.join("big.rs"), &big).unwrap();
+    let big_bytes = big.len() as u64;
+    fs::write(home.repo.join("small.rs"), "fn s() {}\n".repeat(10)).unwrap();
 
     for host in ["claude", "cursor", "devin", "droid", "muse"] {
-        let ev = read_event(host, &home.repo);
-        for _ in 0..2 {
+        let ev = read_event(host, &home.repo, "big.rs");
+        for _ in 0..3 {
             let out = home.hook(host, &ev);
             assert_eq!(out.status.code(), Some(0), "host={host}");
+        }
+        let small = read_event(host, &home.repo, "small.rs");
+        for _ in 0..2 {
+            let out = home.hook(host, &small);
+            assert_eq!(out.status.code(), Some(0), "host={host}");
+        }
+        if host == "claude" {
+            // An identical range on the same large file denies once on its
+            // own state key and estimates only the requested slice.
+            let range_ev = serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "big.rs", "offset": 0, "limit": 50},
+                "cwd": home.repo.to_str().unwrap(),
+                "session_id": "sess-claude",
+            });
+            for _ in 0..3 {
+                let out = home.hook(host, &range_ev);
+                assert_eq!(out.status.code(), Some(0), "host={host}");
+            }
         }
     }
 
     let rows = home.rows();
-    assert_eq!(rows.len(), 10, "rows: {rows:?}");
-    for host in ["claude", "cursor", "devin", "droid", "muse"] {
-        for rule in ["large-read-advisory", "reread-warning"] {
-            let row = find_row(&rows, host, rule);
-            assert_metric_row_keys(row);
-            assert_eq!(row["raw_bytes"].as_u64().unwrap(), 0);
-            assert!(row["emitted_bytes"].as_u64().unwrap() > 0);
-        }
+    // Per host: advisory + denial + allowed-retry (big.rs) + reread-warning
+    // (small.rs) = 4 rows; claude adds a range denial + allowed-retry = 22.
+    assert_eq!(rows.len(), 22, "rows: {rows:?}");
+    for row in &rows {
+        assert_metric_row_keys(row);
     }
+    let range_estimate = (big_bytes as u128 * 50 / 250) as u64;
+    for host in ["claude", "cursor", "devin", "droid", "muse"] {
+        let advisory = find_row(&rows, host, "large-read-advisory");
+        assert_eq!(advisory["raw_bytes"].as_u64().unwrap(), 0);
+        assert!(advisory["emitted_bytes"].as_u64().unwrap() > 0);
+
+        let denial = find_row(&rows, host, "reread-denial");
+        assert_eq!(denial["raw_bytes"].as_u64().unwrap(), big_bytes);
+        assert_eq!(
+            denial["emitted_bytes"].as_u64().unwrap(),
+            REREAD_DENIAL_MESSAGE.len() as u64
+        );
+
+        let retry = find_row(&rows, host, "allowed-retry");
+        assert_eq!(retry["raw_bytes"].as_u64().unwrap(), 0);
+        assert_eq!(retry["emitted_bytes"].as_u64().unwrap(), big_bytes);
+
+        let warning = find_row(&rows, host, "reread-warning");
+        assert_eq!(warning["raw_bytes"].as_u64().unwrap(), 0);
+        assert!(warning["emitted_bytes"].as_u64().unwrap() > 0);
+    }
+
+    // Claude's range reads produced their own denial/retry pair with the
+    // proportional byte estimate.
+    let range_denial = rows
+        .iter()
+        .find(|row| {
+            row["host"].as_str() == Some("claude")
+                && row["rule_id"].as_str() == Some("reread-denial")
+                && row["raw_bytes"].as_u64() == Some(range_estimate)
+        })
+        .expect("missing range reread-denial row");
+    assert_eq!(
+        range_denial["emitted_bytes"].as_u64().unwrap(),
+        REREAD_DENIAL_MESSAGE.len() as u64
+    );
+    let range_retry = rows
+        .iter()
+        .find(|row| {
+            row["host"].as_str() == Some("claude")
+                && row["rule_id"].as_str() == Some("allowed-retry")
+                && row["emitted_bytes"].as_u64() == Some(range_estimate)
+        })
+        .expect("missing range allowed-retry row");
+    assert_eq!(range_retry["raw_bytes"].as_u64().unwrap(), 0);
 }
 
 #[test]
