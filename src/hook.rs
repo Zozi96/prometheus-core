@@ -191,7 +191,7 @@ fn secret_denied(raw: Option<&Value>) -> String {
     secret_path_denied(&path)
 }
 
-fn glob_secret_denied(token: &str) -> String {
+fn glob_secret_denied(token: &str, allow_bare_dot: bool) -> String {
     let chars: Vec<char> = token.chars().collect();
     let cut = chars
         .iter()
@@ -209,6 +209,9 @@ fn glob_secret_denied(token: &str) -> String {
         return String::new();
     }
     let base = casefold(prefix.replace('\\', "/").rsplit('/').next().unwrap_or(""));
+    if allow_bare_dot && base == "." {
+        return String::new();
+    }
     if !base.starts_with('.') && !base.starts_with("id_") && base.chars().count() < 4 {
         return String::new();
     }
@@ -222,13 +225,13 @@ fn glob_secret_denied(token: &str) -> String {
     String::new()
 }
 
-pub(crate) fn command_token_denied(token: &str) -> String {
+fn command_token_denied_opts(token: &str, allow_bare_dot: bool) -> String {
     for candidate in token.split('=') {
         let reason = secret_denied(Some(&Value::String(candidate.to_string())));
         if !reason.is_empty() {
             return reason;
         }
-        let reason = glob_secret_denied(candidate);
+        let reason = glob_secret_denied(candidate, allow_bare_dot);
         if !reason.is_empty() {
             return reason;
         }
@@ -237,7 +240,7 @@ pub(crate) fn command_token_denied(token: &str) -> String {
             let head = &candidate[..colon];
             let tail = &candidate[colon + 1..];
             if !head.is_empty() && !head.chars().any(char::is_whitespace) && !tail.is_empty() {
-                let reason = command_token_denied(tail);
+                let reason = command_token_denied_opts(tail, allow_bare_dot);
                 if !reason.is_empty() {
                     return reason;
                 }
@@ -245,6 +248,10 @@ pub(crate) fn command_token_denied(token: &str) -> String {
         }
     }
     String::new()
+}
+
+pub(crate) fn command_token_denied(token: &str) -> String {
+    command_token_denied_opts(token, false)
 }
 
 fn is_command_split(c: char) -> bool {
@@ -436,21 +443,822 @@ fn posix_decoded_tokens(command: &str) -> Vec<String> {
     tokens
 }
 
-fn secret_command_denied(command: Option<&Value>) -> String {
-    let Some(command) = command.and_then(Value::as_str) else {
-        return String::new();
+#[derive(Clone, Debug)]
+struct StageWord {
+    start: usize,
+    end: usize,
+    value: String,
+    has_quotes: bool,
+    has_unquoted_glob: bool,
+}
+
+fn parse_stage_word(
+    chars: &[(usize, char)],
+    i: &mut usize,
+    total_len: usize,
+) -> Option<StageWord> {
+    let start = chars[*i].0;
+    let mut value = String::new();
+    let mut has_quotes = false;
+    let mut has_unquoted_glob = false;
+
+    while *i < chars.len() {
+        let ch = chars[*i].1;
+        if matches!(
+            ch,
+            ' ' | '\t' | '\r' | '\n' | ';' | '|' | '&' | '<' | '>'
+        ) {
+            break;
+        }
+        if matches!(ch, '(' | ')' | '{' | '}' | '`' | '$') {
+            return None;
+        }
+        if ch == '\'' {
+            has_quotes = true;
+            *i += 1;
+            while *i < chars.len() && chars[*i].1 != '\'' {
+                value.push(chars[*i].1);
+                *i += 1;
+            }
+            if *i >= chars.len() {
+                return None;
+            }
+            *i += 1;
+            continue;
+        }
+        if ch == '"' {
+            has_quotes = true;
+            *i += 1;
+            while *i < chars.len() && chars[*i].1 != '"' {
+                let dch = chars[*i].1;
+                if dch == '`' {
+                    return None;
+                }
+                if dch == '$' {
+                    // Only allow a literal end-of-line regex anchor right before closing `"`.
+                    if *i + 1 < chars.len() && chars[*i + 1].1 == '"' {
+                        value.push('$');
+                        *i += 1;
+                        continue;
+                    }
+                    return None;
+                }
+                if dch == '\\' {
+                    if *i + 1 >= chars.len() {
+                        return None;
+                    }
+                    let next = chars[*i + 1].1;
+                    if next == '\n' {
+                        *i += 2;
+                    } else if matches!(next, '"' | '\\' | '$' | '`') {
+                        value.push(next);
+                        *i += 2;
+                    } else {
+                        value.push('\\');
+                        value.push(next);
+                        *i += 2;
+                    }
+                    continue;
+                }
+                value.push(dch);
+                *i += 1;
+            }
+            if *i >= chars.len() {
+                return None;
+            }
+            *i += 1;
+            continue;
+        }
+        if ch == '\\' {
+            if *i + 1 >= chars.len() {
+                return None;
+            }
+            if chars[*i + 1].1 != '\n' {
+                value.push(chars[*i + 1].1);
+            }
+            *i += 2;
+            continue;
+        }
+        if matches!(ch, '*' | '?') {
+            has_unquoted_glob = true;
+        }
+        value.push(ch);
+        *i += 1;
+    }
+
+    let end = if *i < chars.len() {
+        chars[*i].0
+    } else {
+        total_len
     };
-    let stripped: String = command
+    Some(StageWord {
+        start,
+        end,
+        value,
+        has_quotes,
+        has_unquoted_glob,
+    })
+}
+
+/// Tokenize simple pipeline/list stages, failing closed (`None`) on subshells,
+/// command/parameter expansions, heredocs, or unclosed quotes.
+fn parse_shell_stages(command: &str) -> Option<Vec<Vec<StageWord>>> {
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let mut stages = Vec::new();
+    let mut cur_stage = Vec::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let ch = chars[i].1;
+        if matches!(ch, ' ' | '\t' | '\r') {
+            i += 1;
+            continue;
+        }
+        if matches!(ch, ';' | '\n') {
+            if !cur_stage.is_empty() {
+                stages.push(std::mem::take(&mut cur_stage));
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '|' || ch == '&' {
+            if i + 1 < chars.len() && chars[i + 1].1 == ch {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            if !cur_stage.is_empty() {
+                stages.push(std::mem::take(&mut cur_stage));
+            }
+            continue;
+        }
+        if matches!(ch, '(' | ')' | '{' | '}' | '`' | '$') {
+            return None;
+        }
+        // Check IO_NUMBER redirection (`2>&1`, `2>/dev/null`, `0<in`) or bare `<` / `>`.
+        let mut redir_at = None;
+        if matches!(ch, '<' | '>') {
+            redir_at = Some(i);
+        } else if ch.is_ascii_digit() {
+            let mut j = i;
+            while j < chars.len() && chars[j].1.is_ascii_digit() {
+                j += 1;
+            }
+            if j < chars.len() && matches!(chars[j].1, '<' | '>') {
+                redir_at = Some(j);
+            }
+        }
+        if let Some(at) = redir_at {
+            let rch = chars[at].1;
+            i = at + 1;
+            if rch == '<' {
+                if i < chars.len() && chars[i].1 == '<' {
+                    return None; // heredoc / here-string
+                }
+                if i < chars.len() && chars[i].1 == '&' {
+                    i += 1;
+                }
+            } else if i < chars.len() && matches!(chars[i].1, '>' | '&' | '|') {
+                i += 1;
+            }
+            while i < chars.len() && matches!(chars[i].1, ' ' | '\t' | '\r') {
+                i += 1;
+            }
+            if i >= chars.len() {
+                return None;
+            }
+            let target = parse_stage_word(&chars, &mut i, command.len())?;
+            if target.value.is_empty() && !target.has_quotes {
+                return None;
+            }
+            continue;
+        }
+
+        let word = parse_stage_word(&chars, &mut i, command.len())?;
+        cur_stage.push(word);
+    }
+
+    if !cur_stage.is_empty() {
+        stages.push(cur_stage);
+    }
+    Some(stages)
+}
+
+fn is_env_assignment_word(text: &str) -> bool {
+    let Some((name, _)) = text.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn skip_sed_delimited(chars: &[char], i: &mut usize, delim: char) -> bool {
+    while *i < chars.len() {
+        if chars[*i] == '\\' {
+            if *i + 1 >= chars.len() {
+                return false;
+            }
+            *i += 2;
+            continue;
+        }
+        if chars[*i] == delim {
+            *i += 1;
+            return true;
+        }
+        *i += 1;
+    }
+    false
+}
+
+fn skip_sed_addr(chars: &[char], i: &mut usize) -> bool {
+    if *i >= chars.len() {
+        return true;
+    }
+    if chars[*i].is_ascii_digit() {
+        while *i < chars.len() && chars[*i].is_ascii_digit() {
+            *i += 1;
+        }
+    } else if chars[*i] == '$' {
+        *i += 1;
+    } else if chars[*i] == '/' {
+        *i += 1;
+        if !skip_sed_delimited(chars, i, '/') {
+            return false;
+        }
+    }
+    true
+}
+
+/// Allow only pure `sed` `s` substitutions (without `e`/`w` flags) and `[dpq=]`
+/// commands so GNU `sed`'s `e` shell-execution and `r`/`w` file commands stay blocked.
+fn is_safe_sed_script(script: &str) -> bool {
+    let chars: Vec<char> = script.chars().collect();
+    let mut i = 0usize;
+    let mut saw_cmd = false;
+
+    while i < chars.len() {
+        while i < chars.len() && matches!(chars[i], ' ' | '\t' | ';') {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        if !skip_sed_addr(&chars, &mut i) {
+            return false;
+        }
+        while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+            i += 1;
+        }
+        if i < chars.len() && chars[i] == ',' {
+            i += 1;
+            while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+                i += 1;
+            }
+            if !skip_sed_addr(&chars, &mut i) {
+                return false;
+            }
+            while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+                i += 1;
+            }
+        }
+        if i < chars.len() && chars[i] == '!' {
+            i += 1;
+            while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+                i += 1;
+            }
+        }
+        if i >= chars.len() {
+            return false;
+        }
+        match chars[i] {
+            'd' | 'p' | 'q' | '=' => {
+                i += 1;
+                saw_cmd = true;
+            }
+            's' => {
+                i += 1;
+                if i >= chars.len() {
+                    return false;
+                }
+                let delim = chars[i];
+                if delim.is_alphanumeric() || delim == '\\' || delim.is_whitespace() {
+                    return false;
+                }
+                i += 1;
+                if !skip_sed_delimited(&chars, &mut i, delim)
+                    || !skip_sed_delimited(&chars, &mut i, delim)
+                {
+                    return false;
+                }
+                while i < chars.len()
+                    && (chars[i].is_ascii_digit()
+                        || matches!(chars[i], 'g' | 'p' | 'I' | 'i' | 'm' | 'M'))
+                {
+                    i += 1;
+                }
+                saw_cmd = true;
+            }
+            _ => return false,
+        }
+        while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+            i += 1;
+        }
+        if i < chars.len() && chars[i] != ';' {
+            return false;
+        }
+    }
+    saw_cmd
+}
+
+fn rg_or_grep_regex_spans(words: &[StageWord], is_rg: bool) -> Vec<(usize, usize)> {
+    const RG_BOOL_SHORT: &[char] = &[
+        'a', 'b', 'c', 'F', 'H', 'i', 'I', 'l', 'L', 'n', 'N', 'o', 'p', 'q', 's', 'S', 'u', 'v',
+        'w', 'x', '0', '.', 'U', 'P', 'z',
+    ];
+    const RG_VAL_SHORT: &[char] = &[
+        'A', 'B', 'C', 'd', 'E', 'f', 'g', 'j', 'm', 'M', 'r', 't', 'T',
+    ];
+    const RG_BOOL_LONG: &[&str] = &[
+        "--ignore-case",
+        "--case-sensitive",
+        "--smart-case",
+        "--fixed-strings",
+        "--word-regexp",
+        "--line-regexp",
+        "--invert-match",
+        "--count",
+        "--count-matches",
+        "--files-with-matches",
+        "--files-without-match",
+        "--with-filename",
+        "--no-filename",
+        "--line-number",
+        "--no-line-number",
+        "--column",
+        "--no-column",
+        "--heading",
+        "--no-heading",
+        "--hidden",
+        "--no-ignore",
+        "--no-ignore-vcs",
+        "--no-ignore-dot",
+        "--no-ignore-global",
+        "--no-ignore-parent",
+        "--no-ignore-files",
+        "--unrestricted",
+        "--text",
+        "--multiline",
+        "--multiline-dotall",
+        "--pcre2",
+        "--only-matching",
+        "--passthru",
+        "--null",
+        "--null-data",
+        "--quiet",
+        "--stats",
+        "--trim",
+        "--no-config",
+        "--no-unicode",
+        "--json",
+        "--vimgrep",
+        "--byte-offset",
+        "--follow",
+        "--one-file-system",
+        "--binary",
+        "--search-zip",
+        "--mmap",
+        "--no-mmap",
+        "--block-buffered",
+        "--line-buffered",
+    ];
+    const RG_VAL_LONG: &[&str] = &[
+        "--context",
+        "--after-context",
+        "--before-context",
+        "--glob",
+        "--iglob",
+        "--type",
+        "--type-not",
+        "--type-add",
+        "--type-clear",
+        "--max-count",
+        "--max-depth",
+        "--max-filesize",
+        "--max-columns",
+        "--replace",
+        "--threads",
+        "--color",
+        "--colors",
+        "--encoding",
+        "--dfa-size-limit",
+        "--regex-size-limit",
+        "--path-separator",
+        "--field-match-separator",
+        "--field-context-separator",
+        "--context-separator",
+        "--sort",
+        "--sortr",
+        "--ignore-file",
+    ];
+
+    const GREP_BOOL_SHORT: &[char] = &[
+        'E', 'F', 'G', 'P', 'i', 'v', 'w', 'x', 'c', 'L', 'l', 'n', 'H', 'h', 'o', 'q', 's', 'b',
+        'I', 'a', 'U', 'z', 'Z', 'r', 'R', 'T', 'u', 'J',
+    ];
+    const GREP_VAL_SHORT: &[char] = &['m', 'A', 'B', 'C', 'd', 'D'];
+    const GREP_BOOL_LONG: &[&str] = &[
+        "--extended-regexp",
+        "--fixed-strings",
+        "--basic-regexp",
+        "--perl-regexp",
+        "--ignore-case",
+        "--no-ignore-case",
+        "--invert-match",
+        "--word-regexp",
+        "--line-regexp",
+        "--count",
+        "--files-without-match",
+        "--files-with-matches",
+        "--line-number",
+        "--with-filename",
+        "--no-filename",
+        "--only-matching",
+        "--quiet",
+        "--silent",
+        "--no-messages",
+        "--byte-offset",
+        "--text",
+        "--recursive",
+        "--dereference-recursive",
+        "--null",
+        "--null-data",
+        "--line-buffered",
+    ];
+    const GREP_VAL_LONG: &[&str] = &[
+        "--max-count",
+        "--after-context",
+        "--before-context",
+        "--context",
+        "--color",
+        "--colour",
+        "--include",
+        "--exclude",
+        "--exclude-dir",
+        "--exclude-from",
+        "--label",
+        "--directories",
+        "--devices",
+        "--binary-files",
+    ];
+
+    let (bool_short, val_short, bool_long, val_long) = if is_rg {
+        (RG_BOOL_SHORT, RG_VAL_SHORT, RG_BOOL_LONG, RG_VAL_LONG)
+    } else {
+        (
+            GREP_BOOL_SHORT,
+            GREP_VAL_SHORT,
+            GREP_BOOL_LONG,
+            GREP_VAL_LONG,
+        )
+    };
+
+    let mut spans = Vec::new();
+    let mut has_explicit_pattern = false;
+    let mut saw_positional = false;
+    let mut after_dd = false;
+    let mut i = 1usize;
+
+    while i < words.len() {
+        let w = &words[i];
+        let arg = w.value.as_str();
+        if !after_dd {
+            if arg == "--" {
+                after_dd = true;
+                i += 1;
+                continue;
+            }
+            if arg == "-e" || arg == "--regexp" {
+                let Some(pat) = words.get(i + 1) else {
+                    return Vec::new();
+                };
+                has_explicit_pattern = true;
+                if pat.has_quotes && !pat.has_unquoted_glob {
+                    spans.push((pat.start, pat.end));
+                }
+                i += 2;
+                continue;
+            }
+            if arg.starts_with("--regexp=") {
+                has_explicit_pattern = true;
+                if w.has_quotes && !w.has_unquoted_glob {
+                    spans.push((w.start, w.end));
+                }
+                i += 1;
+                continue;
+            }
+            if arg == "-f" || arg == "--file" {
+                if words.get(i + 1).is_none() {
+                    return Vec::new();
+                }
+                has_explicit_pattern = true;
+                i += 2;
+                continue;
+            }
+            if arg.starts_with("--file=") {
+                has_explicit_pattern = true;
+                i += 1;
+                continue;
+            }
+            if arg.starts_with("--") {
+                if bool_long.contains(&arg) {
+                    i += 1;
+                    continue;
+                }
+                if val_long.contains(&arg) {
+                    if words.get(i + 1).is_none() {
+                        return Vec::new();
+                    }
+                    i += 2;
+                    continue;
+                }
+                if let Some((flag, _)) = arg.split_once('=') {
+                    if val_long.contains(&flag) {
+                        i += 1;
+                        continue;
+                    }
+                }
+                return Vec::new();
+            }
+            if arg.starts_with('-') && arg.len() > 1 {
+                let mut fchars = arg[1..].chars();
+                while let Some(fc) = fchars.next() {
+                    if fc == 'e' {
+                        has_explicit_pattern = true;
+                        let rest: String = fchars.collect();
+                        if rest.is_empty() {
+                            let Some(pat) = words.get(i + 1) else {
+                                return Vec::new();
+                            };
+                            if pat.has_quotes && !pat.has_unquoted_glob {
+                                spans.push((pat.start, pat.end));
+                            }
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                        break;
+                    }
+                    if fc == 'f' {
+                        has_explicit_pattern = true;
+                        let rest: String = fchars.collect();
+                        if rest.is_empty() {
+                            if words.get(i + 1).is_none() {
+                                return Vec::new();
+                            }
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                        break;
+                    }
+                    if val_short.contains(&fc) {
+                        let rest: String = fchars.collect();
+                        if rest.is_empty() {
+                            if words.get(i + 1).is_none() {
+                                return Vec::new();
+                            }
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                        break;
+                    }
+                    if !bool_short.contains(&fc) {
+                        return Vec::new();
+                    }
+                    if fchars.as_str().is_empty() {
+                        i += 1;
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+
+        // Positional operand: only the first positional (when no -e/-f was passed) is the regex.
+        if !has_explicit_pattern && !saw_positional && w.has_quotes && !w.has_unquoted_glob {
+            spans.push((w.start, w.end));
+        }
+        saw_positional = true;
+        i += 1;
+    }
+
+    spans
+}
+
+fn sed_script_spans(words: &[StageWord]) -> Vec<(usize, usize)> {
+    const SED_BOOL_SHORT: &[char] = &['n', 'E', 'r', 'u', 'z', 'b', 's'];
+    const SED_BOOL_LONG: &[&str] = &[
+        "--quiet",
+        "--silent",
+        "--regexp-extended",
+        "--posix",
+        "--sandbox",
+        "--unbuffered",
+        "--null-data",
+        "--separate",
+        "--follow-symlinks",
+        "--in-place",
+    ];
+
+    let mut spans = Vec::new();
+    let mut has_explicit_script = false;
+    let mut saw_positional = false;
+    let mut after_dd = false;
+    let mut i = 1usize;
+
+    while i < words.len() {
+        let w = &words[i];
+        let arg = w.value.as_str();
+        if !after_dd {
+            if arg == "--" {
+                after_dd = true;
+                i += 1;
+                continue;
+            }
+            if arg == "-e" || arg == "--expression" {
+                let Some(scr) = words.get(i + 1) else {
+                    return Vec::new();
+                };
+                has_explicit_script = true;
+                if scr.has_quotes && !scr.has_unquoted_glob && is_safe_sed_script(&scr.value) {
+                    spans.push((scr.start, scr.end));
+                }
+                i += 2;
+                continue;
+            }
+            if let Some(scr_val) = arg.strip_prefix("--expression=") {
+                has_explicit_script = true;
+                if w.has_quotes && !w.has_unquoted_glob && is_safe_sed_script(scr_val) {
+                    spans.push((w.start, w.end));
+                }
+                i += 1;
+                continue;
+            }
+            if arg == "-f" || arg == "--file" {
+                if words.get(i + 1).is_none() {
+                    return Vec::new();
+                }
+                has_explicit_script = true;
+                i += 2;
+                continue;
+            }
+            if arg.starts_with("--file=") {
+                has_explicit_script = true;
+                i += 1;
+                continue;
+            }
+            if arg == "-l" || arg == "--line-length" {
+                if words.get(i + 1).is_none() {
+                    return Vec::new();
+                }
+                i += 2;
+                continue;
+            }
+            if arg.starts_with("--line-length=") || arg.starts_with("--in-place=") {
+                i += 1;
+                continue;
+            }
+            if arg.starts_with("--") {
+                if SED_BOOL_LONG.contains(&arg) {
+                    i += 1;
+                    continue;
+                }
+                return Vec::new();
+            }
+            if arg.starts_with("-i") {
+                i += 1;
+                continue;
+            }
+            if arg.starts_with('-') && arg.len() > 1 {
+                let mut fchars = arg[1..].chars();
+                while let Some(fc) = fchars.next() {
+                    if fc == 'e' {
+                        has_explicit_script = true;
+                        let rest: String = fchars.collect();
+                        if rest.is_empty() {
+                            let Some(scr) = words.get(i + 1) else {
+                                return Vec::new();
+                            };
+                            if scr.has_quotes
+                                && !scr.has_unquoted_glob
+                                && is_safe_sed_script(&scr.value)
+                            {
+                                spans.push((scr.start, scr.end));
+                            }
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                        break;
+                    }
+                    if fc == 'f' || fc == 'l' {
+                        if fc == 'f' {
+                            has_explicit_script = true;
+                        }
+                        let rest: String = fchars.collect();
+                        if rest.is_empty() {
+                            if words.get(i + 1).is_none() {
+                                return Vec::new();
+                            }
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                        break;
+                    }
+                    if !SED_BOOL_SHORT.contains(&fc) {
+                        return Vec::new();
+                    }
+                    if fchars.as_str().is_empty() {
+                        i += 1;
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+
+        if !has_explicit_script
+            && !saw_positional
+            && w.has_quotes
+            && !w.has_unquoted_glob
+            && is_safe_sed_script(arg)
+        {
+            spans.push((w.start, w.end));
+        }
+        saw_positional = true;
+        i += 1;
+    }
+
+    spans
+}
+
+/// Identify byte spans of quoted regex / safe `sed` script operands in simple
+/// `rg`, `grep`/`egrep`/`fgrep`, and `sed`/`gsed` commands.
+fn quoted_regex_spans(command: &str) -> Vec<(usize, usize)> {
+    let Some(stages) = parse_shell_stages(command) else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    for stage in &stages {
+        let mut idx = 0usize;
+        while idx < stage.len()
+            && !stage[idx].has_unquoted_glob
+            && is_env_assignment_word(&stage[idx].value)
+        {
+            idx += 1;
+        }
+        let Some(cmd_word) = stage.get(idx) else {
+            continue;
+        };
+        if cmd_word.has_unquoted_glob {
+            continue;
+        }
+        let bin = casefold(
+            cmd_word
+                .value
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(""),
+        );
+        let tail = &stage[idx..];
+        match bin.as_str() {
+            "rg" => spans.extend(rg_or_grep_regex_spans(tail, true)),
+            "grep" | "egrep" | "fgrep" => spans.extend(rg_or_grep_regex_spans(tail, false)),
+            "sed" | "gsed" => spans.extend(sed_script_spans(tail)),
+            _ => {}
+        }
+    }
+    spans
+}
+
+fn scan_command_segment(segment: &str, allow_bare_dot: bool) -> String {
+    let stripped: String = segment
         .chars()
         .filter(|c| !matches!(c, '"' | '\'' | '`'))
         .collect();
     for token in split_command(&stripped) {
-        let reason = command_token_denied(&token);
+        let reason = command_token_denied_opts(&token, allow_bare_dot);
         if !reason.is_empty() {
             return reason;
         }
     }
-    let chars: Vec<char> = command.chars().collect();
+    let chars: Vec<char> = segment.chars().collect();
     let mut index = 0usize;
     while index < chars.len() {
         if !matches!(chars[index], '"' | '\'' | '`') {
@@ -463,7 +1271,7 @@ fn secret_command_denied(command: Option<&Value>) -> String {
         };
         let fragment: String = chars[index + 1..close].iter().collect();
         for token in split_command(&fragment) {
-            let reason = command_token_denied(&token);
+            let reason = command_token_denied_opts(&token, allow_bare_dot);
             if !reason.is_empty() {
                 return reason;
             }
@@ -474,19 +1282,44 @@ fn secret_command_denied(command: Option<&Value>) -> String {
             close
         };
     }
-    for token in posix_decoded_tokens(command) {
-        let reason = command_token_denied(&token);
+    for token in posix_decoded_tokens(segment) {
+        let reason = command_token_denied_opts(&token, allow_bare_dot);
         if !reason.is_empty() {
             return reason;
         }
         for sub in split_command(&token) {
-            let reason = command_token_denied(&sub);
+            let reason = command_token_denied_opts(&sub, allow_bare_dot);
             if !reason.is_empty() {
                 return reason;
             }
         }
     }
     String::new()
+}
+
+fn secret_command_denied(command: Option<&Value>) -> String {
+    let Some(command) = command.and_then(Value::as_str) else {
+        return String::new();
+    };
+    let spans = quoted_regex_spans(command);
+    if spans.is_empty() {
+        return scan_command_segment(command, false);
+    }
+    for &(start, end) in &spans {
+        let reason = scan_command_segment(&command[start..end], true);
+        if !reason.is_empty() {
+            return reason;
+        }
+    }
+    let mut masked = String::with_capacity(command.len());
+    let mut cursor = 0usize;
+    for &(start, end) in &spans {
+        masked.push_str(&command[cursor..start]);
+        masked.push_str("__PROM_REGEX__");
+        cursor = end;
+    }
+    masked.push_str(&command[cursor..]);
+    scan_command_segment(&masked, false)
 }
 
 fn check_keys_for_secret(source: &Map<String, Value>, keys: &[&str]) -> String {
@@ -1359,9 +2192,221 @@ mod tests {
                 "escaped={escaped}"
             );
         }
+        for secret_glob in [
+            "cat .*",
+            "cat .?*",
+            "cat .??*",
+            "cat .???",
+            "cat .?nv",
+            "cat .*local",
+            "cat .?nv.local",
+            "cat .?nv.*",
+            "cat .*production",
+            "cat .*key",
+            "cat .*/config",
+            "cat .?*/config",
+            "cat dir/.*",
+            r"cat dir\.*",
+            "cat '.'*",
+            "git show HEAD:.*",
+            "sh -c 'cat .*'",
+            "sh -c 'cat .*local'",
+            "find . -name '.*'",
+            "rg 'foo' .*",
+            "rg 'foo' .*local",
+            "rg .* src",
+            "rg '.'* src",
+            "rg -g '.*' 'foo' src",
+            "rg --glob='.*' 'foo' src",
+            "grep -r --include='.*' 'foo' src",
+            "rg -f .env '.*'",
+            "rg -n '.*' .env",
+            "rg -n '.env' src",
+            "rg -n '.e*' src",
+            "sed 'e cat .*'",
+            "sed 's/.*/cat .*/e'",
+            "cat .e*",
+            "cat .en*",
+            "cat .e?",
+            "cat .en?",
+            "cat dir/.e*",
+            "cat ./.en*",
+            "cat .n*",
+            "cat .np*",
+            "cat .h*",
+            "cat .p*",
+            "cat .ssh/*",
+            "cat keys/id_*",
+            "cat id_*",
+            "git show HEAD:.e*",
+        ] {
+            assert!(
+                !secret_command_denied(Some(&json!(secret_glob))).is_empty(),
+                "secret_glob={secret_glob}"
+            );
+        }
+        for regex_cmd in [
+            "rg -n 'fn .*keep_log' src",
+            r"sed -E 's/.*test result: ok\./ok/'",
+            "rg -n 'pub struct LineIndex|fn .*offset|fn .*line' core/src/outline/lexer.rs",
+            "rg -n 'fn .?keep_log' src",
+            r"sed -E 's/.?test result: ok\.?$/ok/'",
+            "sed -E 's/.*/ok/'",
+            "sed -E 's/^.*$/ok/'",
+            "sed -E 's/(.*)/\\1/'",
+            "rg -n 'fn .*' src",
+            "rg -n '^fn .*' src",
+            "rg -n '(.*)' src",
+            "rg -n '.*$' src",
+            "rg -n \".*$\" src",
+            "rg -n 'a|.*' src",
+            "rg -n 'foo:.*' src",
+            "rg -n 'foo=.*' src",
+            r"rg -n 'ok\.*' src",
+            "rg -n '.*keep_log' src",
+            "rg -n '.*local' src",
+            "grep -n 'fn .*keep_log' src",
+            r"cargo test 2>&1 | sed -E 's/.*test result: ok\./ok/'",
+        ] {
+            assert!(
+                secret_command_denied(Some(&json!(regex_cmd))).is_empty(),
+                "regex_cmd={regex_cmd}"
+            );
+        }
         assert!(secret_command_denied(Some(&json!("cat src/*"))).is_empty());
         assert!(secret_command_denied(Some(&json!("dotnet test"))).is_empty());
         assert!(secret_command_denied(Some(&json!("cargo test"))).is_empty());
+    }
+
+    #[test]
+    fn regex_dot_wildcards_pass_across_hosts_without_force_ask() {
+        let _g = env_guard();
+        let tmp = TempDir::new("regex_pass");
+        let _env = EnvOverride::set(&[
+            ("CURSOR_PROJECT_DIR", None),
+            ("DEVIN_PROJECT_DIR", None),
+            ("GROK_SESSION_ID", None),
+            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
+            ("PROMETHEUS_KIT_NO_REWRITE", None),
+        ]);
+        for cmd in [
+            "rg -n 'fn .*keep_log' src",
+            "rg -n '.*keep_log' src",
+            "rg -n 'fn .*' src",
+            "rg -n '(.*)' src",
+            "rg -n '.*$' src",
+            "rg -n 'foo:.*' src",
+            r"rg -n 'ok\.*' src",
+            r"sed -E 's/.*test result: ok\./ok/'",
+            "sed -E 's/(.*)/\\1/'",
+            "rg -n 'pub struct LineIndex|fn .*offset|fn .*line' core/src/outline/lexer.rs",
+            "rg -n 'fn .?keep_log' src",
+        ] {
+            let devin_ev = json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "exec",
+                "tool_input": {"command": cmd},
+                "cwd": tmp.0,
+                "session_id": "s-devin",
+            });
+            assert_eq!(
+                json!({}),
+                run_hook("devin", devin_ev.to_string().as_bytes()),
+                "devin {cmd}"
+            );
+            for host in ["claude", "droid", "muse"] {
+                let ev = json!({
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": cmd},
+                    "cwd": tmp.0,
+                    "session_id": "s-host",
+                });
+                let reply = run_hook(host, ev.to_string().as_bytes());
+                assert!(
+                    reply["hookSpecificOutput"].get("permissionDecision").is_none(),
+                    "{host} {cmd}: {reply}"
+                );
+            }
+            let cursor_ev = json!({
+                "hook_event_name": "preToolUse",
+                "tool_name": "Shell",
+                "tool_input": {"command": cmd},
+                "workspace_roots": [tmp.0],
+                "conversation_id": "s-cursor",
+            });
+            assert_eq!(
+                json!({}),
+                run_hook("cursor", cursor_ev.to_string().as_bytes()),
+                "cursor {cmd}"
+            );
+        }
+        for rw_cmd in ["rg 'fn .*keep_log' src", "rg 'fn .*' src", "rg '(.*)' src"] {
+            let rewritten = crate::hook_rewrite::rewrite_command_str(
+                rw_cmd,
+                "'/bin/prometheus-kit'",
+                false,
+                None,
+            )
+            .unwrap_or_else(|| panic!("{rw_cmd} should rewrite cleanly"));
+            assert!(rewritten.contains("search"), "{rewritten}");
+        }
+        for blocked in [
+            "rg 'foo' .e*",
+            "rg 'foo' .*",
+            "rg 'foo' .?*",
+            "rg 'foo' .*local",
+        ] {
+            assert!(
+                crate::hook_rewrite::rewrite_command_str(
+                    blocked,
+                    "'/bin/prometheus-kit'",
+                    false,
+                    None,
+                )
+                .is_none(),
+                "secret glob {blocked} must block rewrite"
+            );
+        }
+        for bare_glob in [
+            "cat .*",
+            "cat .?*",
+            "cat .??*",
+            "cat .?nv",
+            "cat .*local",
+            "cat .?nv.local",
+            "cat .*production",
+            "cat .*key",
+            "cat .*/config",
+        ] {
+            for host in ["claude", "droid", "devin", "muse"] {
+                let ev = json!({
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": bare_glob},
+                    "cwd": tmp.0,
+                    "session_id": "s-bare",
+                });
+                let reply = run_hook(host, ev.to_string().as_bytes());
+                assert_eq!(
+                    "ask",
+                    reply["hookSpecificOutput"]["permissionDecision"],
+                    "{host} {bare_glob}"
+                );
+            }
+            let cursor_ev = json!({
+                "hook_event_name": "preToolUse",
+                "tool_name": "Shell",
+                "tool_input": {"command": bare_glob},
+                "workspace_roots": [tmp.0],
+                "conversation_id": "s-bare-cursor",
+            });
+            assert_eq!(
+                "deny",
+                run_hook("cursor", cursor_ev.to_string().as_bytes())["permission"],
+                "cursor {bare_glob}"
+            );
+        }
     }
 
     #[test]
