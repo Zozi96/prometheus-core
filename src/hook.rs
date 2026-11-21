@@ -2953,13 +2953,25 @@ mod tests {
         ]);
         let repo = tmp.0.join("repo");
         fs::create_dir_all(&repo).unwrap();
+        // Session ids are unique per run: on Windows the session dir is
+        // the shared temp dir (no XDG_RUNTIME_DIR), so a fixed id would
+        // inherit the marker a previous test run left behind.
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let sid = |n: &str| format!("s-hint{n}-{uniq}");
 
         let py = json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "Bash",
             "tool_input": {"command": "python3 -c 'import json; d=json.load(open(\"data.json\")); print(len(d[\"users\"]))'"},
             "cwd": repo,
-            "session_id": "s-hint",
+            "session_id": sid(""),
         });
         let first = run_hook("claude", py.to_string().as_bytes());
         let ctx = first["hookSpecificOutput"]["additionalContext"]
@@ -2978,7 +2990,7 @@ mod tests {
             "tool_name": "Bash",
             "tool_input": {"command": "jq '.users | length' data.json"},
             "cwd": repo,
-            "session_id": "s-hint",
+            "session_id": sid(""),
         });
         assert_eq!(json!({}), run_hook("claude", jq.to_string().as_bytes()));
         // A new session gets the hint again (jq form).
@@ -2987,7 +2999,7 @@ mod tests {
             "tool_name": "Bash",
             "tool_input": {"command": "jq '.users | length' data.json"},
             "cwd": repo,
-            "session_id": "s-hint-2",
+            "session_id": sid("2"),
         });
         let jq_reply = run_hook("claude", jq2.to_string().as_bytes());
         assert!(jq_reply["hookSpecificOutput"]["additionalContext"]
@@ -2999,7 +3011,7 @@ mod tests {
             "tool_name": "Bash",
             "tool_input": {"command": "python3 - <<'EOF'\nimport yaml\nd = yaml.safe_load(open('cfg.yaml'))\nprint(d['meta'])\nEOF"},
             "cwd": repo,
-            "session_id": "s-hint-3",
+            "session_id": sid("3"),
         });
         let hd = run_hook("claude", heredoc.to_string().as_bytes());
         assert!(hd["hookSpecificOutput"]["additionalContext"]
@@ -3010,7 +3022,7 @@ mod tests {
             "tool_name": "Bash",
             "tool_input": {"command": "node -e \"console.log(Object.keys(require('./cfg.toml')))\" cfg.toml"},
             "cwd": repo,
-            "session_id": "s-hint-4",
+            "session_id": sid("4"),
         });
         // `node -e` with the file only inside the script text has no
         // structured-file operand token after the program, but the
@@ -3025,7 +3037,7 @@ mod tests {
             "tool_name": "Bash",
             "tool_input": {"command": "python3 -c 'print(1)'"},
             "cwd": repo,
-            "session_id": "s-hint-5",
+            "session_id": sid("5"),
         });
         assert_eq!(json!({}), run_hook("claude", plain.to_string().as_bytes()));
         let ls = json!({
@@ -3033,7 +3045,7 @@ mod tests {
             "tool_name": "Bash",
             "tool_input": {"command": "ls -la data.json"},
             "cwd": repo,
-            "session_id": "s-hint-6",
+            "session_id": sid("6"),
         });
         assert_eq!(json!({}), run_hook("claude", ls.to_string().as_bytes()));
     }
