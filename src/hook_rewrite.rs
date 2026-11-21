@@ -1200,6 +1200,70 @@ fn rewrite_grep(tokens: &[ShellToken], kit_bin: &str) -> Option<String> {
     Some(parts.join(" "))
 }
 
+/// Read-only `gh` log pulls → `compact --mode log` (#76, ADR-0013 D2(a):
+/// a hook rewrite to an existing verb, no new verb). Only the exact
+/// `gh run view … --log|--log-failed` shape is rewritten, re-emitting the
+/// original command verbatim after `--`, so the full log stays
+/// recoverable through compact's spillover file. Structured output
+/// (`--json`/`--jq`/`--template`), browser/exit-status forms, and every
+/// other `gh` shape — including all writes (`create`, `merge`, `comment`,
+/// `edit`, `close`, `gh api` with a method or fields), which can never
+/// match this shape — are left untouched.
+fn rewrite_gh_log(tokens: &[ShellToken], kit_bin: &str, rest: &str) -> Option<String> {
+    if tokens.len() < 4
+        || tokens[1].value != "run"
+        || tokens[2].value != "view"
+    {
+        return None;
+    }
+    let mut log_flags = 0usize;
+    let mut positionals = 0usize;
+    let mut i = 3usize;
+    while i < tokens.len() {
+        let arg = tokens[i].value.as_str();
+        match arg {
+            "--log" | "--log-failed" => log_flags += 1,
+            "--job" | "--attempt" | "-R" | "--repo" => {
+                let val = tokens.get(i + 1)?;
+                if val.value.is_empty() {
+                    return None;
+                }
+                i += 1;
+            }
+            _ if arg.starts_with("--job=")
+                || arg.starts_with("--attempt=")
+                || arg.starts_with("--repo=") =>
+            {
+                if arg.ends_with('=') {
+                    return None;
+                }
+            }
+            // Structured output and behaviour-changing flags never rewrite.
+            "--json" | "--jq" | "--template" | "-q" | "--web" | "-w" | "--exit-status" => {
+                return None;
+            }
+            _ if arg.starts_with("--json=")
+                || arg.starts_with("--jq=")
+                || arg.starts_with("--template=") =>
+            {
+                return None;
+            }
+            _ if arg.starts_with('-') => return None,
+            _ => {
+                positionals += 1;
+                if positionals > 1 {
+                    return None;
+                }
+            }
+        }
+        i += 1;
+    }
+    if log_flags != 1 {
+        return None;
+    }
+    Some(format!("{kit_bin} compact --mode log -- {rest}"))
+}
+
 /// Literal-prefix predicate for the measured RTK 1.2.0 piped replies: the
 /// claimed form must end at a literal ASCII space — a tab or extra spacing
 /// right after the command does not count.
@@ -1352,6 +1416,7 @@ pub fn rewrite_command_str(
             "git" => rewrite_git_show_only(&tokens, kit_bin, cd_prefix, event_cwd),
             "head" | "tail" | "cat" | "nl" => rewrite_file_dump(&cmd0, &tokens, kit_bin),
             "grep" => rewrite_grep(&tokens, kit_bin),
+            "gh" => rewrite_gh_log(&tokens, kit_bin, rest),
             "rg" if !rtk_active => rewrite_rg(&tokens, kit_bin),
             _ => runner_mode(&cmd0, arg1, arg2, rtk_active, None)
                 .map(|mode| format!("{kit_bin} compact --mode {mode} -- {rest}")),
@@ -1609,6 +1674,70 @@ mod tests {
                 "head -n 5 .env.local",
                 "grep needle .env",
                 "git show HEAD:.env",
+            ] {
+                assert_eq!(
+                    None,
+                    rewrite_command_str(cmd, KIT, rtk, None),
+                    "rtk={rtk} cmd={cmd}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gh_log_pulls_rewrite_to_compact_log_in_both_rtk_states() {
+        for rtk in [false, true] {
+            for cmd in [
+                "gh run view 12345 --log",
+                "gh run view 12345 --log-failed",
+                "gh run view --log",
+                "gh run view 12345 --job 678 --log",
+                "gh run view --attempt 2 --log-failed 12345",
+                "gh run view -R owner/repo 12345 --log",
+            ] {
+                assert_eq!(
+                    Some(format!("{KIT} compact --mode log -- {cmd}")),
+                    rewrite_command_str(cmd, KIT, rtk, None),
+                    "rtk={rtk} cmd={cmd}"
+                );
+            }
+            // A global `-R` before the subcommand is not a supported
+            // shape (`run` is not at index 1) and stays untouched.
+            assert_eq!(
+                None,
+                rewrite_command_str("gh -R owner/repo run view 12345 --log", KIT, rtk, None),
+                "rtk={rtk}"
+            );
+        }
+    }
+
+    #[test]
+    fn gh_non_log_and_write_forms_are_never_rewritten() {
+        for rtk in [false, true] {
+            for cmd in [
+                // No log flag, or a different read shape.
+                "gh run view 12345",
+                "gh run list --limit 5",
+                "gh pr view 42",
+                "gh run view 12345 --log --log-failed",
+                "gh run view 12345 --job 1 --job 2 --log extra1 extra2",
+                // Structured output stays untouched.
+                "gh run view 12345 --log --json conclusion",
+                "gh run view 12345 --log --jq .conclusion",
+                "gh run view 12345 --log --template '{{.}}'",
+                // Behaviour-changing flags.
+                "gh run view 12345 --log --web",
+                "gh run view 12345 --log --exit-status",
+                // Writes and API mutations are never touched.
+                "gh pr create --title x",
+                "gh pr merge 42",
+                "gh issue comment 7 --body hi",
+                "gh issue edit 7 --title x",
+                "gh issue close 7",
+                "gh api repos/o/r/actions/runs/1/logs -X DELETE",
+                "gh api -X POST repos/o/r/issues -f title=x",
+                "gh run rerun 12345",
+                "gh run cancel 12345",
             ] {
                 assert_eq!(
                     None,
