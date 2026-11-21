@@ -113,6 +113,10 @@ pub struct SearchResult {
     pub omitted_matches: usize,
     pub omitted_files: usize,
     pub truncated: bool,
+    /// Byte length of matching raw lines (or displayed paths for --files-only);
+    /// metrics-only, never serialized.
+    #[serde(skip)]
+    pub raw_bytes: usize,
 }
 
 fn read_searchable_text(path: &Path) -> Option<String> {
@@ -268,6 +272,7 @@ pub fn execute_search(opts: &SearchOptions) -> Result<SearchResult, SearchError>
     let mut files = Vec::new();
     let mut total_matches = 0usize;
     let mut total_files = 0usize;
+    let mut raw_bytes = 0usize;
 
     for (path, disp) in candidates {
         let Some(text) = read_searchable_text(&path) else {
@@ -276,9 +281,20 @@ pub fn execute_search(opts: &SearchOptions) -> Result<SearchResult, SearchError>
         let mut file_matches = 0usize;
         let mut kept: Vec<(usize, String, bool)> = Vec::new();
 
-        for (idx, raw_line) in text.lines().enumerate() {
+        // split_inclusive keeps each raw line's terminator for byte accounting;
+        // the match input strips '\n' then a paired '\r' exactly like
+        // str::lines (a trailing CR on an unterminated last piece is kept).
+        for (idx, piece) in text.split_inclusive('\n').enumerate() {
+            let had_nl = piece.ends_with('\n');
+            let mut raw_line = piece.strip_suffix('\n').unwrap_or(piece);
+            if had_nl {
+                raw_line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            }
             if let Some(m) = re.find(raw_line) {
                 file_matches += 1;
+                if !opts.files_only {
+                    raw_bytes += piece.len();
+                }
                 if !opts.files_only && (opts.max_per_file == 0 || kept.len() < opts.max_per_file) {
                     let (clipped_txt, clipped) =
                         clip_centered(raw_line.trim_end(), m.start(), m.end(), opts.max_line_chars);
@@ -292,6 +308,10 @@ pub fn execute_search(opts: &SearchOptions) -> Result<SearchResult, SearchError>
         }
         total_files += 1;
         total_matches += file_matches;
+
+        if opts.files_only {
+            raw_bytes += disp.len() + 1;
+        }
 
         if opts.max_files > 0 && files.len() >= opts.max_files {
             continue;
@@ -348,6 +368,7 @@ pub fn execute_search(opts: &SearchOptions) -> Result<SearchResult, SearchError>
     }
 
     let mut res = build_search_result(files, total_matches, total_files, opts.files_only);
+    res.raw_bytes = raw_bytes;
     apply_search_text_budget(&mut res, opts);
     Ok(res)
 }
@@ -376,6 +397,7 @@ fn build_search_result(
         omitted_matches,
         omitted_files,
         truncated,
+        raw_bytes: 0,
     }
 }
 

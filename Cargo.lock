@@ -1360,6 +1360,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "windows-sys",
 ]
 
 [[package]]

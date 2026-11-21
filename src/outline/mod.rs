@@ -123,6 +123,9 @@ pub struct OutlineDoc {
     pub imports: Vec<String>,
     pub items: Vec<OutlineItem>,
     pub warnings: Vec<String>,
+    /// Byte length of the source this doc was parsed from; metrics-only, never serialized.
+    #[serde(skip)]
+    pub raw_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +153,11 @@ impl Default for OutlineOptions {
 
 /// Read a UTF-8 (or lossy UTF-8) regular text file up to `MAX_FILE_BYTES`, rejecting directories and binary files.
 pub fn read_text_file(path: &Path) -> Result<(String, Vec<String>), String> {
+    read_text_file_sized(path).map(|(text, warnings, _)| (text, warnings))
+}
+
+/// Like [`read_text_file`], also returning the original byte count before UTF-8 decode.
+pub fn read_text_file_sized(path: &Path) -> Result<(String, Vec<String>, usize), String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !meta.is_file() {
         return Err(format!("{}: not a regular file", path.display()));
@@ -171,15 +179,20 @@ pub fn read_text_file(path: &Path) -> Result<(String, Vec<String>), String> {
             path.display()
         ));
     }
+    let raw_bytes = buf.len();
     let probe_len = buf.len().min(BINARY_PROBE_BYTES);
     if buf[..probe_len].contains(&0) {
         return Err(format!("{}: binary file skipped", path.display()));
     }
     match String::from_utf8(buf) {
-        Ok(text) => Ok((text, Vec::new())),
+        Ok(text) => Ok((text, Vec::new(), raw_bytes)),
         Err(err) => {
             let lossy = String::from_utf8_lossy(err.as_bytes()).into_owned();
-            Ok((lossy, vec!["non-UTF-8 bytes replaced with U+FFFD".to_owned()]))
+            Ok((
+                lossy,
+                vec!["non-UTF-8 bytes replaced with U+FFFD".to_owned()],
+                raw_bytes,
+            ))
         }
     }
 }
@@ -192,6 +205,7 @@ pub fn outline_source(path: &str, src: &str, lang: Lang, opts: &OutlineOptions) 
         code::parse_code(path, src, &idx, lang, opts)
     };
     doc.total_lines = idx.total_lines();
+    doc.raw_bytes = src.len();
     doc
 }
 
@@ -208,8 +222,9 @@ pub fn outline_file(
                 path.display()
             )
         })?;
-    let (src, mut warnings) = read_text_file(path)?;
+    let (src, mut warnings, raw_bytes) = read_text_file_sized(path)?;
     let mut doc = outline_source(&path.to_string_lossy(), &src, lang, opts);
+    doc.raw_bytes = raw_bytes;
     warnings.extend(doc.warnings);
     doc.warnings = warnings;
     Ok(doc)
@@ -342,6 +357,7 @@ fn filtered_doc(doc: &OutlineDoc, opts: &OutlineOptions) -> OutlineDoc {
         },
         items,
         warnings: doc.warnings.clone(),
+        raw_bytes: doc.raw_bytes,
     }
 }
 

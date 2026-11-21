@@ -29,6 +29,7 @@ pub fn parse_structured(
         imports: Vec::new(),
         items: Vec::new(),
         warnings: Vec::new(),
+        raw_bytes: 0,
     };
     let start = if src.starts_with('\u{FEFF}') { 3 } else { 0 };
     match lang {

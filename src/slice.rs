@@ -76,6 +76,12 @@ pub struct SliceResult {
     pub omitted_slices: usize,
     pub omitted_lines: usize,
     pub warnings: Vec<String>,
+    /// Byte length of the merged selected source spans before budget cuts; metrics-only.
+    #[serde(skip)]
+    pub raw_bytes: usize,
+    /// A signatures-only run collapsed a multi-line interval to its signature; metrics-only.
+    #[serde(skip)]
+    pub signature_clipped: bool,
 }
 
 pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
@@ -468,6 +474,8 @@ pub fn execute_slices(specs: &[SliceSpec], opts: &SliceOptions) -> Result<SliceR
     let mut omitted_slices = 0usize;
     let mut omitted_lines = 0usize;
     let mut truncated = false;
+    let mut raw_bytes = 0usize;
+    let mut signature_clipped = false;
 
     for key in per_file_order {
         let entry = per_file_map.remove(&key).unwrap();
@@ -480,6 +488,17 @@ pub fn execute_slices(specs: &[SliceSpec], opts: &SliceOptions) -> Result<SliceR
         .map_err(|e| format!("{}: {e}", entry.path.display()))?;
 
         for iv in merged {
+            // Raw input is the full merged selected span(s) before any budget
+            // cut — signatures-only runs charge the whole interval even though
+            // only the signature is emitted. Counted even when the interval is
+            // later omitted.
+            let end_excl = if iv.end < cached.idx.total_lines() {
+                cached.idx.line_start(iv.end + 1)
+            } else {
+                cached.src.len()
+            };
+            raw_bytes += end_excl.saturating_sub(cached.idx.line_start(iv.start));
+            signature_clipped |= opts.signatures_only && iv.end > iv.start;
             let line_total = if opts.signatures_only {
                 1
             } else {
@@ -595,6 +614,8 @@ pub fn execute_slices(specs: &[SliceSpec], opts: &SliceOptions) -> Result<SliceR
         omitted_slices,
         omitted_lines,
         warnings,
+        raw_bytes,
+        signature_clipped,
     })
 }
 

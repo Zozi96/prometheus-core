@@ -84,6 +84,9 @@ pub struct StatusSummary {
     pub excluded_noise: Vec<String>,
     pub truncated: bool,
     pub omitted_entries: usize,
+    /// Byte length of the raw `git status -z` output; metrics-only.
+    #[serde(skip)]
+    pub raw_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +96,12 @@ pub enum DiffOutput {
     Status(StatusSummary),
     #[serde(rename = "diff")]
     Diff {
+        /// Byte length of the raw unified diff captured from git; metrics-only.
+        #[serde(skip)]
+        raw_bytes: usize,
+        /// Content removed by symbol/stat filtering before budget trims; metrics-only.
+        #[serde(skip)]
+        filtered_output: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         commit_header: Option<String>,
         files: Vec<DiffFile>,
@@ -203,6 +212,7 @@ fn run_status(repo_root: &Path, opts: &DiffOptions) -> Result<DiffOutput, String
         excluded_noise,
         truncated: false,
         omitted_entries: 0,
+        raw_bytes: raw.len(),
     };
     enforce_status_text_budget(&mut summary, opts.max_tokens);
     Ok(DiffOutput::Status(summary))
@@ -548,6 +558,7 @@ pub fn execute_diff(opts: &DiffOptions) -> Result<DiffOutput, String> {
     let explicit = !opts.paths.is_empty();
     let mut excluded_noise = Vec::new();
     let mut files = Vec::new();
+    let mut filtered_output = false;
 
     for mut f in parsed_files {
         if !opts.include_noise && !explicit && is_noise_path(&f.path) {
@@ -559,11 +570,13 @@ pub fn execute_diff(opts: &DiffOptions) -> Result<DiffOutput, String> {
         if let Some(sym_q) = opts.symbol_filter.as_deref() {
             let q_lower = sym_q.trim().to_ascii_lowercase();
             if !q_lower.is_empty() {
+                let before = f.hunks.len();
                 f.hunks.retain(|h| {
                     h.symbols
                         .iter()
                         .any(|s| s.to_ascii_lowercase().contains(&q_lower))
                 });
+                filtered_output |= before != f.hunks.len() || f.hunks.is_empty();
                 if f.hunks.is_empty() {
                     continue;
                 }
@@ -578,6 +591,7 @@ pub fn execute_diff(opts: &DiffOptions) -> Result<DiffOutput, String> {
         }
 
         if opts.stat_only {
+            filtered_output |= !f.hunks.is_empty();
             f.hunks.clear();
         } else if !explicit && opts.max_hunk_lines > 0 {
             if f.status == "added" && f.added > LARGE_NEW_OR_DEL_THRESHOLD {
@@ -600,6 +614,8 @@ pub fn execute_diff(opts: &DiffOptions) -> Result<DiffOutput, String> {
     let total_deleted: usize = files.iter().map(|f| f.deleted).sum();
 
     let mut out = DiffOutput::Diff {
+        raw_bytes: raw_bytes.len(),
+        filtered_output,
         commit_header,
         files,
         excluded_noise,
@@ -742,6 +758,7 @@ pub fn render_diff_text(out: &DiffOutput, max_tokens: usize) -> String {
             total_deleted,
             truncated,
             omitted_files,
+            ..
         } => {
             if let Some(hdr) = commit_header {
                 s.push_str(&format!("commit: {hdr}\n"));

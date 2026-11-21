@@ -97,6 +97,9 @@ pub struct CompactResult {
     pub log_path: Option<String>,
     pub truncated: bool,
     pub omitted_items: usize,
+    /// Byte length of the raw input this result was compacted from; metrics-only.
+    #[serde(skip)]
+    pub raw_bytes: usize,
 }
 
 /// Run an external command, compact its combined stdout + stderr, and preserve its exit code.
@@ -145,7 +148,10 @@ pub fn compact_command(
         combined.push_str(&String::from_utf8_lossy(&err_bytes));
     }
 
-    let result = compact_text(&combined, Some(exit_code), opts);
+    let mut result = compact_text(&combined, Some(exit_code), opts);
+    // Raw is the child's actual stdout+stderr byte counts, before lossy
+    // UTF-8 conversion or the inserted separator newline.
+    result.raw_bytes = out_bytes.len() + err_bytes.len();
     Ok((result, exit_code))
 }
 
@@ -544,6 +550,7 @@ pub fn compact_text(raw: &str, exit_code: Option<i32>, opts: &CompactOptions) ->
         log_path: None,
         truncated: false,
         omitted_items: 0,
+        raw_bytes: raw.len(),
     };
 
     let preview_text = render_compact_text_inner(&result, false);

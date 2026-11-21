@@ -21,6 +21,7 @@ pub fn parse_code(
         imports: Vec::new(),
         items: Vec::new(),
         warnings: Vec::new(),
+        raw_bytes: 0,
     };
     let start = skip_utf8_bom(src);
     match lang {

@@ -902,6 +902,14 @@ pub fn rewrite_command_reply(host: &str, event: &Value) -> Option<Value> {
     let rtk_active = rtk_hook_active(host);
     let kit_bin = kit_bin_quoted()?;
     let rewritten = rewrite_command_str(command, &kit_bin, rtk_active, event_cwd)?;
+    if let Some(host) = crate::metrics::Host::from_hook(host) {
+        crate::metrics::record(
+            host,
+            crate::metrics::Rule::ShellRewrite,
+            command.len(),
+            rewritten.len(),
+        );
+    }
 
     let mut updated: Map<String, Value> = tool_input.clone();
     updated.insert("command".to_owned(), Value::String(rewritten));

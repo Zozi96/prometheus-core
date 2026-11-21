@@ -39,7 +39,8 @@ impl Drop for TempDir {
 
 fn run_kit(args: &[&str], cwd: Option<&Path>) -> Output {
     let mut cmd = Command::new(bin());
-    cmd.args(args);
+    cmd.args(args)
+        .env("PROMETHEUS_KIT_NO_METRICS", "1");
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -314,6 +315,7 @@ src/B.cs(20,4): error CS0103: missing Foo [/tmp/A.csproj]\n",
 
     let mut child = Command::new(bin())
         .args(["compact", "--no-spillover", "--tail", "5"])
+        .env("PROMETHEUS_KIT_NO_METRICS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -430,6 +432,7 @@ fn run_kit_stdin(args: &[&str], stdin_bytes: &[u8]) -> Output {
     use std::process::Stdio;
     let mut child = Command::new(bin())
         .args(args)
+        .env("PROMETHEUS_KIT_NO_METRICS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -535,4 +538,820 @@ fn droid_mode_subcommand_round_trips_with_config_and_home() {
     assert_eq!(off.status.code(), Some(0));
     let restored = fs::read_to_string(&argus).unwrap();
     assert!(restored.contains("model: gemini-4-carbon\nreasoningEffort: medium\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Metrics persistence: every test gets a child-only HOME/USERPROFILE and
+// XDG_RUNTIME_DIR inside a fresh temp dir, so savings.jsonl never lands in a
+// real home.
+// ---------------------------------------------------------------------------
+
+const REWRITE_COMMAND: &str = "dotnet test App.csproj";
+const METRICS_MAX_BYTES: usize = 1024 * 1024;
+
+struct MetricsHome {
+    _root: TempDir,
+    home: PathBuf,
+    runtime: PathBuf,
+    repo: PathBuf,
+}
+
+impl MetricsHome {
+    fn new(tag: &str) -> Self {
+        let root = TempDir::new(tag);
+        let home = root.0.join("home");
+        let runtime = root.0.join("runtime");
+        let repo = root.0.join("repo");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        Self {
+            _root: root,
+            home,
+            runtime,
+            repo,
+        }
+    }
+
+    fn metrics_file(&self) -> PathBuf {
+        self.home.join(".agents/prometheus/metrics/savings.jsonl")
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(bin());
+        cmd.args(args)
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
+            .env("XDG_RUNTIME_DIR", &self.runtime)
+            .env_remove("PROMETHEUS_KIT_NO_METRICS")
+            .env_remove("PROMETHEUS_KIT_NO_REWRITE")
+            .env_remove("PROMETHEUS_KIT_NO_READ_HINT")
+            .env_remove("PROMETHEUS_KIT_RTK_COEXIST")
+            .env_remove("CURSOR_PROJECT_DIR")
+            .env_remove("DEVIN_PROJECT_DIR")
+            .env_remove("CLAUDECODE")
+            .env_remove("FACTORY_DROID_SESSION_ID")
+            .env_remove("MUSE_SESSION_ID")
+            .env_remove("GROK_SESSION_ID");
+        cmd
+    }
+
+    fn hook_env(&self, host: &str, event: &Value, extra: &[(&str, &str)]) -> Output {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut cmd = self.command(&["hook", host]);
+        for (key, value) in extra {
+            cmd.env(key, value);
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn prometheus-kit hook");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(event.to_string().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn hook(&self, host: &str, event: &Value) -> Output {
+        self.hook_env(host, event, &[])
+    }
+
+    fn metrics(&self) -> Output {
+        self.command(&["metrics"])
+            .output()
+            .expect("failed to run prometheus-kit metrics")
+    }
+
+    fn rows(&self) -> Vec<Value> {
+        fs::read_to_string(self.metrics_file())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+}
+
+fn rewrite_event(tool: &str, cwd: &Path, session: &str) -> Value {
+    serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool,
+        "tool_input": {"command": REWRITE_COMMAND},
+        "cwd": cwd.to_str().unwrap(),
+        "session_id": session,
+    })
+}
+
+fn read_event(host: &str, cwd: &Path) -> Value {
+    let session = format!("sess-{host}");
+    match host {
+        "cursor" => serde_json::json!({
+            "hook_event_name": "preToolUse",
+            "tool_name": "Read",
+            "tool_input": {"path": "big.rs"},
+            "workspace_roots": [cwd.to_str().unwrap()],
+            "conversation_id": session,
+        }),
+        "devin" => serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "read",
+            "tool_input": {"file_path": "big.rs"},
+            "cwd": cwd.to_str().unwrap(),
+            "session_id": session,
+        }),
+        _ => serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "big.rs"},
+            "cwd": cwd.to_str().unwrap(),
+            "session_id": session,
+        }),
+    }
+}
+
+fn find_row<'a>(rows: &'a [Value], host: &str, rule: &str) -> &'a Value {
+    rows.iter()
+        .find(|row| row["host"].as_str() == Some(host) && row["rule_id"].as_str() == Some(rule))
+        .unwrap_or_else(|| panic!("missing metrics row for {host}/{rule}"))
+}
+
+fn assert_metric_row_keys(row: &Value) {
+    let obj = row.as_object().expect("metric row must be an object");
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["emitted_bytes", "host", "raw_bytes", "rule_id", "timestamp"],
+        "unexpected metric row keys: {row}"
+    );
+}
+
+#[test]
+fn metrics_records_shell_rewrite_for_rewrite_hosts() {
+    let home = MetricsHome::new("rewrite_metrics");
+    for (host, tool) in [("claude", "Bash"), ("droid", "Execute"), ("muse", "Bash")] {
+        let ev = rewrite_event(tool, &home.repo, &format!("sess-{host}"));
+        let out = home.hook(host, &ev);
+        assert_eq!(out.status.code(), Some(0), "host={host}");
+        let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let command = reply["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .expect("rewrite reply carries updatedInput.command");
+        assert!(
+            command.contains("compact --mode test"),
+            "host={host}: {command}"
+        );
+    }
+
+    let rows = home.rows();
+    assert_eq!(rows.len(), 3, "rows: {rows:?}");
+    for host in ["claude", "droid", "muse"] {
+        let row = find_row(&rows, host, "shell-rewrite");
+        assert_metric_row_keys(row);
+        assert_eq!(
+            row["raw_bytes"].as_u64().unwrap(),
+            REWRITE_COMMAND.len() as u64
+        );
+        assert!(row["emitted_bytes"].as_u64().unwrap() > 0);
+        assert!(row["timestamp"].as_u64().unwrap() > 0);
+    }
+
+    let totals = home.metrics();
+    assert_eq!(totals.status.code(), Some(0));
+    let parsed: Value = serde_json::from_slice(&totals.stdout).unwrap();
+    assert_eq!(parsed["by_rule"]["shell-rewrite"]["count"], 3);
+    for host in ["claude", "droid", "muse"] {
+        assert_eq!(parsed["by_host"][host]["count"], 1, "host={host}");
+    }
+}
+
+#[test]
+fn metrics_records_read_warnings_for_all_hosts() {
+    let home = MetricsHome::new("warn_metrics");
+    let mut big = String::new();
+    for i in 0..250 {
+        big.push_str(&format!("fn func_{i}() {{}}\n"));
+    }
+    fs::write(home.repo.join("big.rs"), big).unwrap();
+
+    for host in ["claude", "cursor", "devin", "droid", "muse"] {
+        let ev = read_event(host, &home.repo);
+        for _ in 0..2 {
+            let out = home.hook(host, &ev);
+            assert_eq!(out.status.code(), Some(0), "host={host}");
+        }
+    }
+
+    let rows = home.rows();
+    assert_eq!(rows.len(), 10, "rows: {rows:?}");
+    for host in ["claude", "cursor", "devin", "droid", "muse"] {
+        for rule in ["large-read-advisory", "reread-warning"] {
+            let row = find_row(&rows, host, rule);
+            assert_metric_row_keys(row);
+            assert_eq!(row["raw_bytes"].as_u64().unwrap(), 0);
+            assert!(row["emitted_bytes"].as_u64().unwrap() > 0);
+        }
+    }
+}
+
+#[test]
+fn metrics_opt_out_disables_writes() {
+    let home = MetricsHome::new("optout_metrics");
+    let ev = rewrite_event("Bash", &home.repo, "sess-claude");
+    let out = home.hook_env("claude", &ev, &[("PROMETHEUS_KIT_NO_METRICS", "1")]);
+    assert_eq!(out.status.code(), Some(0));
+    // An empty value still counts as present and disables writes.
+    let out_empty = home.hook_env("claude", &ev, &[("PROMETHEUS_KIT_NO_METRICS", "")]);
+    assert_eq!(out_empty.status.code(), Some(0));
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        reply["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("compact --mode test"),
+        "opt-out must not change the rewrite reply"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !home.metrics_file().exists(),
+        "opt-out must not create savings.jsonl"
+    );
+
+    let totals = home.metrics();
+    assert_eq!(totals.status.code(), Some(0));
+    let parsed: Value = serde_json::from_slice(&totals.stdout).unwrap();
+    assert_eq!(parsed["by_host"], serde_json::json!({}));
+    assert_eq!(parsed["by_rule"], serde_json::json!({}));
+}
+
+#[test]
+fn metrics_path_obstruction_keeps_hook_stdout_identical() {
+    let good = MetricsHome::new("obstruct_ok");
+    let bad = MetricsHome::new("obstruct_bad");
+    // `.agents` as a regular file blocks the fd walk before any write.
+    fs::write(bad.home.join(".agents"), b"not a directory").unwrap();
+
+    let ev = rewrite_event("Bash", &good.repo, "sess-claude");
+    let out_good = good.hook("claude", &ev);
+    let out_bad = bad.hook("claude", &ev);
+    assert_eq!(out_good.status.code(), Some(0));
+    assert_eq!(out_bad.status.code(), Some(0));
+    assert_eq!(
+        out_good.stdout, out_bad.stdout,
+        "metrics obstruction must not change the hook reply"
+    );
+    assert!(good.metrics_file().exists());
+    assert!(!bad.metrics_file().exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn metrics_refuses_insecure_dirs_symlinks_and_loose_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A metrics dir with group/other bits is refused, not repaired.
+    let home = MetricsHome::new("insecure_metrics");
+    let metrics_dir = home.home.join(".agents/prometheus/metrics");
+    fs::create_dir_all(&metrics_dir).unwrap();
+    fs::set_permissions(&metrics_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let ev = rewrite_event("Bash", &home.repo, "sess-claude");
+    let out = home.hook("claude", &ev);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!metrics_dir.join("savings.jsonl").exists());
+
+    // A symlinked path component is refused outright.
+    let linked = MetricsHome::new("symlink_metrics");
+    let real = linked._root.0.join("real_agents");
+    let real_metrics = real.join("prometheus/metrics");
+    fs::create_dir_all(&real_metrics).unwrap();
+    fs::set_permissions(&real_metrics, fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&real, linked.home.join(".agents")).unwrap();
+    let out = linked.hook("claude", &ev);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!real_metrics.join("savings.jsonl").exists());
+
+    // A group/other-readable savings.jsonl is refused for writes.
+    let loose = MetricsHome::new("loose_metrics");
+    let loose_file = loose.metrics_file();
+    fs::create_dir_all(loose_file.parent().unwrap()).unwrap();
+    fs::set_permissions(
+        loose_file.parent().unwrap(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::write(&loose_file, "{}\n").unwrap();
+    fs::set_permissions(&loose_file, fs::Permissions::from_mode(0o644)).unwrap();
+    let out = loose.hook("claude", &ev);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(fs::read_to_string(&loose_file).unwrap(), "{}\n");
+}
+
+#[test]
+fn metrics_file_stops_accepting_rows_at_cap() {
+    let home = MetricsHome::new("cap_metrics");
+    let ev = rewrite_event("Bash", &home.repo, "sess-claude");
+    let out = home.hook("claude", &ev);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(home.metrics_file().exists());
+
+    // Fill the fixture to exactly the cap with valid rows plus a truncated tail.
+    let row = br#"{"timestamp":1,"host":"claude","rule_id":"shell-rewrite","raw_bytes":1,"emitted_bytes":2}"#;
+    let mut data = Vec::with_capacity(METRICS_MAX_BYTES + row.len());
+    while data.len() < METRICS_MAX_BYTES {
+        data.extend_from_slice(row);
+        data.push(b'\n');
+    }
+    data.truncate(METRICS_MAX_BYTES);
+    assert_eq!(data.len(), METRICS_MAX_BYTES);
+    fs::write(home.metrics_file(), &data).unwrap();
+
+    let out = home.hook("claude", &ev);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        fs::metadata(home.metrics_file()).unwrap().len(),
+        METRICS_MAX_BYTES as u64,
+        "append must stop at the byte cap"
+    );
+}
+
+fn kit_stdin(home: &MetricsHome, args: &[&str], bytes: &[u8]) -> Output {
+    kit_stdin_env(home, args, bytes, &[])
+}
+
+fn kit_stdin_env(home: &MetricsHome, args: &[&str], bytes: &[u8], envs: &[(&str, &str)]) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut cmd = home.command(args);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn prometheus-kit");
+    child.stdin.as_mut().unwrap().write_all(bytes).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn metrics_records_each_clipped_output_command() {
+    let home = MetricsHome::new("verbs_metrics");
+    let work = home.repo.join("work");
+    fs::create_dir_all(work.join("srch")).unwrap();
+
+    // compact via stdin: raw_bytes is the exact pre-decode byte count,
+    // including bytes that are not valid UTF-8.
+    let mut stdin_bytes = b"line one\n".to_vec();
+    stdin_bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
+    stdin_bytes.extend_from_slice(b"line two\nline two\n");
+    let compact_stdin = kit_stdin(
+        &home,
+        &["compact", "--no-spillover", "--tail", "5"],
+        &stdin_bytes,
+    );
+    assert_eq!(compact_stdin.status.code(), Some(0));
+    let compact_stdin_stdout = compact_stdin.stdout.len();
+
+    // compact -- <cmd>: raw_bytes is child stdout + stderr byte totals before
+    // lossy conversion. Unix uses sh printf emitting one non-UTF8 byte each
+    // way (raw = 4); Windows uses cmd builtins with CRLF (raw = 6).
+    #[cfg(unix)]
+    let (cmd_argv, expected_cmd_raw): (&[&str], u64) = (
+        &["sh", "-c", "printf 'O\\377'; printf 'E\\376' >&2"],
+        4,
+    );
+    #[cfg(windows)]
+    let (cmd_argv, expected_cmd_raw): (&[&str], u64) = (
+        &["cmd", "/D", "/C", "echo O&echo E 1>&2"],
+        6,
+    );
+    let mut argv: Vec<&str> = vec!["compact", "--no-spillover", "--"];
+    argv.extend_from_slice(cmd_argv);
+    let compact_cmd = home.command(&argv).output().unwrap();
+    assert_eq!(compact_cmd.status.code(), Some(0));
+    let compact_cmd_stdout = compact_cmd.stdout.len();
+
+    // outline: raw is the whole source file; tight budget forces a clip.
+    let mut big_rs = String::new();
+    for i in 0..60 {
+        big_rs.push_str(&format!("pub fn func_{i}(x: usize) -> usize {{ x + {i} }}\n"));
+    }
+    let rs_path = work.join("big.rs");
+    fs::write(&rs_path, &big_rs).unwrap();
+    let outline = home
+        .command(&[
+            "outline",
+            "--max-tokens",
+            "60",
+            rs_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(outline.status.code(), Some(0));
+    let outline_stdout = outline.stdout.len();
+
+    // slice: raw is only the merged selected span, not the whole file.
+    let mut rows = String::new();
+    for i in 1..=120 {
+        rows.push_str(&format!("row {i:03} filler text goes here\n"));
+    }
+    let txt_path = work.join("rows.txt");
+    fs::write(&txt_path, &rows).unwrap();
+    let expected_slice_raw: usize = rows
+        .lines()
+        .skip(49)
+        .take(6)
+        .map(|l| l.len() + 1)
+        .sum();
+    assert!(expected_slice_raw < rows.len());
+    let slice = home
+        .command(&[
+            "slice",
+            "--max-tokens",
+            "30",
+            &format!("{}:50-55", txt_path.display()),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(slice.status.code(), Some(0));
+    let slice_stdout = slice.stdout.len();
+
+    // search: raw is the matching raw line only; the large nonmatching
+    // regions around it must not be charged.
+    let match_line = format!("{}NEEDLE{}", "a".repeat(200), "b".repeat(200));
+    let expected_search_raw = match_line.len() + 1;
+    let mut hay = String::new();
+    for _ in 0..300 {
+        hay.push_str("nothing to see here\n");
+    }
+    hay.push_str(&match_line);
+    hay.push('\n');
+    for _ in 0..300 {
+        hay.push_str("still nothing\n");
+    }
+    let srch_dir = work.join("srch");
+    fs::write(srch_dir.join("haystack.txt"), &hay).unwrap();
+    let search = home
+        .command(&[
+            "search",
+            "--max-line-chars",
+            "60",
+            "NEEDLE",
+            srch_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(search.status.code(), Some(0));
+    let search_stdout = search.stdout.len();
+
+    // map: tight budget clips the unbudgeted render.
+    for i in 0..10 {
+        fs::write(work.join(format!("f{i}.txt")), format!("content {i}\n")).unwrap();
+    }
+    let map = home
+        .command(&["map", "--max-tokens", "40", work.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(map.status.code(), Some(0));
+    let map_stdout = map.stdout.len();
+
+    // diff: a real git repo; Cargo.lock is excluded noise so the run is a
+    // recorded reduction even though the diff itself is small.
+    let git = |args: &[&str]| {
+        let st = Command::new("git")
+            .arg("-C")
+            .arg(&home.repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?} failed");
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    fs::write(home.repo.join("src.rs"), "pub fn a() {}\n").unwrap();
+    fs::write(home.repo.join("Cargo.lock"), "# v1\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-m", "init"]);
+    fs::write(home.repo.join("src.rs"), "pub fn a() {}\npub fn b() {}\n").unwrap();
+    fs::write(home.repo.join("Cargo.lock"), "# v2\n").unwrap();
+    let diff = home
+        .command(&["diff", "--root", home.repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(diff.status.code(), Some(0));
+    let diff_stdout = diff.stdout.len();
+
+    let rows = home.rows();
+    assert_eq!(rows.len(), 7, "rows: {rows:?}");
+    for row in &rows {
+        assert_metric_row_keys(row);
+        assert_eq!(row["host"].as_str(), Some("standalone"), "row: {row}");
+    }
+
+    let compacts: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r["rule_id"].as_str() == Some("compact"))
+        .collect();
+    assert_eq!(compacts.len(), 2, "rows: {rows:?}");
+    let stdin_row = compacts
+        .iter()
+        .find(|r| r["raw_bytes"].as_u64() == Some(stdin_bytes.len() as u64))
+        .expect("compact stdin row with exact raw byte count");
+    assert_eq!(
+        stdin_row["emitted_bytes"].as_u64().unwrap() as usize,
+        compact_stdin_stdout
+    );
+    let cmd_row = compacts
+        .iter()
+        .find(|r| r["raw_bytes"].as_u64() == Some(expected_cmd_raw))
+        .expect("compact command row with stdout+stderr byte total");
+    assert_eq!(
+        cmd_row["emitted_bytes"].as_u64().unwrap() as usize,
+        compact_cmd_stdout
+    );
+
+    let checks: [(&str, usize, u64); 5] = [
+        ("outline", outline_stdout, big_rs.len() as u64),
+        ("slice", slice_stdout, expected_slice_raw as u64),
+        ("search", search_stdout, expected_search_raw as u64),
+        ("map", map_stdout, 0),
+        ("diff", diff_stdout, 0),
+    ];
+    for (rule, stdout_len, expected_raw) in checks {
+        let row = rows
+            .iter()
+            .find(|r| r["rule_id"].as_str() == Some(rule))
+            .unwrap_or_else(|| panic!("missing metrics row for {rule}"));
+        assert_eq!(
+            row["emitted_bytes"].as_u64().unwrap() as usize,
+            stdout_len,
+            "rule={rule}"
+        );
+        if expected_raw != 0 {
+            assert_eq!(row["raw_bytes"].as_u64().unwrap(), expected_raw, "rule={rule}");
+        } else {
+            assert!(row["raw_bytes"].as_u64().unwrap() > 0, "rule={rule}");
+        }
+    }
+
+    let totals = home.metrics();
+    assert_eq!(totals.status.code(), Some(0));
+    let parsed: Value = serde_json::from_slice(&totals.stdout).unwrap();
+    assert_eq!(parsed["by_rule"]["compact"]["count"], 2);
+    for rule in ["outline", "slice", "search", "diff", "map"] {
+        assert_eq!(parsed["by_rule"][rule]["count"], 1, "rule={rule}");
+    }
+    assert_eq!(parsed["by_host"]["standalone"]["count"], 7);
+}
+
+#[test]
+fn metrics_search_files_only_charges_capped_files() {
+    let home = MetricsHome::new("files_only_cap");
+    let dir = home.repo.join("cap");
+    fs::create_dir_all(&dir).unwrap();
+    for i in 0..5 {
+        fs::write(dir.join(format!("f{i}.txt")), "xxNEEDLEyy\n").unwrap();
+    }
+    let root = dir.to_str().unwrap();
+
+    // Uncapped: all five paths shown, emitted exceeds raw -> nothing reduced,
+    // so no row is recorded at all.
+    let full = home
+        .command(&["search", "--files-only", "--max-files", "0", "NEEDLE", root])
+        .output()
+        .unwrap();
+    assert_eq!(full.status.code(), Some(0));
+    assert!(
+        !home.metrics_file().exists(),
+        "unclipped files-only listing must not record"
+    );
+
+    // Capped: only one path is shown, but raw_bytes must still charge the
+    // display path of every matching file, including the four omitted ones.
+    let capped = home
+        .command(&["search", "--files-only", "--max-files", "1", "NEEDLE", root])
+        .output()
+        .unwrap();
+    assert_eq!(capped.status.code(), Some(0));
+    assert!(capped.stdout.len() < full.stdout.len());
+
+    // Expected raw: sum of (display path length + 1) over all five matches.
+    let expected_raw: usize = (0..5)
+        .map(|i| dir.join(format!("f{i}.txt")).to_string_lossy().len() + 1)
+        .sum();
+
+    let rows = home.rows();
+    assert_eq!(rows.len(), 1, "rows: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["rule_id"].as_str(), Some("search"), "row: {row}");
+    assert_metric_row_keys(row);
+    assert_eq!(
+        row["raw_bytes"].as_u64().unwrap() as usize, expected_raw,
+        "files beyond --max-files must still charge raw path bytes; row: {row}"
+    );
+    assert_eq!(
+        row["emitted_bytes"].as_u64().unwrap() as usize,
+        capped.stdout.len()
+    );
+}
+
+#[test]
+fn metrics_diff_stat_on_clean_tree_records_nothing() {
+    let home = MetricsHome::new("diff_stat_clean");
+    let git = |args: &[&str]| {
+        let st = Command::new("git")
+            .arg("-C")
+            .arg(&home.repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?} failed");
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    fs::write(home.repo.join("src.rs"), "pub fn a() {}\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-m", "init"]);
+
+    // --stat on an empty diff filters nothing: no reduction, no row.
+    let out = home
+        .command(&["diff", "--stat", "--root", home.repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        !home.metrics_file().exists(),
+        "unclipped empty diff must not create the metrics store"
+    );
+}
+
+#[test]
+fn metrics_slice_signatures_only_charges_full_span() {
+    let home = MetricsHome::new("slice_sig_span");
+    let mut src = String::from("fn big() {\n");
+    for i in 0..40 {
+        src.push_str(&format!("    let v{i} = {i};\n"));
+    }
+    src.push_str("}\n");
+    let path = home.repo.join("big.rs");
+    fs::write(&path, &src).unwrap();
+
+    let out = home
+        .command(&[
+            "slice",
+            "--signatures-only",
+            &format!("{}::big", path.display()),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout_len = out.stdout.len();
+
+    let rows = home.rows();
+    assert_eq!(rows.len(), 1, "rows: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["rule_id"].as_str(), Some("slice"), "row: {row}");
+    assert_metric_row_keys(row);
+    // Raw is the whole multi-line interval, not just the emitted signature.
+    assert_eq!(
+        row["raw_bytes"].as_u64().unwrap(),
+        src.len() as u64,
+        "row: {row}"
+    );
+    assert_eq!(
+        row["emitted_bytes"].as_u64().unwrap() as usize,
+        stdout_len
+    );
+}
+
+#[test]
+fn metrics_totals_skips_malformed_non_utf8_row() {
+    use std::io::Write;
+    let home = MetricsHome::new("totals_malformed");
+    // Seed a real row through the normal path so the store exists with the
+    // platform-correct private permissions.
+    let seed = kit_stdin(&home, &["compact", "--no-spillover"], b"seed line\n");
+    assert_eq!(seed.status.code(), Some(0));
+
+    // Append a non-UTF-8 malformed line followed by a valid handcrafted row.
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(home.metrics_file())
+        .unwrap();
+    f.write_all(b"\xff\xfe not json\n").unwrap();
+    f.write_all(
+        b"{\"timestamp\":1,\"host\":\"claude\",\"rule_id\":\"shell-rewrite\",\"raw_bytes\":10,\"emitted_bytes\":5}\n",
+    )
+    .unwrap();
+    drop(f);
+
+    let totals = home.metrics();
+    assert_eq!(totals.status.code(), Some(0));
+    let parsed: Value = serde_json::from_slice(&totals.stdout).unwrap();
+    // The malformed line must be skipped, not stop the scan: both valid rows count.
+    assert_eq!(parsed["by_rule"]["compact"]["count"], 1, "{parsed}");
+    assert_eq!(parsed["by_rule"]["shell-rewrite"]["count"], 1, "{parsed}");
+    assert_eq!(parsed["by_rule"]["shell-rewrite"]["raw_bytes"], 10, "{parsed}");
+    assert_eq!(parsed["by_host"]["claude"]["count"], 1, "{parsed}");
+}
+
+#[test]
+fn metrics_host_marker_single_vs_ambiguous() {
+    let home = MetricsHome::new("host_markers");
+    // One known marker -> that host.
+    let single = kit_stdin_env(
+        &home,
+        &["compact", "--no-spillover"],
+        b"squeeze\n",
+        &[("CLAUDECODE", "1")],
+    );
+    assert_eq!(single.status.code(), Some(0));
+    // Two distinct markers -> ambiguous -> standalone.
+    let ambiguous = kit_stdin_env(
+        &home,
+        &["compact", "--no-spillover"],
+        b"squeeze\n",
+        &[("CLAUDECODE", "1"), ("CURSOR_PROJECT_DIR", "/tmp/ambiguous")],
+    );
+    assert_eq!(ambiguous.status.code(), Some(0));
+
+    let rows = home.rows();
+    assert_eq!(rows.len(), 2, "rows: {rows:?}");
+    assert_eq!(rows[0]["host"].as_str(), Some("claude"), "row: {}", rows[0]);
+    assert_eq!(
+        rows[1]["host"].as_str(),
+        Some("standalone"),
+        "row: {}",
+        rows[1]
+    );
+    for row in &rows {
+        assert_eq!(row["rule_id"].as_str(), Some("compact"), "row: {row}");
+        assert_metric_row_keys(row);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn metrics_windows_refuses_hardlinked_store() {
+    let home = MetricsHome::new("win_hardlink");
+    let seed = kit_stdin(&home, &["compact", "--no-spillover"], b"seed line\n");
+    assert_eq!(seed.status.code(), Some(0));
+    assert_eq!(home.rows().len(), 1);
+
+    // A second name for savings.jsonl makes nNumberOfLinks > 1; the store
+    // must be refused for both reads and writes rather than repaired.
+    fs::hard_link(home.metrics_file(), home.metrics_file().with_file_name("alias.jsonl"))
+        .unwrap();
+
+    let next = kit_stdin(&home, &["compact", "--no-spillover"], b"more\n");
+    assert_eq!(next.status.code(), Some(0));
+    assert_eq!(
+        home.rows().len(),
+        1,
+        "hard-linked store must refuse appends"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn metrics_windows_refuses_permissive_metrics_dir() {
+    let home = MetricsHome::new("win_permissive_dir");
+    let seed = kit_stdin(&home, &["compact", "--no-spillover"], b"seed line\n");
+    assert_eq!(seed.status.code(), Some(0));
+    assert_eq!(home.rows().len(), 1);
+
+    // Grant BUILTIN\Users read on the isolated metrics dir only; the foreign
+    // SID in the DACL must make open_metrics refuse the store.
+    let metrics_dir = home
+        .home
+        .join(".agents")
+        .join("prometheus")
+        .join("metrics");
+    let st = Command::new("icacls")
+        .arg(&metrics_dir)
+        .args(["/grant", "*S-1-5-32-545:(OI)(CI)R"])
+        .status()
+        .unwrap();
+    assert!(st.success(), "icacls grant failed on test fixture");
+
+    let next = kit_stdin(&home, &["compact", "--no-spillover"], b"more\n");
+    assert_eq!(next.status.code(), Some(0));
+    assert_eq!(
+        home.rows().len(),
+        1,
+        "permissive metrics dir must refuse appends"
+    );
 }

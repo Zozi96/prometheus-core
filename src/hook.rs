@@ -8,6 +8,7 @@
 //! Every other event, tool, and edit passes with `{}` (or `{"continue": true}` for
 //! Cursor's `beforeSubmitPrompt`), and direct checks never trigger `permissionDecision`.
 
+use crate::metrics::{self, Host, Rule};
 use crate::store::{ensure_private_dir, sha256_hex};
 use serde_json::{json, Map, Value};
 use std::ffi::OsStr;
@@ -941,14 +942,25 @@ pub fn whole_file_warning(host: &str, event: &Value, session_id: &str, root: Opt
     key_bytes.extend_from_slice(target_str.as_bytes());
     let key = sha256_hex(&key_bytes);
     let state = folder.join(format!("reread-{key}"));
-    match read_reread_state(&state) {
-        StoredHash::Malformed => String::new(),
-        StoredHash::Present(stored) if stored == digest => REREAD_MESSAGE.to_string(),
+    let (rule, warning) = match read_reread_state(&state) {
+        StoredHash::Malformed => return String::new(),
+        StoredHash::Present(stored) if stored == digest => {
+            (Rule::RereadWarning, REREAD_MESSAGE.to_string())
+        }
         _ => {
             write_reread_state(&state, &digest);
-            large_read_advisory(&target_path, line_count)
+            (
+                Rule::LargeReadAdvisory,
+                large_read_advisory(&target_path, line_count),
+            )
+        }
+    };
+    if !warning.is_empty() {
+        if let Some(host) = Host::from_hook(host) {
+            metrics::record(host, rule, 0, warning.len());
         }
     }
+    warning
 }
 
 // ---------------------------------------------------------------------------

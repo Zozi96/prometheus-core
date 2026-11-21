@@ -12,6 +12,7 @@ pub mod impact;
 pub mod kit_util;
 pub mod logs;
 pub mod map;
+pub mod metrics;
 pub mod outline;
 pub mod search;
 pub mod slice;

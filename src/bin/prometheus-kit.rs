@@ -9,18 +9,22 @@
 //!   map         One-call repository tree with line counts and optional top-level symbols.
 //!   hook        PreToolUse secret-path, large-read/reread, and shell-rewrite guards.
 //!   droid-mode  Switch installed Factory Droid model pins between on/off modes.
+//!   metrics     Print local hook-rule totals by host and rule (maintainer aid).
 
 use prometheus_core::compact::{
     compact_command, compact_text, render_compact_json, render_compact_text, CompactMode,
     CompactOptions,
 };
-use prometheus_core::diff::{execute_diff, render_diff_json, render_diff_text, DiffMode, DiffOptions};
+use prometheus_core::diff::{
+    execute_diff, render_diff_json, render_diff_text, DiffMode, DiffOptions, DiffOutput,
+};
 use prometheus_core::droid_mode::{apply_mode, default_home, resolve_config_path};
 use prometheus_core::hook::{is_supported_host, panic_fallback, run_hook};
 use prometheus_core::map::{execute_map, render_map_json, render_map_text, MapOptions};
+use prometheus_core::metrics::{self, Rule};
 use prometheus_core::outline::{
-    outline_file, read_text_file, render_outline_json, render_outline_text, Lang, OutlineOptions,
-    DEFAULT_OUTLINE_MAX_TOKENS,
+    outline_file, read_text_file_sized, render_outline_json, render_outline_text, Lang,
+    OutlineOptions, DEFAULT_OUTLINE_MAX_TOKENS,
 };
 use prometheus_core::search::{execute_search, render_search_json, render_search_text, SearchOptions};
 use prometheus_core::slice::{
@@ -42,6 +46,7 @@ commands:
   map         Repository directory map with line counts and optional top-level symbols
   hook        Evaluate PreToolUse secret, read-budget, and rewrite guards for a host
   droid-mode  Switch installed Droid model pins between on and off modes
+  metrics     Print local totals by host and rule (maintainer aid)
 
 options:
   -h, --help      Show help
@@ -162,6 +167,39 @@ fn emit_output(rendered: &str) {
     let _ = std::io::stdout().flush();
 }
 
+/// Wire bytes a rendered string occupies on stdout: content plus the newline
+/// `emit_output` appends when missing.
+fn wire_len(s: &str) -> usize {
+    s.len() + usize::from(!s.ends_with('\n'))
+}
+
+/// Emit exactly `rendered`, then record a metrics row when the run reduced or
+/// clipped its input (`clipped`) or the raw input exceeded the wire output.
+/// Metrics failures are silent and never alter the reply.
+fn emit_measured(rule: Rule, raw: usize, clipped: bool, rendered: &str) {
+    emit_output(rendered);
+    if clipped || raw > wire_len(rendered) {
+        metrics::record(metrics::command_host(), rule, raw, wire_len(rendered));
+    }
+}
+
+/// Detect a render-stage budget cut by comparing `rendered` with an
+/// unbudgeted in-memory re-render. The closure runs only when metrics are
+/// enabled, a nonzero budget applied, and the raw input was not already
+/// larger than the emission (that case records via `raw > wire_len`), so
+/// disabled or already-reduced runs pay nothing.
+fn render_was_clipped(
+    rendered: &str,
+    max_tokens: usize,
+    raw_bytes: usize,
+    full: impl FnOnce() -> String,
+) -> bool {
+    metrics::enabled()
+        && max_tokens != 0
+        && raw_bytes <= wire_len(rendered)
+        && full() != rendered
+}
+
 fn next_val(raw: &[String], index: &mut usize, flag: &str, usage: &str) -> Result<String, i32> {
     *index += 1;
     match raw.get(*index) {
@@ -267,11 +305,17 @@ fn run_outline(raw: &[String]) -> i32 {
     } else {
         render_outline_text(&docs, &opts)
     };
-    print!("{rendered}");
-    if !rendered.ends_with('\n') {
-        println!();
-    }
-    let _ = std::io::stdout().flush();
+    let raw_bytes: usize = docs.iter().map(|d| d.raw_bytes).sum();
+    let clipped = render_was_clipped(&rendered, opts.max_tokens, raw_bytes, || {
+        let mut unbudgeted = opts.clone();
+        unbudgeted.max_tokens = 0;
+        if json_mode {
+            render_outline_json(&docs, &unbudgeted)
+        } else {
+            render_outline_text(&docs, &unbudgeted)
+        }
+    });
+    emit_measured(Rule::Outline, raw_bytes, clipped, &rendered);
     0
 }
 
@@ -345,7 +389,18 @@ fn run_slice(raw: &[String]) -> i32 {
             } else {
                 render_slice_text(&result, &opts)
             };
-            emit_output(&rendered);
+            let mut clipped = result.truncated
+                || result.signature_clipped
+                || result
+                    .slices
+                    .iter()
+                    .any(|b| b.lines.iter().any(|l| l.truncated));
+            if !clipped && json_mode {
+                clipped = render_was_clipped(&rendered, opts.max_tokens, result.raw_bytes, || {
+                    render_slice_json(&result, 0)
+                });
+            }
+            emit_measured(Rule::Slice, result.raw_bytes, clipped, &rendered);
             0
         }
         Err(err) => {
@@ -432,8 +487,12 @@ fn run_compact(raw: &[String]) -> i32 {
             }
         }
     } else if let Some(path) = file_path {
-        match read_text_file(&path) {
-            Ok((text, _)) => (compact_text(&text, None, &opts), 0),
+        match read_text_file_sized(&path) {
+            Ok((text, _, raw_bytes)) => {
+                let mut res = compact_text(&text, None, &opts);
+                res.raw_bytes = raw_bytes;
+                (res, 0)
+            }
             Err(err) => {
                 eprintln!("prometheus-kit compact: {err}");
                 return 1;
@@ -445,8 +504,11 @@ fn run_compact(raw: &[String]) -> i32 {
             eprintln!("prometheus-kit compact: stdin: {err}");
             return 1;
         }
+        let raw_bytes = buf.len();
         let text = String::from_utf8_lossy(&buf);
-        (compact_text(&text, None, &opts), 0)
+        let mut res = compact_text(&text, None, &opts);
+        res.raw_bytes = raw_bytes;
+        (res, 0)
     };
 
     let rendered = if json_mode {
@@ -454,7 +516,8 @@ fn run_compact(raw: &[String]) -> i32 {
     } else {
         render_compact_text(&result, opts.max_tokens)
     };
-    emit_output(&rendered);
+    // Every compaction counts as a reduction, including render overhead.
+    emit_measured(Rule::Compact, result.raw_bytes, true, &rendered);
     exit_code
 }
 
@@ -548,7 +611,23 @@ fn run_search(raw: &[String]) -> i32 {
             } else {
                 render_search_text(&res, &opts)
             };
-            emit_output(&rendered);
+            let mut clipped = res.truncated
+                || res
+                    .files
+                    .iter()
+                    .any(|f| f.matches.iter().any(|m| m.clipped));
+            if !clipped {
+                clipped = render_was_clipped(&rendered, opts.max_tokens, res.raw_bytes, || {
+                    let mut unbudgeted = opts.clone();
+                    unbudgeted.max_tokens = 0;
+                    if json_mode {
+                        render_search_json(&res, &unbudgeted)
+                    } else {
+                        render_search_text(&res, &unbudgeted)
+                    }
+                });
+            }
+            emit_measured(Rule::Search, res.raw_bytes, clipped, &rendered);
             0
         }
         Err(err) => {
@@ -647,7 +726,42 @@ fn run_diff(raw: &[String]) -> i32 {
             } else {
                 render_diff_text(&out, opts.max_tokens)
             };
-            emit_output(&rendered);
+            let raw_bytes = match &out {
+                DiffOutput::Status(s) => s.raw_bytes,
+                DiffOutput::Diff { raw_bytes, .. } => *raw_bytes,
+            };
+            let mut clipped = match &out {
+                DiffOutput::Status(s) => {
+                    s.truncated || s.omitted_entries > 0 || !s.excluded_noise.is_empty()
+                }
+                DiffOutput::Diff {
+                    files,
+                    excluded_noise,
+                    truncated,
+                    omitted_files,
+                    filtered_output,
+                    ..
+                } => {
+                    *truncated
+                        || *omitted_files > 0
+                        || !excluded_noise.is_empty()
+                        || *filtered_output
+                        || files.iter().any(|f| {
+                            f.summary_note.is_some()
+                                || f.hunks.iter().any(|h| h.omitted_lines > 0)
+                        })
+                }
+            };
+            if !clipped {
+                clipped = render_was_clipped(&rendered, opts.max_tokens, raw_bytes, || {
+                    if json_mode {
+                        render_diff_json(&out, 0)
+                    } else {
+                        render_diff_text(&out, 0)
+                    }
+                });
+            }
+            emit_measured(Rule::Diff, raw_bytes, clipped, &rendered);
             0
         }
         Err(err) => {
@@ -735,7 +849,24 @@ fn run_map(raw: &[String]) -> i32 {
             } else {
                 render_map_text(&res, opts.max_tokens)
             };
-            emit_output(&rendered);
+            // Raw is the same map's unbudgeted render; with no budget the
+            // rendered output already is that render, so raw == emitted.
+            let mut raw = 0usize;
+            let mut clipped = false;
+            if metrics::enabled() {
+                if opts.max_tokens == 0 {
+                    raw = wire_len(&rendered);
+                } else {
+                    let full = if json_mode {
+                        render_map_json(&res, 0)
+                    } else {
+                        render_map_text(&res, 0)
+                    };
+                    clipped = full != rendered;
+                    raw = wire_len(&full);
+                }
+            }
+            emit_measured(Rule::Map, raw, clipped, &rendered);
             0
         }
         Err(err) => {
@@ -758,6 +889,10 @@ options:
   --config <path>   Path to droid-modes.json
   --home <dir>      Home directory holding .factory/
   -h, --help        Show help";
+
+const METRICS_USAGE: &str = "\
+usage: prometheus-kit metrics
+Print local totals by host and rule. Set PROMETHEUS_KIT_NO_METRICS to disable writes.";
 
 fn run_hook_cmd(raw: &[String]) -> i32 {
     let mut host: Option<String> = None;
@@ -894,6 +1029,18 @@ fn main() {
         "map" => run_map(&raw[1..]),
         "hook" => run_hook_cmd(&raw[1..]),
         "droid-mode" => run_droid_mode_cmd(&raw[1..]),
+        "metrics" if raw.len() == 1 => {
+            println!("{}", prometheus_core::metrics::totals());
+            0
+        }
+        "metrics" if matches!(raw.as_slice(), [_, flag] if flag == "-h" || flag == "--help") => {
+            println!("{METRICS_USAGE}");
+            0
+        }
+        "metrics" => {
+            eprintln!("{METRICS_USAGE}");
+            2
+        }
         other => {
             eprintln!("prometheus-kit: unknown command `{other}`\n{MAIN_USAGE}");
             2
