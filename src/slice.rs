@@ -25,6 +25,7 @@ pub enum SliceTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SliceSpec {
+    pub raw: String,
     pub path: PathBuf,
     pub target: SliceTarget,
 }
@@ -76,6 +77,12 @@ pub struct SliceBlock {
     pub lines: Vec<SliceLine>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SliceError {
+    pub spec: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SliceResult {
     pub slices: Vec<SliceBlock>,
@@ -83,12 +90,17 @@ pub struct SliceResult {
     pub omitted_slices: usize,
     pub omitted_lines: usize,
     pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<SliceError>,
     /// Byte length of the merged selected source spans before budget cuts; metrics-only.
     #[serde(skip)]
     pub raw_bytes: usize,
     /// A signatures-only run collapsed a multi-line interval to its signature; metrics-only.
     #[serde(skip)]
     pub signature_clipped: bool,
+    /// Number of specs that resolved cleanly; used to separate partial success from total failure.
+    #[serde(skip)]
+    pub succeeded_specs: usize,
 }
 
 pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
@@ -109,6 +121,7 @@ pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
         let sel = sel.trim();
         if let Some(n) = parse_tail_count(sel) {
             return Ok(SliceSpec {
+                raw: trimmed.to_owned(),
                 path: PathBuf::from(path_part),
                 target: SliceTarget::Tail(n),
             });
@@ -116,11 +129,13 @@ pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
         if looks_like_range_list(sel) {
             let ranges = parse_ranges(sel, raw)?;
             return Ok(SliceSpec {
+                raw: trimmed.to_owned(),
                 path: PathBuf::from(path_part),
                 target: SliceTarget::Ranges(ranges),
             });
         }
         return Ok(SliceSpec {
+            raw: trimmed.to_owned(),
             path: PathBuf::from(path_part),
             target: SliceTarget::Selector(sel.to_owned()),
         });
@@ -131,6 +146,7 @@ pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
         if !path_part.is_empty() && !is_drive_prefix {
             if let Some(n) = parse_tail_count(range_part) {
                 return Ok(SliceSpec {
+                    raw: trimmed.to_owned(),
                     path: PathBuf::from(path_part),
                     target: SliceTarget::Tail(n),
                 });
@@ -139,6 +155,7 @@ pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
         if !path_part.is_empty() && !is_drive_prefix && looks_like_range_list(range_part) {
             let ranges = parse_ranges(range_part, raw)?;
             return Ok(SliceSpec {
+                raw: trimmed.to_owned(),
                 path: PathBuf::from(path_part),
                 target: SliceTarget::Ranges(ranges),
             });
@@ -224,18 +241,9 @@ fn merge_intervals(
     raw: Vec<Interval>,
     total_lines: usize,
     context_lines: usize,
-) -> Result<Vec<Interval>, String> {
-    if total_lines == 0 {
-        return Err("file is empty (0 lines)".to_owned());
-    }
+) -> Vec<Interval> {
     let mut normalized = Vec::with_capacity(raw.len());
     for item in raw {
-        if item.start > total_lines {
-            return Err(format!(
-                "requested line {} exceeds file length ({total_lines} lines)",
-                item.start
-            ));
-        }
         let s = item.start.saturating_sub(context_lines).max(1);
         let e = item.end.saturating_add(context_lines).min(total_lines);
         if s <= e {
@@ -275,7 +283,7 @@ fn merge_intervals(
         }
         merged.push(item);
     }
-    Ok(merged)
+    merged
 }
 
 fn norm_sep(s: &str) -> String {
@@ -485,16 +493,65 @@ fn clip_line_to_chars(line: &str, max_chars: usize) -> (String, bool) {
 }
 
 pub fn execute_slices(specs: &[SliceSpec], opts: &SliceOptions) -> Result<SliceResult, String> {
+    let result = execute_slices_partial(specs, opts);
+    if result.succeeded_specs == 0 && !result.errors.is_empty() {
+        let joined = result
+            .errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(joined);
+    }
+    Ok(result)
+}
+
+/// Parse and execute a batch of raw CLI specs in input order.
+/// Returns `Err(parse_errors)` when every spec fails syntax parsing (exit 2),
+/// or `Ok(SliceResult)` with execution and parse errors merged in CLI order.
+pub fn parse_and_execute_slices_partial(
+    raw_specs: &[String],
+    opts: &SliceOptions,
+) -> Result<SliceResult, Vec<SliceError>> {
+    let mut items: Vec<Result<SliceSpec, SliceError>> = Vec::with_capacity(raw_specs.len());
+    let mut parsed_count = 0usize;
+    for raw in raw_specs {
+        let normalized = raw.trim().to_owned();
+        match parse_spec(raw) {
+            Ok(spec) => {
+                parsed_count += 1;
+                items.push(Ok(spec));
+            }
+            Err(message) => items.push(Err(SliceError {
+                spec: normalized,
+                message,
+            })),
+        }
+    }
+    if parsed_count == 0 {
+        let errs = items.into_iter().filter_map(Result::err).collect();
+        return Err(errs);
+    }
+    Ok(execute_slice_items(&items, opts))
+}
+
+pub fn execute_slices_partial(specs: &[SliceSpec], opts: &SliceOptions) -> SliceResult {
+    let items: Vec<Result<SliceSpec, SliceError>> = specs.iter().cloned().map(Ok).collect();
+    execute_slice_items(&items, opts)
+}
+
+fn execute_slice_items(items: &[Result<SliceSpec, SliceError>], opts: &SliceOptions) -> SliceResult {
     struct CachedFile {
         src: String,
         idx: LineIndex,
         lang: Option<Lang>,
     }
-    let mut cache: HashMap<PathBuf, CachedFile> = HashMap::new();
+    let mut cache: HashMap<PathBuf, Result<CachedFile, String>> = HashMap::new();
     let mut warnings = Vec::new();
+    let mut errors: Vec<SliceError> = Vec::new();
+    let mut succeeded_specs = 0usize;
 
     struct FileIntervals {
-        path: PathBuf,
         display: String,
         intervals: Vec<Interval>,
     }
@@ -502,37 +559,86 @@ pub fn execute_slices(specs: &[SliceSpec], opts: &SliceOptions) -> Result<SliceR
     let mut per_file_map: HashMap<PathBuf, FileIntervals> = HashMap::new();
     let mut computed_blocks: Vec<(String, ComputedSelection)> = Vec::new();
 
-    for spec in specs {
+    for item in items {
+        let spec = match item {
+            Ok(spec) => spec,
+            Err(err) => {
+                errors.push(err.clone());
+                continue;
+            }
+        };
         let key = std::fs::canonicalize(&spec.path).unwrap_or_else(|_| spec.path.clone());
         if !cache.contains_key(&key) {
-            let (src, w) = read_text_file(&spec.path)?;
-            for msg in w {
-                warnings.push(format!("{}: {msg}", spec.path.display()));
-            }
-            let idx = LineIndex::new(&src);
-            let lang = opts.lang_override.or_else(|| Lang::from_path(&spec.path));
-            cache.insert(key.clone(), CachedFile { src, idx, lang });
+            let loaded = match read_text_file(&spec.path) {
+                Ok((src, w)) => {
+                    for msg in w {
+                        warnings.push(format!("{}: {msg}", spec.path.display()));
+                    }
+                    let idx = LineIndex::new(&src);
+                    let lang = opts.lang_override.or_else(|| Lang::from_path(&spec.path));
+                    Ok(CachedFile { src, idx, lang })
+                }
+                Err(err) => Err(err),
+            };
+            cache.insert(key.clone(), loaded);
         }
-        let cached = cache.get(&key).unwrap();
+        let cached = match cache.get(&key).unwrap() {
+            Ok(c) => c,
+            Err(err) => {
+                errors.push(SliceError {
+                    spec: spec.raw.clone(),
+                    message: err.clone(),
+                });
+                continue;
+            }
+        };
         let display = spec.path.to_string_lossy().to_string();
-        let resolution = resolve_ranges_for_spec(
+        let resolution = match resolve_ranges_for_spec(
             &display,
             &cached.src,
             &cached.idx,
             cached.lang,
             &spec.target,
-        )?;
+        ) {
+            Ok(res) => res,
+            Err(err) => {
+                errors.push(SliceError {
+                    spec: spec.raw.clone(),
+                    message: err,
+                });
+                continue;
+            }
+        };
         match resolution {
             SpecResolution::Computed(computed) => {
                 computed_blocks.push((display, computed));
+                succeeded_specs += 1;
             }
             SpecResolution::Intervals(intervals) => {
+                let total_lines = cached.idx.total_lines();
+                if total_lines == 0 {
+                    errors.push(SliceError {
+                        spec: spec.raw.clone(),
+                        message: format!("{display}: file is empty (0 lines)"),
+                    });
+                    continue;
+                }
+                if let Some(bad) = intervals.iter().find(|iv| iv.start > total_lines) {
+                    errors.push(SliceError {
+                        spec: spec.raw.clone(),
+                        message: format!(
+                            "{display}: requested line {} exceeds file length ({total_lines} lines)",
+                            bad.start
+                        ),
+                    });
+                    continue;
+                }
+                succeeded_specs += 1;
                 if !per_file_map.contains_key(&key) {
                     per_file_order.push(key.clone());
                     per_file_map.insert(
                         key.clone(),
                         FileIntervals {
-                            path: spec.path.clone(),
                             display,
                             intervals,
                         },
@@ -545,10 +651,25 @@ pub fn execute_slices(specs: &[SliceSpec], opts: &SliceOptions) -> Result<SliceR
     }
 
     let unlimited = opts.max_tokens == 0;
-    let budget_chars = if unlimited {
+    let total_budget_chars = if unlimited {
         usize::MAX
     } else {
         opts.max_tokens.saturating_mul(4)
+    };
+    let error_bytes: usize = if errors.is_empty() {
+        0
+    } else {
+        1 + errors.iter().map(|e| e.message.len() + 8).sum::<usize>()
+    };
+    let err_reserve = if unlimited || errors.is_empty() {
+        0
+    } else {
+        error_bytes.min(total_budget_chars / 3)
+    };
+    let budget_chars = if unlimited {
+        usize::MAX
+    } else {
+        total_budget_chars.saturating_sub(err_reserve)
     };
     const RESERVE: usize = 96;
     let mut used = 0usize;
@@ -561,13 +682,12 @@ pub fn execute_slices(specs: &[SliceSpec], opts: &SliceOptions) -> Result<SliceR
 
     for key in per_file_order {
         let entry = per_file_map.remove(&key).unwrap();
-        let cached = cache.get(&key).unwrap();
+        let cached = cache.get(&key).unwrap().as_ref().unwrap();
         let merged = merge_intervals(
             entry.intervals,
             cached.idx.total_lines(),
             if opts.signatures_only { 0 } else { opts.context_lines },
-        )
-        .map_err(|e| format!("{}: {e}", entry.path.display()))?;
+        );
 
         for iv in merged {
             // Raw input is the full merged selected span(s) before any budget
@@ -742,15 +862,17 @@ pub fn execute_slices(specs: &[SliceSpec], opts: &SliceOptions) -> Result<SliceR
         }
     }
 
-    Ok(SliceResult {
+    SliceResult {
         slices: kept,
         truncated,
         omitted_slices,
         omitted_lines,
         warnings,
+        errors,
         raw_bytes,
         signature_clipped,
-    })
+        succeeded_specs,
+    }
 }
 
 pub fn render_slice_text(result: &SliceResult, opts: &SliceOptions) -> String {
@@ -808,7 +930,83 @@ pub fn render_slice_text(result: &SliceResult, opts: &SliceOptions) -> String {
             result.omitted_lines, result.omitted_slices
         ));
     }
+    if !result.errors.is_empty() {
+        let budget_chars = if opts.max_tokens == 0 {
+            usize::MAX
+        } else {
+            opts.max_tokens.saturating_mul(4)
+        };
+        if !out.is_empty() && (budget_chars == usize::MAX || out.len() + 1 < budget_chars) {
+            out.push('\n');
+        }
+        const ERR_TAIL_RESERVE: usize = 36;
+        let mut emitted_errors = 0usize;
+        for (idx, err) in result.errors.iter().enumerate() {
+            let line = format!("error: {}\n", err.message);
+            let remaining_after = result.errors.len() - idx - 1;
+            let reserve = if remaining_after > 0 { ERR_TAIL_RESERVE } else { 0 };
+            if budget_chars != usize::MAX && out.len() + line.len() + reserve > budget_chars {
+                if emitted_errors == 0 && out.len() + 16 < budget_chars {
+                    let avail = budget_chars.saturating_sub(out.len() + 8 + reserve);
+                    let (clipped, _) = clip_line_to_chars(&err.message, avail.max(16));
+                    out.push_str(&format!("error: {clipped}\n"));
+                    emitted_errors += 1;
+                }
+                let omitted = result.errors.len().saturating_sub(emitted_errors);
+                if omitted > 0 {
+                    out.push_str(&format!("... (+{omitted} omitted errors)\n"));
+                }
+                break;
+            }
+            out.push_str(&line);
+            emitted_errors += 1;
+        }
+    }
     out
+}
+
+fn cap_slice_errors_for_json(errors: &[SliceError], max_bytes: usize) -> (Vec<SliceError>, bool) {
+    if errors.is_empty() {
+        return (Vec::new(), false);
+    }
+    let full = serde_json::to_string(errors).unwrap_or_default();
+    if full.len() <= max_bytes {
+        return (errors.to_vec(), false);
+    }
+    let mut kept = Vec::new();
+    for (idx, err) in errors.iter().enumerate() {
+        let omitted = errors.len() - idx - 1;
+        let mut candidate = kept.clone();
+        candidate.push(err.clone());
+        if omitted > 0 {
+            candidate.push(SliceError {
+                spec: "...".to_owned(),
+                message: format!("... (+{omitted} omitted errors)"),
+            });
+        }
+        if serde_json::to_string(&candidate).unwrap_or_default().len() <= max_bytes {
+            kept.push(err.clone());
+        } else {
+            break;
+        }
+    }
+    let omitted = errors.len() - kept.len();
+    if omitted > 0 {
+        let summary = SliceError {
+            spec: "...".to_owned(),
+            message: format!("... (+{omitted} omitted errors)"),
+        };
+        kept.push(summary);
+    }
+    while serde_json::to_string(&kept).unwrap_or_default().len() > max_bytes && kept.len() > 1 {
+        kept.pop();
+        let omitted_now = errors.len().saturating_sub(kept.len().saturating_sub(1));
+        if let Some(last) = kept.last_mut() {
+            last.spec = "...".to_owned();
+            last.message = format!("... (+{omitted_now} omitted errors)");
+        }
+    }
+    (kept, true)
 }
 
 pub fn render_slice_json(result: &SliceResult, max_tokens: usize) -> String {
@@ -820,11 +1018,24 @@ pub fn render_slice_json(result: &SliceResult, max_tokens: usize) -> String {
     if encoded.len() <= budget_chars {
         return encoded;
     }
-    // Trim trailing lines/slices until compact JSON fits within `budget_chars`.
+    // Bound errors first when slices exist so large error lists never starve all valid slices.
     let mut trimmed = result.clone();
+    if !trimmed.errors.is_empty() {
+        let err_budget = if trimmed.slices.is_empty() {
+            budget_chars.saturating_sub(96)
+        } else {
+            (budget_chars / 2).max(96)
+        };
+        let (capped, dropped) = cap_slice_errors_for_json(&trimmed.errors, err_budget);
+        if dropped {
+            trimmed.errors = capped;
+            trimmed.truncated = true;
+        }
+    }
+    // Trim trailing lines/slices until compact JSON fits within `budget_chars`.
     loop {
         let cur = serde_json::to_string(&trimmed).unwrap_or_else(|_| "{}".to_owned());
-        if cur.len() <= budget_chars || trimmed.slices.is_empty() {
+        if cur.len() <= budget_chars {
             return cur;
         }
         if let Some(last) = trimmed.slices.last_mut() {
@@ -835,11 +1046,29 @@ pub fn render_slice_json(result: &SliceResult, max_tokens: usize) -> String {
                 continue;
             }
         }
+        if trimmed.slices.len() > 1 {
+            if let Some(dropped) = trimmed.slices.pop() {
+                trimmed.truncated = true;
+                trimmed.omitted_slices += 1;
+                trimmed.omitted_lines += dropped.lines.len();
+                continue;
+            }
+        }
+        if trimmed.errors.len() > 1 {
+            let (capped, _) = cap_slice_errors_for_json(&result.errors, 80);
+            if capped.len() < trimmed.errors.len() {
+                trimmed.errors = capped;
+                trimmed.truncated = true;
+                continue;
+            }
+        }
         if let Some(dropped) = trimmed.slices.pop() {
             trimmed.truncated = true;
             trimmed.omitted_slices += 1;
             trimmed.omitted_lines += dropped.lines.len();
+            continue;
         }
+        return cur;
     }
 }
 
@@ -1101,6 +1330,48 @@ mod tests {
         let spec = parse_spec(&format!("{}:1-5", p.display())).unwrap();
         let err = execute_slices(&[spec], &SliceOptions::default()).unwrap_err();
         assert!(err.contains("binary file skipped"));
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn partial_success_keeps_valid_slices_and_reports_per_spec_errors() {
+        let src = "namespace A.B;\npublic class Svc {\n    public void Run() {}\n    public void Stop() {}\n}\n";
+        let p = temp_file("Svc.cs", src.as_bytes());
+        let missing = p.parent().unwrap().join("missing.cs");
+        let specs = vec![
+            parse_spec(&format!("{}::Svc.Run", p.display())).unwrap(),
+            parse_spec(&format!("{}::Rn", p.display())).unwrap(),
+            parse_spec(&format!("{}:999", p.display())).unwrap(),
+            parse_spec(&format!("{}:1-2", missing.display())).unwrap(),
+            parse_spec(&format!("{}::Svc.Stop", p.display())).unwrap(),
+        ];
+        let res = execute_slices(&specs, &SliceOptions::default()).unwrap();
+        assert_eq!(res.succeeded_specs, 2);
+        assert_eq!(res.errors.len(), 3);
+        assert!(res.errors[0].message.contains("closest:"));
+        assert!(res.errors[0].message.contains("A.B.Svc.Run"));
+        assert!(res.errors[1].message.contains("exceeds file length"));
+        assert!(res.errors[2].message.contains("missing.cs"));
+
+        let txt = render_slice_text(&res, &SliceOptions::default());
+        assert!(txt.contains("public void Run()"), "{txt}");
+        assert!(txt.contains("public void Stop()"), "{txt}");
+        assert!(txt.contains("error:"), "{txt}");
+        assert!(txt.contains("closest:"), "{txt}");
+
+        let json_str = render_slice_json(&res, DEFAULT_SLICE_MAX_TOKENS);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["errors"].as_array().unwrap().len(), 3);
+        assert!(!parsed["slices"].as_array().unwrap().is_empty());
+
+        // Total failure still returns Err with every diagnostic.
+        let bad_only = vec![
+            parse_spec(&format!("{}::Rn", p.display())).unwrap(),
+            parse_spec(&format!("{}:1-2", missing.display())).unwrap(),
+        ];
+        let err = execute_slices(&bad_only, &SliceOptions::default()).unwrap_err();
+        assert!(err.contains("A.B.Svc.Run"), "{err}");
+        assert!(err.contains("missing.cs"), "{err}");
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }

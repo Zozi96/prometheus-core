@@ -116,6 +116,12 @@ pub struct OutlineItem {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OutlineError {
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OutlineDoc {
     pub path: String,
     pub lang: String,
@@ -370,10 +376,33 @@ fn format_line_range(start: usize, end: usize) -> String {
 }
 
 pub fn render_outline_text(docs: &[OutlineDoc], opts: &OutlineOptions) -> String {
-    let budget_chars = if opts.max_tokens == 0 {
+    render_outline_text_with_errors(docs, &[], opts)
+}
+
+pub fn render_outline_text_with_errors(
+    docs: &[OutlineDoc],
+    errors: &[OutlineError],
+    opts: &OutlineOptions,
+) -> String {
+    let total_budget_chars = if opts.max_tokens == 0 {
         usize::MAX
     } else {
         opts.max_tokens.saturating_mul(4)
+    };
+    let error_bytes: usize = if errors.is_empty() {
+        0
+    } else {
+        1 + errors.iter().map(|e| e.message.len() + 8).sum::<usize>()
+    };
+    let err_reserve = if total_budget_chars == usize::MAX || errors.is_empty() {
+        0
+    } else {
+        error_bytes.min(total_budget_chars / 3)
+    };
+    let budget_chars = if total_budget_chars == usize::MAX {
+        usize::MAX
+    } else {
+        total_budget_chars.saturating_sub(err_reserve)
     };
     const RESERVE: usize = 84;
     let filtered: Vec<OutlineDoc> = docs.iter().map(|d| filtered_doc(d, opts)).collect();
@@ -465,7 +494,77 @@ pub fn render_outline_text(docs: &[OutlineDoc], opts: &OutlineOptions) -> String
             ));
         }
     }
+    if !errors.is_empty() {
+        if !out.is_empty() && (total_budget_chars == usize::MAX || out.len() + 1 < total_budget_chars) {
+            out.push('\n');
+        }
+        const ERR_TAIL_RESERVE: usize = 36;
+        let mut emitted_errors = 0usize;
+        for (idx, err) in errors.iter().enumerate() {
+            let line = format!("error: {}\n", err.message);
+            let remaining_after = errors.len() - idx - 1;
+            let reserve = if remaining_after > 0 { ERR_TAIL_RESERVE } else { 0 };
+            if total_budget_chars != usize::MAX && out.len() + line.len() + reserve > total_budget_chars {
+                if emitted_errors == 0 && out.len() + 16 < total_budget_chars {
+                    let avail = total_budget_chars.saturating_sub(out.len() + 8 + reserve);
+                    let clipped = lexer::normalize_signature(&err.message, avail.max(16));
+                    out.push_str(&format!("error: {clipped}\n"));
+                    emitted_errors += 1;
+                }
+                let omitted = errors.len().saturating_sub(emitted_errors);
+                if omitted > 0 {
+                    out.push_str(&format!("... (+{omitted} omitted errors)\n"));
+                }
+                break;
+            }
+            out.push_str(&line);
+            emitted_errors += 1;
+        }
+    }
     out
+}
+
+fn cap_outline_errors_for_json(errors: &[OutlineError], max_bytes: usize) -> (Vec<OutlineError>, bool) {
+    if errors.is_empty() {
+        return (Vec::new(), false);
+    }
+    let full = serde_json::to_string(errors).unwrap_or_default();
+    if full.len() <= max_bytes {
+        return (errors.to_vec(), false);
+    }
+    let mut kept = Vec::new();
+    for (idx, err) in errors.iter().enumerate() {
+        let omitted = errors.len() - idx - 1;
+        let mut candidate = kept.clone();
+        candidate.push(err.clone());
+        if omitted > 0 {
+            candidate.push(OutlineError {
+                path: "...".to_owned(),
+                message: format!("... (+{omitted} omitted errors)"),
+            });
+        }
+        if serde_json::to_string(&candidate).unwrap_or_default().len() <= max_bytes {
+            kept.push(err.clone());
+        } else {
+            break;
+        }
+    }
+    let omitted = errors.len() - kept.len();
+    if omitted > 0 {
+        kept.push(OutlineError {
+            path: "...".to_owned(),
+            message: format!("... (+{omitted} omitted errors)"),
+        });
+    }
+    while serde_json::to_string(&kept).unwrap_or_default().len() > max_bytes && kept.len() > 1 {
+        kept.pop();
+        let omitted_now = errors.len().saturating_sub(kept.len().saturating_sub(1));
+        if let Some(last) = kept.last_mut() {
+            last.path = "...".to_owned();
+            last.message = format!("... (+{omitted_now} omitted errors)");
+        }
+    }
+    (kept, true)
 }
 
 #[derive(Serialize)]
@@ -473,6 +572,8 @@ struct OutlineJsonResponse {
     docs: Vec<OutlineDoc>,
     truncated: bool,
     omitted_items: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<OutlineError>,
 }
 
 fn prune_items_for_budget(
@@ -496,12 +597,21 @@ fn prune_items_for_budget(
 }
 
 pub fn render_outline_json(docs: &[OutlineDoc], opts: &OutlineOptions) -> String {
+    render_outline_json_with_errors(docs, &[], opts)
+}
+
+pub fn render_outline_json_with_errors(
+    docs: &[OutlineDoc],
+    errors: &[OutlineError],
+    opts: &OutlineOptions,
+) -> String {
     let mut filtered: Vec<OutlineDoc> = docs.iter().map(|d| filtered_doc(d, opts)).collect();
     if opts.max_tokens == 0 {
         let resp = OutlineJsonResponse {
             docs: filtered,
             truncated: false,
             omitted_items: 0,
+            errors: errors.to_vec(),
         };
         return serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_owned());
     }
@@ -511,10 +621,26 @@ pub fn render_outline_json(docs: &[OutlineDoc], opts: &OutlineOptions) -> String
         docs: filtered.clone(),
         truncated: false,
         omitted_items: 0,
+        errors: errors.to_vec(),
     };
     let serialized = serde_json::to_string(&full).unwrap_or_else(|_| "{}".to_owned());
-    if serialized.len() <= budget_chars || total_items == 0 {
+    if serialized.len() <= budget_chars {
         return serialized;
+    }
+    let err_budget = if filtered.is_empty() {
+        budget_chars.saturating_sub(96)
+    } else {
+        (budget_chars / 2).max(96)
+    };
+    let (capped_errors, errors_clipped) = cap_outline_errors_for_json(errors, err_budget);
+    if total_items == 0 {
+        let resp = OutlineJsonResponse {
+            docs: filtered,
+            truncated: errors_clipped,
+            omitted_items: 0,
+            errors: capped_errors,
+        };
+        return serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_owned());
     }
     // Binary search maximum item count whose emitted compact JSON fits within budget_chars.
     let mut lo = 1usize;
@@ -532,8 +658,9 @@ pub fn render_outline_json(docs: &[OutlineDoc], opts: &OutlineOptions) -> String
         }
         let resp = OutlineJsonResponse {
             docs: candidate_docs,
-            truncated: omitted > 0,
+            truncated: omitted > 0 || errors_clipped,
             omitted_items: omitted,
+            errors: capped_errors.clone(),
         };
         let encoded = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_owned());
         if encoded.len() <= budget_chars {
@@ -556,10 +683,34 @@ pub fn render_outline_json(docs: &[OutlineDoc], opts: &OutlineOptions) -> String
             }
             let resp = OutlineJsonResponse {
                 docs: filtered,
-                truncated: omitted > 0,
+                truncated: omitted > 0 || errors_clipped,
                 omitted_items: omitted,
+                errors: capped_errors,
             };
             serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_owned())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_outline_with_errors_includes_text_and_json_errors() {
+        let doc = outline_source("a.rs", "pub fn alpha() {}\n", Lang::Rust, &OutlineOptions::default());
+        let errors = vec![OutlineError {
+            path: "missing.rs".to_owned(),
+            message: "missing.rs: No such file or directory".to_owned(),
+        }];
+        let txt = render_outline_text_with_errors(std::slice::from_ref(&doc), &errors, &OutlineOptions::default());
+        assert!(txt.contains("pub fn alpha()"), "{txt}");
+        assert!(txt.contains("error: missing.rs: No such file or directory"), "{txt}");
+
+        let json_str = render_outline_json_with_errors(&[doc], &errors, &OutlineOptions::default());
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["docs"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["errors"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["errors"][0]["path"], "missing.rs");
     }
 }

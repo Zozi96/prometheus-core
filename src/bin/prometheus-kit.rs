@@ -24,12 +24,13 @@ use prometheus_core::kit_util::write_private_spillover;
 use prometheus_core::map::{execute_map, render_map_json, render_map_text, MapOptions};
 use prometheus_core::metrics::{self, Rule};
 use prometheus_core::outline::{
-    outline_file, read_text_file_sized, render_outline_json, render_outline_text, Lang,
-    OutlineOptions, DEFAULT_OUTLINE_MAX_TOKENS,
+    outline_file, read_text_file_sized, render_outline_json_with_errors,
+    render_outline_text_with_errors, Lang, OutlineError, OutlineOptions,
+    DEFAULT_OUTLINE_MAX_TOKENS,
 };
 use prometheus_core::search::{execute_search, render_search_json, render_search_text, SearchOptions};
 use prometheus_core::slice::{
-    execute_slices, parse_spec, render_slice_json, render_slice_text, SliceOptions,
+    parse_and_execute_slices_partial, render_slice_json, render_slice_text, SliceOptions,
     DEFAULT_SLICE_MAX_TOKENS,
 };
 use std::io::{Read, Write};
@@ -304,29 +305,40 @@ fn run_outline(raw: &[String]) -> i32 {
     }
 
     let mut docs = Vec::with_capacity(paths.len());
+    let mut errors: Vec<OutlineError> = Vec::new();
     for p in &paths {
         match outline_file(p, lang_override, &opts) {
             Ok(doc) => docs.push(doc),
-            Err(err) => {
-                eprintln!("prometheus-kit outline: {err}");
-                return 1;
-            }
+            Err(err) => errors.push(OutlineError {
+                path: p.to_string_lossy().into_owned(),
+                message: err,
+            }),
         }
     }
 
+    if docs.is_empty() {
+        for err in &errors {
+            eprintln!("prometheus-kit outline: {}", err.message);
+        }
+        if json_mode {
+            emit_output(&render_outline_json_with_errors(&docs, &errors, &opts));
+        }
+        return 1;
+    }
+
     let rendered = if json_mode {
-        render_outline_json(&docs, &opts)
+        render_outline_json_with_errors(&docs, &errors, &opts)
     } else {
-        render_outline_text(&docs, &opts)
+        render_outline_text_with_errors(&docs, &errors, &opts)
     };
     let raw_bytes: usize = docs.iter().map(|d| d.raw_bytes).sum();
     let clipped = render_was_clipped(&rendered, opts.max_tokens, raw_bytes, || {
         let mut unbudgeted = opts.clone();
         unbudgeted.max_tokens = 0;
         if json_mode {
-            render_outline_json(&docs, &unbudgeted)
+            render_outline_json_with_errors(&docs, &errors, &unbudgeted)
         } else {
-            render_outline_text(&docs, &unbudgeted)
+            render_outline_text_with_errors(&docs, &errors, &unbudgeted)
         }
     });
     emit_measured(Rule::Outline, raw_bytes, clipped, &rendered);
@@ -385,43 +397,50 @@ fn run_slice(raw: &[String]) -> i32 {
         return 2;
     }
 
-    let mut specs = Vec::with_capacity(raw_specs.len());
-    for raw_spec in &raw_specs {
-        match parse_spec(raw_spec) {
-            Ok(spec) => specs.push(spec),
-            Err(err) => {
-                eprintln!("prometheus-kit slice: {err}");
-                return 2;
+    let result = match parse_and_execute_slices_partial(&raw_specs, &opts) {
+        Ok(res) => res,
+        Err(parse_errors) => {
+            for err in &parse_errors {
+                eprintln!("prometheus-kit slice: {}", err.message);
             }
+            return 2;
         }
+    };
+
+    if result.succeeded_specs == 0 {
+        for err in &result.errors {
+            eprintln!("prometheus-kit slice: {}", err.message);
+        }
+        if json_mode {
+            emit_output(&render_slice_json(&result, opts.max_tokens));
+        }
+        return 1;
     }
 
-    match execute_slices(&specs, &opts) {
-        Ok(result) => {
-            let rendered = if json_mode {
-                render_slice_json(&result, opts.max_tokens)
+    let rendered = if json_mode {
+        render_slice_json(&result, opts.max_tokens)
+    } else {
+        render_slice_text(&result, &opts)
+    };
+    let mut clipped = result.truncated
+        || result.signature_clipped
+        || result
+            .slices
+            .iter()
+            .any(|b| b.lines.iter().any(|l| l.truncated));
+    if !clipped {
+        clipped = render_was_clipped(&rendered, opts.max_tokens, result.raw_bytes, || {
+            if json_mode {
+                render_slice_json(&result, 0)
             } else {
-                render_slice_text(&result, &opts)
-            };
-            let mut clipped = result.truncated
-                || result.signature_clipped
-                || result
-                    .slices
-                    .iter()
-                    .any(|b| b.lines.iter().any(|l| l.truncated));
-            if !clipped && json_mode {
-                clipped = render_was_clipped(&rendered, opts.max_tokens, result.raw_bytes, || {
-                    render_slice_json(&result, 0)
-                });
+                let mut unbudgeted = opts.clone();
+                unbudgeted.max_tokens = 0;
+                render_slice_text(&result, &unbudgeted)
             }
-            emit_measured(Rule::Slice, result.raw_bytes, clipped, &rendered);
-            0
-        }
-        Err(err) => {
-            eprintln!("prometheus-kit slice: {err}");
-            1
-        }
+        });
     }
+    emit_measured(Rule::Slice, result.raw_bytes, clipped, &rendered);
+    0
 }
 
 fn run_compact(raw: &[String]) -> i32 {

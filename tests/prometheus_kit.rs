@@ -1928,3 +1928,255 @@ fn keep_log_windows_private_route_writes_log() {
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains('O') && text.contains('E'), "log={text:?}");
 }
+
+#[test]
+fn slice_partial_success_emits_valid_results_diagnostics_json_and_metrics() {
+    let home = MetricsHome::new("slice_partial");
+    let rs = home.repo.join("Svc.cs");
+    fs::write(
+        &rs,
+        b"namespace Demo;\npublic class Svc {\n    public void Ping() {}\n    public void Pong() {}\n}\n",
+    )
+    .unwrap();
+    let missing = home.repo.join("nope.cs");
+    let valid_ping = format!("{}::Svc.Ping", rs.display());
+    let valid_pong = format!("{}::Svc.Pong", rs.display());
+    let typo = format!("{}::Png", rs.display());
+    let oob = format!("{}:999", rs.display());
+    let miss_spec = format!("{}:1-2", missing.display());
+
+    // Partial success (text): valid slices + per-spec error with closest: + exit 0
+    let text_out = run_kit(&["slice", &valid_ping, &typo, &oob, &miss_spec, &valid_pong], None);
+    assert_eq!(text_out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&text_out.stdout);
+    assert!(stdout.contains("public void Ping()"), "{stdout}");
+    assert!(stdout.contains("public void Pong()"), "{stdout}");
+    assert!(stdout.contains("error:"), "{stdout}");
+    assert!(stdout.contains("closest:"), "{stdout}");
+    assert!(stdout.contains("Demo.Svc.Ping"), "{stdout}");
+    assert!(stdout.contains("exceeds file length"), "{stdout}");
+    assert!(stdout.contains("nope.cs"), "{stdout}");
+
+    // Partial success (--json): valid JSON containing both slices and errors, exit 0
+    let json_out = run_kit(&["slice", "--json", &valid_ping, &typo, &miss_spec], None);
+    assert_eq!(json_out.status.code(), Some(0));
+    let parsed: Value = serde_json::from_slice(&json_out.stdout).expect("valid json");
+    assert_eq!(parsed["slices"].as_array().unwrap().len(), 1);
+    let errs = parsed["errors"].as_array().unwrap();
+    assert_eq!(errs.len(), 2);
+    assert_eq!(errs[0]["spec"], typo);
+    assert!(errs[0]["message"].as_str().unwrap().contains("closest:"));
+    assert_eq!(errs[1]["spec"], miss_spec);
+
+    // Total failure across multiple specs: exit 1, stderr diagnostics, JSON valid in --json
+    let all_bad = run_kit(&["slice", &typo, &miss_spec], None);
+    assert_eq!(all_bad.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&all_bad.stderr);
+    assert!(stderr.contains("Demo.Svc.Ping"), "{stderr}");
+    assert!(stderr.contains("nope.cs"), "{stderr}");
+    assert!(all_bad.stdout.is_empty());
+
+    let all_bad_json = run_kit(&["slice", "--json", &typo, &miss_spec], None);
+    assert_eq!(all_bad_json.status.code(), Some(1));
+    let bad_parsed: Value = serde_json::from_slice(&all_bad_json.stdout).expect("valid error json");
+    assert!(bad_parsed["slices"].as_array().unwrap().is_empty());
+    assert_eq!(bad_parsed["errors"].as_array().unwrap().len(), 2);
+
+    // Partial success records Rule::Slice metric when valid output is reduced/clipped.
+    let big = home.repo.join("big.txt");
+    let big_content: String = (1..=120).map(|i| format!("row {i:03} filler text\n")).collect();
+    fs::write(&big, &big_content).unwrap();
+    let m_out = home
+        .command(&[
+            "slice",
+            "--max-tokens",
+            "30",
+            &format!("{}:1-60", big.display()),
+            &typo,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(m_out.status.code(), Some(0));
+    let rows = home.rows();
+    let row = find_row(&rows, "standalone", "slice");
+    assert!(row["raw_bytes"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn outline_partial_success_emits_valid_docs_diagnostics_json_and_metrics() {
+    let home = MetricsHome::new("outline_partial");
+    let rs = home.repo.join("lib.rs");
+    let mut rs_body = String::new();
+    for i in 0..30 {
+        rs_body.push_str(&format!(
+            "pub fn func_{i}(x: usize) -> usize {{\n    let y = x + {i};\n    let z = y * 2;\n    z + 1\n}}\n"
+        ));
+    }
+    fs::write(&rs, &rs_body).unwrap();
+    let bin = home.repo.join("blob.rs");
+    fs::write(&bin, b"\x00\x01\x02").unwrap();
+    let missing = home.repo.join("missing.rs");
+
+    // Partial success (text): valid outline + per-path error + exit 0
+    let text_out = run_kit(
+        &[
+            "outline",
+            rs.to_str().unwrap(),
+            missing.to_str().unwrap(),
+            bin.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(text_out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&text_out.stdout);
+    assert!(stdout.contains("pub fn func_0"), "{stdout}");
+    assert!(stdout.contains("error:"), "{stdout}");
+    assert!(stdout.contains("missing.rs"), "{stdout}");
+    assert!(stdout.contains("binary file skipped"), "{stdout}");
+
+    // Partial success (--json, tight budget): valid JSON preserving errors alongside docs
+    let json_out = run_kit(
+        &[
+            "outline",
+            "--json",
+            "--max-tokens",
+            "200",
+            rs.to_str().unwrap(),
+            missing.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(json_out.status.code(), Some(0));
+    let parsed: Value = serde_json::from_slice(&json_out.stdout).expect("valid outline json");
+    assert_eq!(parsed["docs"].as_array().unwrap().len(), 1);
+    let errs = parsed["errors"].as_array().unwrap();
+    assert_eq!(errs.len(), 1);
+    assert_eq!(errs[0]["path"], missing.to_string_lossy().as_ref());
+
+    // Total failure: exit 1 and stderr diagnostics
+    let all_bad = run_kit(&["outline", missing.to_str().unwrap(), bin.to_str().unwrap()], None);
+    assert_eq!(all_bad.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&all_bad.stderr);
+    assert!(stderr.contains("missing.rs"), "{stderr}");
+    assert!(stderr.contains("binary file skipped"), "{stderr}");
+    assert!(all_bad.stdout.is_empty());
+
+    // Partial success records Rule::Outline metric for valid docs.
+    let m_out = home
+        .command(&["outline", rs.to_str().unwrap(), missing.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(m_out.status.code(), Some(0));
+    let rows = home.rows();
+    let row = find_row(&rows, "standalone", "outline");
+    assert_eq!(row["raw_bytes"].as_u64().unwrap(), rs_body.len() as u64);
+
+    // Total failure with --json exits 1 and emits valid JSON with errors + stderr.
+    let all_bad_json = run_kit(
+        &["outline", "--json", missing.to_str().unwrap(), bin.to_str().unwrap()],
+        None,
+    );
+    assert_eq!(all_bad_json.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&all_bad_json.stderr).contains("missing.rs"));
+    let bad_parsed: Value = serde_json::from_slice(&all_bad_json.stdout).expect("valid error json");
+    assert!(bad_parsed["docs"].as_array().unwrap().is_empty());
+    assert_eq!(bad_parsed["errors"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn partial_success_batch_edge_cases_and_budgets() {
+    let tmp = TempDir::new("partial_edges");
+    let cs = tmp.write(
+        "Svc.cs",
+        b"namespace Demo;\npublic class Svc {\n    public void Ping() {}\n    public void Pong() {}\n}\n",
+    );
+    let empty = tmp.write("empty.txt", b"");
+    let rs = tmp.write(
+        "many.rs",
+        (0..40)
+            .map(|i| format!("pub fn func_{i}(x: usize) -> usize {{\n    x + {i}\n}}\n"))
+            .collect::<String>()
+            .as_bytes(),
+    );
+
+    let valid_ping = format!("{}::Svc.Ping", cs.display());
+    let typo = format!("{}::Png", cs.display());
+    let empty_spec = format!("{}:1", empty.display());
+
+    // (a) Mixed parse + runtime + valid specs preserve exact CLI error order and normalize spec.
+    let padded_bad = format!("  {}  ", cs.display());
+    let mixed_ok = run_kit(&["slice", "--json", &typo, &padded_bad, &empty_spec, &valid_ping], None);
+    assert_eq!(mixed_ok.status.code(), Some(0));
+    let mv: Value = serde_json::from_slice(&mixed_ok.stdout).unwrap();
+    assert_eq!(mv["slices"].as_array().unwrap().len(), 1);
+    let merrs = mv["errors"].as_array().unwrap();
+    assert_eq!(merrs.len(), 3);
+    assert_eq!(merrs[0]["spec"], typo);
+    assert_eq!(merrs[1]["spec"], cs.to_string_lossy().as_ref());
+    assert_eq!(merrs[2]["spec"], empty_spec);
+    assert!(merrs[2]["message"].as_str().unwrap().contains("empty"));
+
+    // Mixed parse + runtime errors with zero valid specs exit 1 in CLI order.
+    let mixed_fail = run_kit(&["slice", &typo, &padded_bad], None);
+    assert_eq!(mixed_fail.status.code(), Some(1));
+    let mstderr = String::from_utf8_lossy(&mixed_fail.stderr);
+    let pos_typo = mstderr.find("Demo.Svc.Ping").expect("typo error");
+    let pos_parse = mstderr.find("missing range or selector").expect("parse error");
+    assert!(pos_typo < pos_parse, "expected CLI order in stderr: {mstderr}");
+
+    // Multiple all-syntax errors exit 2.
+    let all_syntax = run_kit(&["slice", cs.to_str().unwrap(), &format!("{}:9-2", cs.display())], None);
+    assert_eq!(all_syntax.status.code(), Some(2));
+
+    // (b) Tight --max-tokens with many errors keeps valid results AND stays bounded (text & JSON).
+    let mut missing_specs: Vec<String> = (0..12)
+        .map(|i| format!("{}:1-2", tmp.0.join(format!("very_long_missing_file_name_{i:02}.rs")).display()))
+        .collect();
+    let mut slice_args_txt: Vec<&str> = vec!["slice", "--max-tokens", "120", &valid_ping];
+    for s in &missing_specs {
+        slice_args_txt.push(s);
+    }
+    let stxt = run_kit(&slice_args_txt, None);
+    assert_eq!(stxt.status.code(), Some(0));
+    let stxt_s = String::from_utf8_lossy(&stxt.stdout);
+    assert!(stxt_s.contains("public void Ping()"), "{stxt_s}");
+    assert!(stxt_s.contains("omitted errors"), "{stxt_s}");
+    assert!(stxt.stdout.len() <= 120 * 4 + 80, "slice text exceeded budget: {}", stxt.stdout.len());
+
+    let mut slice_args_json: Vec<&str> = vec!["slice", "--json", "--max-tokens", "160", &valid_ping];
+    for s in &missing_specs {
+        slice_args_json.push(s);
+    }
+    let sjson = run_kit(&slice_args_json, None);
+    assert_eq!(sjson.status.code(), Some(0));
+    assert!(sjson.stdout.len() <= 160 * 4 + 2, "slice json exceeded budget: {} bytes", sjson.stdout.len());
+    let sjv: Value = serde_json::from_slice(&sjson.stdout).unwrap();
+    assert!(!sjv["slices"].as_array().unwrap().is_empty(), "valid slice starved: {sjv}");
+    assert_eq!(sjv["truncated"], Value::Bool(true));
+
+    missing_specs.clear();
+    let missing_paths: Vec<String> = (0..12)
+        .map(|i| tmp.0.join(format!("very_long_missing_outline_path_{i:02}.rs")).to_string_lossy().into_owned())
+        .collect();
+    let mut out_args_txt: Vec<&str> = vec!["outline", "--max-tokens", "150", rs.to_str().unwrap()];
+    for p in &missing_paths {
+        out_args_txt.push(p);
+    }
+    let otxt = run_kit(&out_args_txt, None);
+    assert_eq!(otxt.status.code(), Some(0));
+    let otxt_s = String::from_utf8_lossy(&otxt.stdout);
+    assert!(otxt_s.contains("pub fn func_0"), "{otxt_s}");
+    assert!(otxt_s.contains("omitted errors"), "{otxt_s}");
+    assert!(otxt.stdout.len() <= 150 * 4 + 80, "outline text exceeded budget: {}", otxt.stdout.len());
+
+    let mut out_args_json: Vec<&str> = vec!["outline", "--json", "--max-tokens", "220", rs.to_str().unwrap()];
+    for p in &missing_paths {
+        out_args_json.push(p);
+    }
+    let ojson = run_kit(&out_args_json, None);
+    assert_eq!(ojson.status.code(), Some(0));
+    assert!(ojson.stdout.len() <= 220 * 4 + 2, "outline json exceeded budget: {} bytes", ojson.stdout.len());
+    let ojv: Value = serde_json::from_slice(&ojson.stdout).unwrap();
+    assert!(!ojv["docs"][0]["items"].as_array().unwrap().is_empty(), "valid outline starved: {ojv}");
+    assert_eq!(ojv["truncated"], Value::Bool(true));
+}
