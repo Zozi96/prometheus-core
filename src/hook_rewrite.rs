@@ -1593,26 +1593,37 @@ pub fn evaluate_shell_policy(
     }
 }
 
-/// Evaluate a `PreToolUse` event for shell command auto-rewrite (Claude/Droid/Muse envelope).
+/// Evaluate a `PreToolUse` event for shell command auto-rewrite (Claude/Devin/Droid/Muse envelope).
 /// Returns `None` when the command should pass through unchanged.
 pub fn rewrite_command_reply(host: &str, event: &Value) -> Option<Value> {
-    if !matches!(host, "claude" | "droid" | "muse") {
+    let event_cwd = event
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(Path::new);
+    rewrite_command_reply_with_cwd(host, event, event_cwd)
+}
+
+pub fn rewrite_command_reply_with_cwd(
+    host: &str,
+    event: &Value,
+    event_cwd: Option<&Path>,
+) -> Option<Value> {
+    if !matches!(host, "claude" | "devin" | "droid" | "muse") {
         return None;
     }
     let tool = event
         .get("tool_name")
         .or_else(|| event.get("toolName"))
         .and_then(Value::as_str)?;
-    let tool_input = event.get("tool_input").and_then(Value::as_object)?;
+    let tool_input = event
+        .get("tool_input")
+        .or_else(|| event.get("input"))
+        .and_then(Value::as_object)?;
     let session_id = event
         .get("session_id")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let event_cwd = event
-        .get("cwd")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(Path::new);
     match evaluate_shell_policy(
         host,
         ShellPolicyTier::Rewrite,
@@ -2147,9 +2158,14 @@ mod tests {
                 .unwrap()
                 .contains("compact --mode test -- dotnet test App.csproj"));
 
-            // Cursor and Devin never receive updatedInput.
+            // Cursor uses its own flat `updated_input` envelope in `handle_cursor`,
+            // while Devin uses the shared `hookSpecificOutput.updatedInput` envelope.
             assert_eq!(None, rewrite_command_reply("cursor", &dotnet_ev));
-            assert_eq!(None, rewrite_command_reply("devin", &dotnet_ev));
+            let devin_reply = rewrite_command_reply("devin", &dotnet_ev).unwrap();
+            assert!(devin_reply["hookSpecificOutput"]["updatedInput"]["command"]
+                .as_str()
+                .unwrap()
+                .contains("compact --mode test -- dotnet test App.csproj"));
         }
 
         {

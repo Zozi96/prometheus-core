@@ -1363,6 +1363,11 @@ fn handle_devin(raw: &[u8]) -> Value {
     if !denial.is_empty() {
         return ask_reply(&denial);
     }
+    if let Some(reply) =
+        crate::hook_rewrite::rewrite_command_reply_with_cwd("devin", event, Some(&root))
+    {
+        return reply;
+    }
     let dump = inline_dump_guard("devin", event, session_id, Some(&root));
     if dump != ReadGuard::Pass {
         return read_guard_reply("devin", dump);
@@ -1666,10 +1671,11 @@ mod tests {
                 "cwd": tmp.0,
                 "session_id": "s-devin",
             });
-            assert_eq!(
-                json!({}),
-                run_hook("devin", devin_ev.to_string().as_bytes()),
-                "devin {cmd}"
+            let devin_reply = run_hook("devin", devin_ev.to_string().as_bytes());
+            assert!(
+                devin_reply["hookSpecificOutput"].get("permissionDecision").is_none()
+                    && devin_reply.get("decision").is_none(),
+                "devin {cmd}: {devin_reply}"
             );
             for host in ["claude", "droid", "muse"] {
                 let ev = json!({
@@ -1783,17 +1789,13 @@ mod tests {
                     reply["hookSpecificOutput"].get("permissionDecision").is_none(),
                     "{host} {cmd} must never ask/deny"
                 );
-                if host == "devin" {
-                    assert_eq!(json!({}), reply, "{host} {cmd}");
-                } else {
-                    let rewritten = reply["hookSpecificOutput"]["updatedInput"]["command"]
-                        .as_str()
-                        .expect("updatedInput.command");
-                    assert!(
-                        rewritten.contains("compact --mode test --"),
-                        "{host} {cmd}: {rewritten}"
-                    );
-                }
+                let rewritten = reply["hookSpecificOutput"]["updatedInput"]["command"]
+                    .as_str()
+                    .expect("updatedInput.command");
+                assert!(
+                    rewritten.contains("compact --mode test --"),
+                    "{host} {cmd}: {rewritten}"
+                );
             }
             for _ in 0..6 {
                 let ev = json!({
@@ -2859,6 +2861,94 @@ mod tests {
         let dt_reply = run_hook("cursor", dt_ev.to_string().as_bytes());
         assert_eq!("allow", dt_reply["permission"]);
         assert!(dt_reply["updated_input"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("compact --mode test -- dotnet test"));
+    }
+
+    #[test]
+    fn devin_rewrites_exec_via_updated_input_preserves_siblings_and_defers_to_rtk() {
+        let _g = env_guard();
+        let tmp = TempDir::new("devin_rw");
+        let _env = EnvOverride::set(&[
+            ("DEVIN_PROJECT_DIR", None),
+            ("PROMETHEUS_KIT_NO_REWRITE", None),
+            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
+        ]);
+        // Standard tool_input and Devin `input` alias both rewrite `exec` via updatedInput.
+        for ev in [
+            json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "exec",
+                "tool_input": {"command": "git status", "timeout": 45},
+                "cwd": tmp.0,
+                "session_id": "s-devin-rw",
+            }),
+            json!({
+                "hook_event_name": "PreToolUse",
+                "toolName": "exec",
+                "input": {"command": "git status", "timeout": 45},
+                "cwd": tmp.0,
+                "session_id": "s-devin-rw",
+            }),
+        ] {
+            let reply = run_hook("devin", ev.to_string().as_bytes());
+            let out = &reply["hookSpecificOutput"];
+            assert_eq!("PreToolUse", out["hookEventName"]);
+            assert!(out.get("permissionDecision").is_none());
+            assert!(out.get("additionalContext").is_none());
+            let updated = out["updatedInput"].as_object().expect("updatedInput");
+            assert!(updated["command"].as_str().unwrap().contains("diff --status"), "{reply}");
+            assert_eq!(45, updated["timeout"].as_i64().unwrap());
+        }
+
+        // Write/unsupported commands pass through untouched.
+        let write_ev = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "exec",
+            "tool_input": {"command": "echo hi > out.txt"},
+            "cwd": tmp.0,
+            "session_id": "s-devin-rw",
+        });
+        assert_eq!(json!({}), run_hook("devin", write_ev.to_string().as_bytes()));
+
+        // Secret-path guard runs before rewrites; secret shell operands skip rewrite.
+        let sec_read = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "read",
+            "tool_input": {"file_path": ".env"},
+            "cwd": tmp.0,
+            "session_id": "s-devin-rw",
+        });
+        assert_eq!("ask", run_hook("devin", sec_read.to_string().as_bytes())["hookSpecificOutput"]["permissionDecision"]);
+        let sec_exec = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "exec",
+            "tool_input": {"command": "cat .env"},
+            "cwd": tmp.0,
+            "session_id": "s-devin-rw",
+        });
+        assert_eq!(json!({}), run_hook("devin", sec_exec.to_string().as_bytes()));
+
+        // RTK deferral skips RTK-owned commands while rewriting RTK-gap commands.
+        let _rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("1"))]);
+        let git_ev = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "exec",
+            "tool_input": {"command": "git status"},
+            "cwd": tmp.0,
+            "session_id": "s-devin-rw",
+        });
+        assert_eq!(json!({}), run_hook("devin", git_ev.to_string().as_bytes()));
+        let dt_ev = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "exec",
+            "tool_input": {"command": "dotnet test"},
+            "cwd": tmp.0,
+            "session_id": "s-devin-rw",
+        });
+        let dt_reply = run_hook("devin", dt_ev.to_string().as_bytes());
+        assert!(dt_reply["hookSpecificOutput"]["updatedInput"]["command"]
             .as_str()
             .unwrap()
             .contains("compact --mode test -- dotnet test"));

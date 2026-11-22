@@ -745,7 +745,12 @@ fn assert_metric_row_keys(row: &Value) {
 #[test]
 fn metrics_records_shell_rewrite_for_rewrite_hosts() {
     let home = MetricsHome::new("rewrite_metrics");
-    for (host, tool) in [("claude", "Bash"), ("droid", "Execute"), ("muse", "Bash")] {
+    for (host, tool) in [
+        ("claude", "Bash"),
+        ("devin", "exec"),
+        ("droid", "Execute"),
+        ("muse", "Bash"),
+    ] {
         let ev = rewrite_event(tool, &home.repo, &format!("sess-{host}"));
         let out = home.hook(host, &ev);
         assert_eq!(out.status.code(), Some(0), "host={host}");
@@ -775,8 +780,8 @@ fn metrics_records_shell_rewrite_for_rewrite_hosts() {
         .contains("compact --mode test"));
 
     let rows = home.rows();
-    assert_eq!(rows.len(), 4, "rows: {rows:?}");
-    for host in ["claude", "cursor", "droid", "muse"] {
+    assert_eq!(rows.len(), 5, "rows: {rows:?}");
+    for host in ["claude", "cursor", "devin", "droid", "muse"] {
         let row = find_row(&rows, host, "shell-rewrite");
         assert_metric_row_keys(row);
         assert_eq!(
@@ -790,8 +795,8 @@ fn metrics_records_shell_rewrite_for_rewrite_hosts() {
     let totals = home.metrics();
     assert_eq!(totals.status.code(), Some(0));
     let parsed: Value = serde_json::from_slice(&totals.stdout).unwrap();
-    assert_eq!(parsed["by_rule"]["shell-rewrite"]["count"], 4);
-    for host in ["claude", "cursor", "droid", "muse"] {
+    assert_eq!(parsed["by_rule"]["shell-rewrite"]["count"], 5);
+    for host in ["claude", "cursor", "devin", "droid", "muse"] {
         assert_eq!(parsed["by_host"][host]["count"], 1, "host={host}");
     }
 }
