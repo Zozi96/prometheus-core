@@ -444,6 +444,8 @@ fn posix_decoded_tokens(command: &str) -> Vec<String> {
     tokens
 }
 
+const MAX_SHELL_PARSE_DEPTH: usize = 64;
+
 #[derive(Clone, Debug)]
 struct StageWord {
     start: usize,
@@ -451,28 +453,540 @@ struct StageWord {
     value: String,
     has_quotes: bool,
     has_unquoted_glob: bool,
+    is_dynamic: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaseState {
+    Header { saw_subject: bool },
+    Pattern { saw_open_paren: bool },
+    Body,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockKind {
+    Subshell,
+    Brace,
+    Case(CaseState),
+}
+
+fn is_control_prefix_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "do" | "then" | "else" | "elif" | "if" | "while" | "until" | "!" | "time"
+    )
+}
+
+fn is_command_position(cur_stage: &[StageWord]) -> bool {
+    cur_stage.iter().all(|w| {
+        !w.has_quotes
+            && !w.has_unquoted_glob
+            && !w.is_dynamic
+            && is_control_prefix_keyword(&w.value)
+    })
+}
+
+fn is_valid_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_array_assign_prefix(prefix: &str) -> bool {
+    let Some(lhs) = prefix.strip_suffix('=') else {
+        return false;
+    };
+    let name = lhs.strip_suffix('+').unwrap_or(lhs);
+    is_valid_ident(name)
+}
+
+/// True when `chars[i]` is `\\` followed by EOF or a newline (`\n`/`\r`).
+/// POSIX deletes `\<newline>` before lexing, so failing closed prevents
+/// keyword/operator/word desyncs across line continuations.
+fn is_dangling_or_line_continuation(chars: &[(usize, char)], i: usize) -> bool {
+    i + 1 >= chars.len() || matches!(chars[i + 1].1, '\n' | '\r')
+}
+
+/// True when `chars[i]` is `(` followed only by optional whitespace or
+/// `#...\n` comments and `)`, matching shell function definitions `name ( )`.
+fn is_empty_parens_at(chars: &[(usize, char)], i: usize) -> bool {
+    if i >= chars.len() || chars[i].1 != '(' {
+        return false;
+    }
+    let mut j = i + 1;
+    while j < chars.len() {
+        match chars[j].1 {
+            ' ' | '\t' | '\n' => j += 1,
+            '#' => {
+                while j < chars.len() && chars[j].1 != '\n' {
+                    j += 1;
+                }
+            }
+            ')' => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn is_shell_word_boundary(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\t' | '\n' | ';' | '|' | '&' | '(' | ')' | '<' | '>'
+    )
+}
+
+fn skip_single_quoted(chars: &[(usize, char)], i: &mut usize) -> bool {
+    *i += 1;
+    while *i < chars.len() && chars[*i].1 != '\'' {
+        *i += 1;
+    }
+    if *i >= chars.len() {
+        return false;
+    }
+    *i += 1;
+    true
+}
+
+fn skip_backtick(chars: &[(usize, char)], i: &mut usize) -> bool {
+    *i += 1;
+    while *i < chars.len() {
+        if chars[*i].1 == '\\' {
+            if is_dangling_or_line_continuation(chars, *i) {
+                return false;
+            }
+            *i += 2;
+            continue;
+        }
+        if chars[*i].1 == '`' {
+            *i += 1;
+            return true;
+        }
+        *i += 1;
+    }
+    false
+}
+
+fn skip_double_quoted_opaque(chars: &[(usize, char)], i: &mut usize, depth: usize) -> bool {
+    if depth > MAX_SHELL_PARSE_DEPTH {
+        return false;
+    }
+    *i += 1;
+    while *i < chars.len() {
+        match chars[*i].1 {
+            '\\' => {
+                if is_dangling_or_line_continuation(chars, *i) {
+                    return false;
+                }
+                *i += 2;
+            }
+            '`' => {
+                if !skip_backtick(chars, i) {
+                    return false;
+                }
+            }
+            '$' => {
+                if *i + 1 < chars.len() && chars[*i + 1].1 == '(' {
+                    *i += 1;
+                    if !skip_balanced_paren(chars, i, depth + 1) {
+                        return false;
+                    }
+                } else if *i + 1 < chars.len() && chars[*i + 1].1 == '{' {
+                    if !skip_dollar_brace(chars, i, depth + 1, true) {
+                        return false;
+                    }
+                } else {
+                    *i += 1;
+                }
+            }
+            '"' => {
+                *i += 1;
+                return true;
+            }
+            _ => *i += 1,
+        }
+    }
+    false
+}
+
+fn skip_dollar_brace(
+    chars: &[(usize, char)],
+    i: &mut usize,
+    depth: usize,
+    in_double_quotes: bool,
+) -> bool {
+    if depth > MAX_SHELL_PARSE_DEPTH {
+        return false;
+    }
+    *i += 2;
+    while *i < chars.len() {
+        match chars[*i].1 {
+            '\\' => {
+                if is_dangling_or_line_continuation(chars, *i) {
+                    return false;
+                }
+                *i += 2;
+            }
+            '\'' => {
+                // Inside `"${...}"`, `'` is literal in POSIX/bash/zsh, so fail closed
+                // rather than risking cross-shell quote desync.
+                if in_double_quotes || !skip_single_quoted(chars, i) {
+                    return false;
+                }
+            }
+            '"' => {
+                // Fail closed on nested `"` inside `"${...}"` (bash/dash diverge).
+                if in_double_quotes || !skip_double_quoted_opaque(chars, i, depth + 1) {
+                    return false;
+                }
+            }
+            '`' => {
+                if !skip_backtick(chars, i) {
+                    return false;
+                }
+            }
+            '$' => {
+                if *i + 1 < chars.len() && chars[*i + 1].1 == '(' {
+                    *i += 1;
+                    if !skip_balanced_paren(chars, i, depth + 1) {
+                        return false;
+                    }
+                } else if *i + 1 < chars.len() && chars[*i + 1].1 == '{' {
+                    if !skip_dollar_brace(chars, i, depth + 1, in_double_quotes) {
+                        return false;
+                    }
+                } else if *i + 1 < chars.len() && chars[*i + 1].1 == '\'' {
+                    // Fail closed on `$'...'` (dash <= 0.5.11 / BusyBox ash lack ANSI-C quotes).
+                    return false;
+                } else if *i + 1 < chars.len() && chars[*i + 1].1 == '"' {
+                    if in_double_quotes {
+                        return false;
+                    }
+                    *i += 1;
+                    if !skip_double_quoted_opaque(chars, i, depth + 1) {
+                        return false;
+                    }
+                } else {
+                    *i += 1;
+                }
+            }
+            '}' => {
+                *i += 1;
+                return true;
+            }
+            _ => *i += 1,
+        }
+    }
+    false
+}
+
+fn is_unquoted_keyword_at(chars: &[(usize, char)], i: usize, kw: &str) -> bool {
+    let kw_chars: Vec<char> = kw.chars().collect();
+    if i + kw_chars.len() > chars.len() {
+        return false;
+    }
+    for (off, expected) in kw_chars.iter().enumerate() {
+        if chars[i + off].1 != *expected {
+            return false;
+        }
+    }
+    chars
+        .get(i + kw_chars.len())
+        .is_none_or(|&(_, c)| is_shell_word_boundary(c))
+}
+
+/// Skip balanced `(...)` opaquely (used for `$(...)`, `$((...))`, `<(...)`,
+/// `>(...)`, `((...))`, and mid-word `(...)` such as array assignments).
+/// Fails closed on unclosed delimiters, excessive nesting, `\<newline>`,
+/// `$'...'`, or inner `case` / heredocs whose bodies may contain unbalanced `)`.
+fn skip_balanced_paren(chars: &[(usize, char)], i: &mut usize, depth: usize) -> bool {
+    if depth > MAX_SHELL_PARSE_DEPTH || *i >= chars.len() || chars[*i].1 != '(' {
+        return false;
+    }
+    *i += 1;
+    let mut at_word_start = true;
+    while *i < chars.len() {
+        let ch = chars[*i].1;
+        if ch == ')' {
+            *i += 1;
+            return true;
+        }
+        if ch == '(' {
+            if !skip_balanced_paren(chars, i, depth + 1) {
+                return false;
+            }
+            at_word_start = true;
+            continue;
+        }
+        if ch == '\\' {
+            if is_dangling_or_line_continuation(chars, *i) {
+                return false;
+            }
+            *i += 2;
+            at_word_start = false;
+            continue;
+        }
+        if ch == '\'' {
+            if !skip_single_quoted(chars, i) {
+                return false;
+            }
+            at_word_start = false;
+            continue;
+        }
+        if ch == '"' {
+            if !skip_double_quoted_opaque(chars, i, depth + 1) {
+                return false;
+            }
+            at_word_start = false;
+            continue;
+        }
+        if ch == '`' {
+            if !skip_backtick(chars, i) {
+                return false;
+            }
+            at_word_start = false;
+            continue;
+        }
+        if ch == '$' {
+            if *i + 1 < chars.len() && chars[*i + 1].1 == '(' {
+                *i += 1;
+                if !skip_balanced_paren(chars, i, depth + 1) {
+                    return false;
+                }
+            } else if *i + 1 < chars.len() && chars[*i + 1].1 == '{' {
+                if !skip_dollar_brace(chars, i, depth + 1, false) {
+                    return false;
+                }
+            } else if *i + 1 < chars.len() && chars[*i + 1].1 == '\'' {
+                return false;
+            } else if *i + 1 < chars.len() && chars[*i + 1].1 == '"' {
+                *i += 1;
+                if !skip_double_quoted_opaque(chars, i, depth + 1) {
+                    return false;
+                }
+            } else {
+                *i += 1;
+            }
+            at_word_start = false;
+            continue;
+        }
+        if ch == '#' && at_word_start {
+            while *i < chars.len() && chars[*i].1 != '\n' {
+                *i += 1;
+            }
+            continue;
+        }
+        if ch == '<' && *i + 1 < chars.len() && chars[*i + 1].1 == '<' {
+            if *i + 2 < chars.len() && chars[*i + 2].1 == '<' {
+                *i += 3;
+                at_word_start = true;
+                continue;
+            }
+            return false;
+        }
+        if ch == '\r' {
+            return false;
+        }
+        if at_word_start && is_unquoted_keyword_at(chars, *i, "case") {
+            return false;
+        }
+        at_word_start = matches!(
+            ch,
+            ' ' | '\t' | '\n' | ';' | '|' | '&' | '<' | '>'
+        );
+        *i += 1;
+    }
+    false
+}
+
+fn parse_heredoc_delim(chars: &[(usize, char)], i: &mut usize) -> Option<String> {
+    let mut delim = String::new();
+    let mut has_quotes = false;
+    while *i < chars.len() {
+        let ch = chars[*i].1;
+        if is_shell_word_boundary(ch) {
+            break;
+        }
+        if matches!(ch, '$' | '`' | '\r') {
+            return None;
+        }
+        if ch == '\'' {
+            has_quotes = true;
+            *i += 1;
+            while *i < chars.len() && chars[*i].1 != '\'' {
+                delim.push(chars[*i].1);
+                *i += 1;
+            }
+            if *i >= chars.len() {
+                return None;
+            }
+            *i += 1;
+            continue;
+        }
+        if ch == '"' {
+            has_quotes = true;
+            *i += 1;
+            while *i < chars.len() && chars[*i].1 != '"' {
+                if chars[*i].1 == '\\' {
+                    if is_dangling_or_line_continuation(chars, *i) {
+                        return None;
+                    }
+                    let next = chars[*i + 1].1;
+                    if matches!(next, '"' | '\\' | '$' | '`') {
+                        delim.push(next);
+                    } else {
+                        delim.push('\\');
+                        delim.push(next);
+                    }
+                    *i += 2;
+                    continue;
+                }
+                delim.push(chars[*i].1);
+                *i += 1;
+            }
+            if *i >= chars.len() {
+                return None;
+            }
+            *i += 1;
+            continue;
+        }
+        if ch == '\\' {
+            if is_dangling_or_line_continuation(chars, *i) {
+                return None;
+            }
+            delim.push(chars[*i + 1].1);
+            *i += 2;
+            continue;
+        }
+        delim.push(ch);
+        *i += 1;
+    }
+    if delim.is_empty() && !has_quotes {
+        return None;
+    }
+    Some(delim)
+}
+
+fn consume_heredoc_body(
+    command: &str,
+    chars: &[(usize, char)],
+    i: &mut usize,
+    delim: &str,
+    strip_tabs: bool,
+) -> bool {
+    while *i < chars.len() {
+        let line_start = chars[*i].0;
+        while *i < chars.len() && chars[*i].1 != '\n' {
+            *i += 1;
+        }
+        let raw_end = if *i < chars.len() {
+            chars[*i].0
+        } else {
+            command.len()
+        };
+        if *i < chars.len() && chars[*i].1 == '\n' {
+            *i += 1;
+        }
+        let raw_line = &command[line_start..raw_end];
+        let cmp = if strip_tabs {
+            raw_line.trim_start_matches('\t')
+        } else {
+            raw_line
+        };
+        if cmp == delim {
+            return true;
+        }
+        // Fail closed when trailing `\r` creates a Unix-vs-CRLF delimiter disagreement.
+        if cmp.trim_end_matches('\r') == delim {
+            return false;
+        }
+    }
+    false
 }
 
 fn parse_stage_word(
     chars: &[(usize, char)],
     i: &mut usize,
     total_len: usize,
+    stop_on_rparen: bool,
 ) -> Option<StageWord> {
     let start = chars[*i].0;
     let mut value = String::new();
     let mut has_quotes = false;
     let mut has_unquoted_glob = false;
+    let mut is_dynamic = false;
 
     while *i < chars.len() {
         let ch = chars[*i].1;
-        if matches!(
-            ch,
-            ' ' | '\t' | '\r' | '\n' | ';' | '|' | '&' | '<' | '>'
-        ) {
+        if matches!(ch, ' ' | '\t' | '\n' | ';' | '|' | '&' | '<' | '>') {
             break;
         }
-        if matches!(ch, '(' | ')' | '{' | '}' | '`' | '$') {
+        if ch == '\r' {
             return None;
+        }
+        if ch == ')' {
+            if stop_on_rparen {
+                break;
+            }
+            return None;
+        }
+        if ch == '(' {
+            // Allow mid-word `(...)` only for bash array assignments (`arr=(...)` /
+            // `arr+=(...)`); fail closed on function defs (`f()`, `rg( #\n)`) and
+            // extglob/zsh qualifiers.
+            let ok_array = !has_quotes
+                && !is_dynamic
+                && !has_unquoted_glob
+                && is_array_assign_prefix(&value);
+            if !ok_array || !skip_balanced_paren(chars, i, 0) {
+                return None;
+            }
+            if chars.get(*i).is_some_and(|&(_, c)| !is_shell_word_boundary(c)) {
+                return None;
+            }
+            is_dynamic = true;
+            continue;
+        }
+        if matches!(ch, '{' | '}') {
+            is_dynamic = true;
+            value.push(ch);
+            *i += 1;
+            continue;
+        }
+        if ch == '`' {
+            is_dynamic = true;
+            if !skip_backtick(chars, i) {
+                return None;
+            }
+            continue;
+        }
+        if ch == '$' {
+            is_dynamic = true;
+            if *i + 1 < chars.len() && chars[*i + 1].1 == '\'' {
+                // Fail closed on `$'...'` to prevent dash/ash quote desync.
+                return None;
+            } else if *i + 1 < chars.len() && chars[*i + 1].1 == '"' {
+                *i += 1;
+                if !skip_double_quoted_opaque(chars, i, 0) {
+                    return None;
+                }
+            } else if *i + 1 < chars.len() && chars[*i + 1].1 == '(' {
+                *i += 1;
+                if !skip_balanced_paren(chars, i, 0) {
+                    return None;
+                }
+            } else if *i + 1 < chars.len() && chars[*i + 1].1 == '{' {
+                if !skip_dollar_brace(chars, i, 0, false) {
+                    return None;
+                }
+            } else {
+                value.push('$');
+                *i += 1;
+            }
+            continue;
         }
         if ch == '\'' {
             has_quotes = true;
@@ -493,7 +1007,11 @@ fn parse_stage_word(
             while *i < chars.len() && chars[*i].1 != '"' {
                 let dch = chars[*i].1;
                 if dch == '`' {
-                    return None;
+                    is_dynamic = true;
+                    if !skip_backtick(chars, i) {
+                        return None;
+                    }
+                    continue;
                 }
                 if dch == '$' {
                     // Only allow a literal end-of-line regex anchor right before closing `"`.
@@ -502,16 +1020,28 @@ fn parse_stage_word(
                         *i += 1;
                         continue;
                     }
-                    return None;
+                    is_dynamic = true;
+                    if *i + 1 < chars.len() && chars[*i + 1].1 == '(' {
+                        *i += 1;
+                        if !skip_balanced_paren(chars, i, 0) {
+                            return None;
+                        }
+                    } else if *i + 1 < chars.len() && chars[*i + 1].1 == '{' {
+                        if !skip_dollar_brace(chars, i, 0, true) {
+                            return None;
+                        }
+                    } else {
+                        value.push('$');
+                        *i += 1;
+                    }
+                    continue;
                 }
                 if dch == '\\' {
-                    if *i + 1 >= chars.len() {
+                    if is_dangling_or_line_continuation(chars, *i) {
                         return None;
                     }
                     let next = chars[*i + 1].1;
-                    if next == '\n' {
-                        *i += 2;
-                    } else if matches!(next, '"' | '\\' | '$' | '`') {
+                    if matches!(next, '"' | '\\' | '$' | '`') {
                         value.push(next);
                         *i += 2;
                     } else {
@@ -531,12 +1061,10 @@ fn parse_stage_word(
             continue;
         }
         if ch == '\\' {
-            if *i + 1 >= chars.len() {
+            if is_dangling_or_line_continuation(chars, *i) {
                 return None;
             }
-            if chars[*i + 1].1 != '\n' {
-                value.push(chars[*i + 1].1);
-            }
+            value.push(chars[*i + 1].1);
             *i += 2;
             continue;
         }
@@ -552,49 +1080,267 @@ fn parse_stage_word(
     } else {
         total_len
     };
+    if start == end || (!has_quotes && !is_dynamic && value.is_empty()) {
+        return None;
+    }
     Some(StageWord {
         start,
         end,
         value,
         has_quotes,
         has_unquoted_glob,
+        is_dynamic,
     })
 }
 
-/// Tokenize simple pipeline/list stages, failing closed (`None`) on subshells,
-/// command/parameter expansions, heredocs, or unclosed quotes.
+/// Tokenize pipeline/list/compound stages while keeping quote and block-nesting
+/// state synchronized across dynamic words (`$var`, `${...}`, `$(...)`,
+/// heredocs, subshells, brace groups, `case`, comments). Fails closed (`None`)
+/// on unclosed quotes/delimiters, line continuations, `$'...'`, shell function
+/// definitions, ambiguous heredoc `\r`, or excessive nesting.
 fn parse_shell_stages(command: &str) -> Option<Vec<Vec<StageWord>>> {
     let chars: Vec<(usize, char)> = command.char_indices().collect();
     let mut stages = Vec::new();
-    let mut cur_stage = Vec::new();
+    let mut cur_stage: Vec<StageWord> = Vec::new();
+    let mut stack: Vec<BlockKind> = Vec::new();
+    let mut pending_heredocs: Vec<(String, bool)> = Vec::new();
     let mut i = 0usize;
 
     while i < chars.len() {
         let ch = chars[i].1;
-        if matches!(ch, ' ' | '\t' | '\r') {
+        let in_case_header = matches!(stack.last(), Some(BlockKind::Case(CaseState::Header { .. })));
+        let in_case_pattern = matches!(
+            stack.last(),
+            Some(BlockKind::Case(CaseState::Pattern { .. }))
+        );
+        let stop_on_rparen = matches!(
+            stack.last(),
+            Some(BlockKind::Subshell | BlockKind::Case(CaseState::Pattern { .. }))
+        );
+
+        if matches!(ch, ' ' | '\t') {
             i += 1;
             continue;
         }
-        if matches!(ch, ';' | '\n') {
+        if ch == '\r' {
+            return None;
+        }
+        if ch == '#' {
+            while i < chars.len() && chars[i].1 != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '\n' {
+            if !in_case_header && !in_case_pattern && !cur_stage.is_empty() {
+                stages.push(std::mem::take(&mut cur_stage));
+            }
+            i += 1;
+            for (delim, strip_tabs) in std::mem::take(&mut pending_heredocs) {
+                if !consume_heredoc_body(command, &chars, &mut i, &delim, strip_tabs) {
+                    return None;
+                }
+            }
+            continue;
+        }
+        if ch == ';' {
+            if in_case_header || in_case_pattern {
+                return None;
+            }
+            if i + 1 < chars.len() && matches!(chars[i + 1].1, ';' | '&') {
+                // Case clause terminator: `;;`, `;&`, or `;;&`.
+                if !cur_stage.is_empty() {
+                    stages.push(std::mem::take(&mut cur_stage));
+                }
+                if chars[i + 1].1 == ';' && i + 2 < chars.len() && chars[i + 2].1 == '&' {
+                    i += 3;
+                } else {
+                    i += 2;
+                }
+                let Some(BlockKind::Case(state @ CaseState::Body)) = stack.last_mut() else {
+                    return None;
+                };
+                *state = CaseState::Pattern {
+                    saw_open_paren: false,
+                };
+                continue;
+            }
             if !cur_stage.is_empty() {
                 stages.push(std::mem::take(&mut cur_stage));
             }
             i += 1;
+            continue;
+        }
+        if ch == '&' && i + 1 < chars.len() && chars[i + 1].1 == '>' {
+            if in_case_header || in_case_pattern {
+                return None;
+            }
+            i += 2;
+            if i < chars.len() && chars[i].1 == '>' {
+                i += 1;
+            }
+            while i < chars.len() && matches!(chars[i].1, ' ' | '\t') {
+                i += 1;
+            }
+            if i >= chars.len() {
+                return None;
+            }
+            let _ = parse_stage_word(&chars, &mut i, command.len(), stop_on_rparen)?;
             continue;
         }
         if ch == '|' || ch == '&' {
-            if i + 1 < chars.len() && chars[i + 1].1 == ch {
-                i += 2;
-            } else {
-                i += 1;
+            if in_case_header {
+                return None;
             }
+            if in_case_pattern {
+                if ch != '|' || (i + 1 < chars.len() && matches!(chars[i + 1].1, '|' | '&')) {
+                    return None;
+                }
+                cur_stage.clear();
+                i += 1;
+                continue;
+            }
+            let two_char = (ch == '|'
+                && i + 1 < chars.len()
+                && matches!(chars[i + 1].1, '|' | '&'))
+                || (ch == '&' && i + 1 < chars.len() && chars[i + 1].1 == '&');
+            i += if two_char { 2 } else { 1 };
             if !cur_stage.is_empty() {
                 stages.push(std::mem::take(&mut cur_stage));
             }
             continue;
         }
-        if matches!(ch, '(' | ')' | '{' | '}' | '`' | '$') {
+        if ch == '(' {
+            // Reject empty `()` / `( #\n)` anywhere.
+            if is_empty_parens_at(&chars, i) {
+                return None;
+            }
+            if let Some(BlockKind::Case(CaseState::Pattern {
+                saw_open_paren: false,
+            })) = stack.last_mut()
+            {
+                if cur_stage.is_empty() {
+                    *stack.last_mut().unwrap() = BlockKind::Case(CaseState::Pattern {
+                        saw_open_paren: true,
+                    });
+                    i += 1;
+                    continue;
+                }
+            }
+            if !in_case_header && !in_case_pattern && is_command_position(&cur_stage) {
+                if i + 1 < chars.len() && chars[i + 1].1 == '(' {
+                    let start = chars[i].0;
+                    if !skip_balanced_paren(&chars, &mut i, 0) {
+                        return None;
+                    }
+                    let end = if i < chars.len() {
+                        chars[i].0
+                    } else {
+                        command.len()
+                    };
+                    cur_stage.push(StageWord {
+                        start,
+                        end,
+                        value: String::new(),
+                        has_quotes: false,
+                        has_unquoted_glob: false,
+                        is_dynamic: true,
+                    });
+                    continue;
+                }
+                if stack.len() >= MAX_SHELL_PARSE_DEPTH {
+                    return None;
+                }
+                if !cur_stage.is_empty() {
+                    stages.push(std::mem::take(&mut cur_stage));
+                }
+                stack.push(BlockKind::Subshell);
+                i += 1;
+                continue;
+            }
+            // Bare `(` outside command position and `CaseState::Pattern` (e.g., `f ( #\n)`) — fail closed.
             return None;
+        }
+        if ch == ')' {
+            match stack.last_mut() {
+                Some(BlockKind::Subshell) => {
+                    if !cur_stage.is_empty() {
+                        stages.push(std::mem::take(&mut cur_stage));
+                    }
+                    stack.pop();
+                    i += 1;
+                    continue;
+                }
+                Some(BlockKind::Case(state @ CaseState::Pattern { .. })) => {
+                    // Discard case pattern tokens; they are never executed commands.
+                    cur_stage.clear();
+                    *state = CaseState::Body;
+                    i += 1;
+                    continue;
+                }
+                _ => return None,
+            }
+        }
+        if ch == '{'
+            && !in_case_header
+            && !in_case_pattern
+            && is_command_position(&cur_stage)
+            && chars
+                .get(i + 1)
+                .is_some_and(|&(_, c)| matches!(c, ' ' | '\t' | '\n'))
+        {
+            if stack.len() >= MAX_SHELL_PARSE_DEPTH {
+                return None;
+            }
+            if !cur_stage.is_empty() {
+                stages.push(std::mem::take(&mut cur_stage));
+            }
+            stack.push(BlockKind::Brace);
+            i += 1;
+            continue;
+        }
+        if ch == '}'
+            && !in_case_header
+            && !in_case_pattern
+            && is_command_position(&cur_stage)
+            && chars
+                .get(i + 1)
+                .is_none_or(|&(_, c)| is_shell_word_boundary(c))
+        {
+            if !matches!(stack.last(), Some(BlockKind::Brace)) {
+                return None;
+            }
+            if !cur_stage.is_empty() {
+                stages.push(std::mem::take(&mut cur_stage));
+            }
+            stack.pop();
+            i += 1;
+            continue;
+        }
+        // Process substitution `<(...)` / `>(...)` is a dynamic argument word.
+        if matches!(ch, '<' | '>') && i + 1 < chars.len() && chars[i + 1].1 == '(' {
+            if in_case_header || in_case_pattern {
+                return None;
+            }
+            let start = chars[i].0;
+            i += 1;
+            if !skip_balanced_paren(&chars, &mut i, 0) {
+                return None;
+            }
+            let end = if i < chars.len() {
+                chars[i].0
+            } else {
+                command.len()
+            };
+            cur_stage.push(StageWord {
+                start,
+                end,
+                value: String::new(),
+                has_quotes: false,
+                has_unquoted_glob: false,
+                is_dynamic: true,
+            });
+            continue;
         }
         // Check IO_NUMBER redirection (`2>&1`, `2>/dev/null`, `0<in`) or bare `<` / `>`.
         let mut redir_at = None;
@@ -610,37 +1356,123 @@ fn parse_shell_stages(command: &str) -> Option<Vec<Vec<StageWord>>> {
             }
         }
         if let Some(at) = redir_at {
+            if in_case_header || in_case_pattern {
+                return None;
+            }
             let rch = chars[at].1;
             i = at + 1;
-            if rch == '<' {
+            if rch == '<' && i < chars.len() && chars[i].1 == '<' {
+                i += 1;
                 if i < chars.len() && chars[i].1 == '<' {
-                    return None; // heredoc / here-string
+                    // Here-string `<<<word`.
+                    i += 1;
+                    while i < chars.len() && matches!(chars[i].1, ' ' | '\t') {
+                        i += 1;
+                    }
+                    if i >= chars.len() {
+                        return None;
+                    }
+                    let _ = parse_stage_word(&chars, &mut i, command.len(), stop_on_rparen)?;
+                    continue;
                 }
-                if i < chars.len() && chars[i].1 == '&' {
+                let strip_tabs = if i < chars.len() && chars[i].1 == '-' {
+                    i += 1;
+                    true
+                } else {
+                    false
+                };
+                while i < chars.len() && matches!(chars[i].1, ' ' | '\t') {
+                    i += 1;
+                }
+                let delim = parse_heredoc_delim(&chars, &mut i)?;
+                pending_heredocs.push((delim, strip_tabs));
+                continue;
+            }
+            if rch == '<' {
+                if i < chars.len() && matches!(chars[i].1, '&' | '>') {
                     i += 1;
                 }
             } else if i < chars.len() && matches!(chars[i].1, '>' | '&' | '|') {
                 i += 1;
             }
-            while i < chars.len() && matches!(chars[i].1, ' ' | '\t' | '\r') {
+            while i < chars.len() && matches!(chars[i].1, ' ' | '\t') {
                 i += 1;
             }
             if i >= chars.len() {
                 return None;
             }
-            let target = parse_stage_word(&chars, &mut i, command.len())?;
-            if target.value.is_empty() && !target.has_quotes {
-                return None;
-            }
+            let _ = parse_stage_word(&chars, &mut i, command.len(), stop_on_rparen)?;
             continue;
         }
 
-        let word = parse_stage_word(&chars, &mut i, command.len())?;
+        let cmd_pos = is_command_position(&cur_stage);
+        let word = parse_stage_word(&chars, &mut i, command.len(), stop_on_rparen)?;
+        let is_plain_word = !word.has_quotes && !word.has_unquoted_glob && !word.is_dynamic;
+
+        if let Some(BlockKind::Case(state)) = stack.last_mut() {
+            match *state {
+                CaseState::Header { saw_subject: false } => {
+                    *state = CaseState::Header { saw_subject: true };
+                    continue;
+                }
+                CaseState::Header { saw_subject: true } => {
+                    if is_plain_word && word.value == "in" {
+                        *state = CaseState::Pattern {
+                            saw_open_paren: false,
+                        };
+                        continue;
+                    }
+                    return None;
+                }
+                CaseState::Pattern { saw_open_paren } => {
+                    if !saw_open_paren
+                        && cur_stage.is_empty()
+                        && is_plain_word
+                        && word.value == "esac"
+                    {
+                        stack.pop();
+                        continue;
+                    }
+                    cur_stage.push(word);
+                    continue;
+                }
+                CaseState::Body => {
+                    if cmd_pos && is_plain_word && word.value == "esac" {
+                        if !cur_stage.is_empty() {
+                            stages.push(std::mem::take(&mut cur_stage));
+                        }
+                        stack.pop();
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if cmd_pos && is_plain_word {
+            match word.value.as_str() {
+                "function" => return None,
+                "case" => {
+                    if stack.len() >= MAX_SHELL_PARSE_DEPTH {
+                        return None;
+                    }
+                    if !cur_stage.is_empty() {
+                        stages.push(std::mem::take(&mut cur_stage));
+                    }
+                    stack.push(BlockKind::Case(CaseState::Header { saw_subject: false }));
+                    continue;
+                }
+                "esac" => return None,
+                _ => {}
+            }
+        }
         cur_stage.push(word);
     }
 
     if !cur_stage.is_empty() {
         stages.push(cur_stage);
+    }
+    if !stack.is_empty() || !pending_heredocs.is_empty() {
+        return None;
     }
     Some(stages)
 }
@@ -649,93 +1481,247 @@ fn is_env_assignment_word(text: &str) -> bool {
     let Some((name, _)) = text.split_once('=') else {
         return false;
     };
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    is_valid_ident(name)
 }
 
-fn skip_sed_delimited(chars: &[char], i: &mut usize, delim: char) -> bool {
+/// Decode a single cleanly-quoted (`'...'` or `"..."`), non-dynamic `sed`
+/// string into `(byte_start, byte_end, char)` tuples referencing exact byte
+/// offsets inside the outer quotes. Rejecting mixed or multi-segment quoting
+/// guarantees that masking any sub-span preserves shell quote parity.
+fn decode_single_quoted_sed_chars(
+    raw: &str,
+    base_offset: usize,
+) -> Option<Vec<(usize, usize, char)>> {
+    let chars: Vec<(usize, char)> = raw.char_indices().collect();
+    if chars.len() < 2 {
+        return None;
+    }
+    let total_len = raw.len();
+    let char_end = |idx: usize| -> usize {
+        if idx + 1 < chars.len() {
+            chars[idx + 1].0
+        } else {
+            total_len
+        }
+    };
+    let mut out = Vec::new();
+    match chars[0].1 {
+        '\'' => {
+            let mut i = 1usize;
+            while i < chars.len() && chars[i].1 != '\'' {
+                out.push((
+                    base_offset + chars[i].0,
+                    base_offset + char_end(i),
+                    chars[i].1,
+                ));
+                i += 1;
+            }
+            if i + 1 != chars.len() {
+                return None;
+            }
+        }
+        '"' => {
+            let mut i = 1usize;
+            while i < chars.len() && chars[i].1 != '"' {
+                let dch = chars[i].1;
+                if dch == '`' {
+                    return None;
+                }
+                if dch == '$' {
+                    if i + 1 < chars.len() && chars[i + 1].1 == '"' {
+                        out.push((base_offset + chars[i].0, base_offset + char_end(i), '$'));
+                        i += 1;
+                        continue;
+                    }
+                    return None;
+                }
+                if dch == '\\' {
+                    if is_dangling_or_line_continuation(&chars, i) {
+                        return None;
+                    }
+                    let next = chars[i + 1].1;
+                    if matches!(next, '"' | '\\' | '$' | '`') {
+                        out.push((
+                            base_offset + chars[i].0,
+                            base_offset + char_end(i + 1),
+                            next,
+                        ));
+                    } else {
+                        out.push((base_offset + chars[i].0, base_offset + char_end(i), '\\'));
+                        out.push((
+                            base_offset + chars[i + 1].0,
+                            base_offset + char_end(i + 1),
+                            next,
+                        ));
+                    }
+                    i += 2;
+                    continue;
+                }
+                out.push((base_offset + chars[i].0, base_offset + char_end(i), dch));
+                i += 1;
+            }
+            if i + 1 != chars.len() {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// Scan a `sed` delimited field, returning `Some(span)` of its interior bytes
+/// (`None` if empty) or `None` on invalid/ambiguous syntax. When `is_regex` is
+/// true, bracket expressions `[...]` are validated and fail closed on embedded
+/// `delim` or `\\` (avoiding GNU-vs-POSIX bracket desync).
+fn skip_sed_delimited(
+    chars: &[(usize, usize, char)],
+    i: &mut usize,
+    delim: char,
+    is_regex: bool,
+) -> Option<Option<(usize, usize)>> {
+    let content_start = *i;
     while *i < chars.len() {
-        if chars[*i] == '\\' {
+        let c = chars[*i].2;
+        if c == '\\' {
             if *i + 1 >= chars.len() {
-                return false;
+                return None;
             }
             *i += 2;
             continue;
         }
-        if chars[*i] == delim {
+        if c == delim {
+            let span = if content_start < *i {
+                Some((chars[content_start].0, chars[*i - 1].1))
+            } else {
+                None
+            };
             *i += 1;
-            return true;
+            return Some(span);
+        }
+        if is_regex && c == '[' {
+            *i += 1;
+            if *i < chars.len() && chars[*i].2 == '^' {
+                *i += 1;
+            }
+            if *i < chars.len() && chars[*i].2 == ']' {
+                *i += 1;
+            }
+            let mut closed = false;
+            while *i < chars.len() {
+                let bc = chars[*i].2;
+                if bc == '\\' || bc == delim {
+                    return None;
+                }
+                if bc == ']' {
+                    *i += 1;
+                    closed = true;
+                    break;
+                }
+                if bc == '['
+                    && *i + 1 < chars.len()
+                    && matches!(chars[*i + 1].2, ':' | '.' | '=')
+                {
+                    let kind = chars[*i + 1].2;
+                    *i += 2;
+                    let mut class_closed = false;
+                    while *i < chars.len() {
+                        let cc = chars[*i].2;
+                        if cc == '\\' || cc == delim {
+                            return None;
+                        }
+                        if cc == kind && *i + 1 < chars.len() && chars[*i + 1].2 == ']' {
+                            *i += 2;
+                            class_closed = true;
+                            break;
+                        }
+                        *i += 1;
+                    }
+                    if !class_closed {
+                        return None;
+                    }
+                    continue;
+                }
+                *i += 1;
+            }
+            if !closed {
+                return None;
+            }
+            continue;
         }
         *i += 1;
     }
-    false
+    None
 }
 
-fn skip_sed_addr(chars: &[char], i: &mut usize) -> bool {
+fn skip_sed_addr(
+    chars: &[(usize, usize, char)],
+    i: &mut usize,
+    spans: &mut Vec<(usize, usize)>,
+) -> bool {
     if *i >= chars.len() {
         return true;
     }
-    if chars[*i].is_ascii_digit() {
-        while *i < chars.len() && chars[*i].is_ascii_digit() {
+    if chars[*i].2.is_ascii_digit() {
+        while *i < chars.len() && chars[*i].2.is_ascii_digit() {
             *i += 1;
         }
-    } else if chars[*i] == '$' {
+    } else if chars[*i].2 == '$' {
         *i += 1;
-    } else if chars[*i] == '/' {
+    } else if chars[*i].2 == '/' {
         *i += 1;
-        if !skip_sed_delimited(chars, i, '/') {
+        let Some(span) = skip_sed_delimited(chars, i, '/', true) else {
             return false;
+        };
+        if let Some(s) = span {
+            spans.push(s);
         }
     }
     true
 }
 
-/// Allow only pure `sed` `s` substitutions (without `e`/`w` flags) and `[dpq=]`
-/// commands so GNU `sed`'s `e` shell-execution and `r`/`w` file commands stay blocked.
-fn is_safe_sed_script(script: &str) -> bool {
-    let chars: Vec<char> = script.chars().collect();
+/// Validate that a `sed` script contains only pure `s` substitutions (without
+/// `e`/`w` flags) and `[dpq=]` commands, and return byte spans ONLY for regex
+/// addresses `/addr/` and `s` search patterns (never `s` replacement text).
+fn safe_sed_regex_spans(chars: &[(usize, usize, char)]) -> Option<Vec<(usize, usize)>> {
+    let mut spans = Vec::new();
     let mut i = 0usize;
     let mut saw_cmd = false;
 
     while i < chars.len() {
-        while i < chars.len() && matches!(chars[i], ' ' | '\t' | ';') {
+        while i < chars.len() && matches!(chars[i].2, ' ' | '\t' | ';') {
             i += 1;
         }
         if i >= chars.len() {
             break;
         }
-        if !skip_sed_addr(&chars, &mut i) {
-            return false;
+        if !skip_sed_addr(chars, &mut i, &mut spans) {
+            return None;
         }
-        while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+        while i < chars.len() && matches!(chars[i].2, ' ' | '\t') {
             i += 1;
         }
-        if i < chars.len() && chars[i] == ',' {
+        if i < chars.len() && chars[i].2 == ',' {
             i += 1;
-            while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+            while i < chars.len() && matches!(chars[i].2, ' ' | '\t') {
                 i += 1;
             }
-            if !skip_sed_addr(&chars, &mut i) {
-                return false;
+            if !skip_sed_addr(chars, &mut i, &mut spans) {
+                return None;
             }
-            while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+            while i < chars.len() && matches!(chars[i].2, ' ' | '\t') {
                 i += 1;
             }
         }
-        if i < chars.len() && chars[i] == '!' {
+        if i < chars.len() && chars[i].2 == '!' {
             i += 1;
-            while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+            while i < chars.len() && matches!(chars[i].2, ' ' | '\t') {
                 i += 1;
             }
         }
         if i >= chars.len() {
-            return false;
+            return None;
         }
-        match chars[i] {
+        match chars[i].2 {
             'd' | 'p' | 'q' | '=' => {
                 i += 1;
                 saw_cmd = true;
@@ -743,36 +1729,77 @@ fn is_safe_sed_script(script: &str) -> bool {
             's' => {
                 i += 1;
                 if i >= chars.len() {
-                    return false;
+                    return None;
                 }
-                let delim = chars[i];
-                if delim.is_alphanumeric() || delim == '\\' || delim.is_whitespace() {
-                    return false;
+                let delim = chars[i].2;
+                if delim.is_alphanumeric()
+                    || matches!(delim, '\\' | '[' | ']')
+                    || delim.is_whitespace()
+                {
+                    return None;
                 }
                 i += 1;
-                if !skip_sed_delimited(&chars, &mut i, delim)
-                    || !skip_sed_delimited(&chars, &mut i, delim)
-                {
-                    return false;
+                let pat_span = skip_sed_delimited(chars, &mut i, delim, true)?;
+                // Replacement text is literal output, never a regex — validate it
+                // without exempting its bytes.
+                let _ = skip_sed_delimited(chars, &mut i, delim, false)?;
+                if let Some(s) = pat_span {
+                    spans.push(s);
                 }
                 while i < chars.len()
-                    && (chars[i].is_ascii_digit()
-                        || matches!(chars[i], 'g' | 'p' | 'I' | 'i' | 'm' | 'M'))
+                    && (chars[i].2.is_ascii_digit()
+                        || matches!(chars[i].2, 'g' | 'p' | 'I' | 'i' | 'm' | 'M'))
                 {
                     i += 1;
                 }
                 saw_cmd = true;
             }
-            _ => return false,
+            _ => return None,
         }
-        while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+        while i < chars.len() && matches!(chars[i].2, ' ' | '\t') {
             i += 1;
         }
-        if i < chars.len() && chars[i] != ';' {
-            return false;
+        if i < chars.len() && chars[i].2 != ';' {
+            return None;
         }
     }
-    saw_cmd
+    saw_cmd.then_some(spans)
+}
+
+fn sed_word_regex_spans(
+    command: &str,
+    word: &StageWord,
+    strip_prefix: Option<&str>,
+) -> Vec<(usize, usize)> {
+    let raw = &command[word.start..word.end];
+    if let Some(prefix) = strip_prefix {
+        // Case 1: `--expression='...'` or `--expression="..."`.
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            let Some(decoded) = decode_single_quoted_sed_chars(rest, word.start + prefix.len())
+            else {
+                return Vec::new();
+            };
+            return safe_sed_regex_spans(&decoded).unwrap_or_default();
+        }
+        // Case 2: `"--expression=..."` or `'--expression=...'` (whole word in one quote).
+        let Some(decoded) = decode_single_quoted_sed_chars(raw, word.start) else {
+            return Vec::new();
+        };
+        let pchars: Vec<char> = prefix.chars().collect();
+        if decoded.len() < pchars.len()
+            || !decoded
+                .iter()
+                .zip(pchars.iter())
+                .all(|(&(_, _, c), &p)| c == p)
+        {
+            return Vec::new();
+        }
+        return safe_sed_regex_spans(&decoded[pchars.len()..]).unwrap_or_default();
+    }
+    let Some(decoded) = decode_single_quoted_sed_chars(raw, word.start) else {
+        return Vec::new();
+    };
+    safe_sed_regex_spans(&decoded).unwrap_or_default()
 }
 
 fn rg_or_grep_regex_spans(words: &[StageWord], is_rg: bool) -> Vec<(usize, usize)> {
@@ -898,14 +1925,14 @@ fn rg_or_grep_regex_spans(words: &[StageWord], is_rg: bool) -> Vec<(usize, usize
         "--null",
         "--null-data",
         "--line-buffered",
+        "--color",
+        "--colour",
     ];
     const GREP_VAL_LONG: &[&str] = &[
         "--max-count",
         "--after-context",
         "--before-context",
         "--context",
-        "--color",
-        "--colour",
         "--include",
         "--exclude",
         "--exclude-dir",
@@ -935,6 +1962,9 @@ fn rg_or_grep_regex_spans(words: &[StageWord], is_rg: bool) -> Vec<(usize, usize
 
     while i < words.len() {
         let w = &words[i];
+        if w.is_dynamic {
+            break;
+        }
         let arg = w.value.as_str();
         if !after_dd {
             if arg == "--" {
@@ -946,6 +1976,9 @@ fn rg_or_grep_regex_spans(words: &[StageWord], is_rg: bool) -> Vec<(usize, usize
                 let Some(pat) = words.get(i + 1) else {
                     return Vec::new();
                 };
+                if pat.is_dynamic {
+                    break;
+                }
                 has_explicit_pattern = true;
                 if pat.has_quotes && !pat.has_unquoted_glob {
                     spans.push((pat.start, pat.end));
@@ -962,8 +1995,11 @@ fn rg_or_grep_regex_spans(words: &[StageWord], is_rg: bool) -> Vec<(usize, usize
                 continue;
             }
             if arg == "-f" || arg == "--file" {
-                if words.get(i + 1).is_none() {
+                let Some(val) = words.get(i + 1) else {
                     return Vec::new();
+                };
+                if val.is_dynamic {
+                    break;
                 }
                 has_explicit_pattern = true;
                 i += 2;
@@ -980,14 +2016,30 @@ fn rg_or_grep_regex_spans(words: &[StageWord], is_rg: bool) -> Vec<(usize, usize
                     continue;
                 }
                 if val_long.contains(&arg) {
-                    if words.get(i + 1).is_none() {
+                    let Some(val) = words.get(i + 1) else {
+                        return Vec::new();
+                    };
+                    if val.is_dynamic {
+                        break;
+                    }
+                    // Numeric flags (including BSD/macOS grep `--context`, which is
+                    // optional-argument) must consume pure ASCII digits so a following
+                    // flag like `--include` can never be swallowed as a value.
+                    if matches!(
+                        arg,
+                        "--after-context" | "--before-context" | "--context" | "--max-count"
+                    ) && (val.value.is_empty()
+                        || !val.value.chars().all(|c| c.is_ascii_digit()))
+                    {
                         return Vec::new();
                     }
                     i += 2;
                     continue;
                 }
                 if let Some((flag, _)) = arg.split_once('=') {
-                    if val_long.contains(&flag) {
+                    if val_long.contains(&flag)
+                        || (!is_rg && matches!(flag, "--color" | "--colour"))
+                    {
                         i += 1;
                         continue;
                     }
@@ -996,6 +2048,7 @@ fn rg_or_grep_regex_spans(words: &[StageWord], is_rg: bool) -> Vec<(usize, usize
             }
             if arg.starts_with('-') && arg.len() > 1 {
                 let mut fchars = arg[1..].chars();
+                let mut hit_dynamic = false;
                 while let Some(fc) = fchars.next() {
                     if fc == 'e' {
                         has_explicit_pattern = true;
@@ -1004,6 +2057,10 @@ fn rg_or_grep_regex_spans(words: &[StageWord], is_rg: bool) -> Vec<(usize, usize
                             let Some(pat) = words.get(i + 1) else {
                                 return Vec::new();
                             };
+                            if pat.is_dynamic {
+                                hit_dynamic = true;
+                                break;
+                            }
                             if pat.has_quotes && !pat.has_unquoted_glob {
                                 spans.push((pat.start, pat.end));
                             }
@@ -1017,8 +2074,12 @@ fn rg_or_grep_regex_spans(words: &[StageWord], is_rg: bool) -> Vec<(usize, usize
                         has_explicit_pattern = true;
                         let rest: String = fchars.collect();
                         if rest.is_empty() {
-                            if words.get(i + 1).is_none() {
+                            let Some(val) = words.get(i + 1) else {
                                 return Vec::new();
+                            };
+                            if val.is_dynamic {
+                                hit_dynamic = true;
+                                break;
                             }
                             i += 2;
                         } else {
@@ -1029,7 +2090,17 @@ fn rg_or_grep_regex_spans(words: &[StageWord], is_rg: bool) -> Vec<(usize, usize
                     if val_short.contains(&fc) {
                         let rest: String = fchars.collect();
                         if rest.is_empty() {
-                            if words.get(i + 1).is_none() {
+                            let Some(val) = words.get(i + 1) else {
+                                return Vec::new();
+                            };
+                            if val.is_dynamic {
+                                hit_dynamic = true;
+                                break;
+                            }
+                            if matches!(fc, 'A' | 'B' | 'C' | 'm')
+                                && (val.value.is_empty()
+                                    || !val.value.chars().all(|c| c.is_ascii_digit()))
+                            {
                                 return Vec::new();
                             }
                             i += 2;
@@ -1046,6 +2117,9 @@ fn rg_or_grep_regex_spans(words: &[StageWord], is_rg: bool) -> Vec<(usize, usize
                         break;
                     }
                 }
+                if hit_dynamic {
+                    break;
+                }
                 continue;
             }
         }
@@ -1061,7 +2135,7 @@ fn rg_or_grep_regex_spans(words: &[StageWord], is_rg: bool) -> Vec<(usize, usize
     spans
 }
 
-fn sed_script_spans(words: &[StageWord]) -> Vec<(usize, usize)> {
+fn sed_script_spans(command: &str, words: &[StageWord]) -> Vec<(usize, usize)> {
     const SED_BOOL_SHORT: &[char] = &['n', 'E', 'r', 'u', 'z', 'b', 's'];
     const SED_BOOL_LONG: &[&str] = &[
         "--quiet",
@@ -1084,6 +2158,9 @@ fn sed_script_spans(words: &[StageWord]) -> Vec<(usize, usize)> {
 
     while i < words.len() {
         let w = &words[i];
+        if w.is_dynamic {
+            break;
+        }
         let arg = w.value.as_str();
         if !after_dd {
             if arg == "--" {
@@ -1095,24 +2172,30 @@ fn sed_script_spans(words: &[StageWord]) -> Vec<(usize, usize)> {
                 let Some(scr) = words.get(i + 1) else {
                     return Vec::new();
                 };
+                if scr.is_dynamic {
+                    break;
+                }
                 has_explicit_script = true;
-                if scr.has_quotes && !scr.has_unquoted_glob && is_safe_sed_script(&scr.value) {
-                    spans.push((scr.start, scr.end));
+                if scr.has_quotes && !scr.has_unquoted_glob {
+                    spans.extend(sed_word_regex_spans(command, scr, None));
                 }
                 i += 2;
                 continue;
             }
-            if let Some(scr_val) = arg.strip_prefix("--expression=") {
+            if arg.starts_with("--expression=") {
                 has_explicit_script = true;
-                if w.has_quotes && !w.has_unquoted_glob && is_safe_sed_script(scr_val) {
-                    spans.push((w.start, w.end));
+                if w.has_quotes && !w.has_unquoted_glob {
+                    spans.extend(sed_word_regex_spans(command, w, Some("--expression=")));
                 }
                 i += 1;
                 continue;
             }
             if arg == "-f" || arg == "--file" {
-                if words.get(i + 1).is_none() {
+                let Some(val) = words.get(i + 1) else {
                     return Vec::new();
+                };
+                if val.is_dynamic {
+                    break;
                 }
                 has_explicit_script = true;
                 i += 2;
@@ -1124,8 +2207,11 @@ fn sed_script_spans(words: &[StageWord]) -> Vec<(usize, usize)> {
                 continue;
             }
             if arg == "-l" || arg == "--line-length" {
-                if words.get(i + 1).is_none() {
+                let Some(val) = words.get(i + 1) else {
                     return Vec::new();
+                };
+                if val.is_dynamic {
+                    break;
                 }
                 i += 2;
                 continue;
@@ -1147,6 +2233,7 @@ fn sed_script_spans(words: &[StageWord]) -> Vec<(usize, usize)> {
             }
             if arg.starts_with('-') && arg.len() > 1 {
                 let mut fchars = arg[1..].chars();
+                let mut hit_dynamic = false;
                 while let Some(fc) = fchars.next() {
                     if fc == 'e' {
                         has_explicit_script = true;
@@ -1155,11 +2242,12 @@ fn sed_script_spans(words: &[StageWord]) -> Vec<(usize, usize)> {
                             let Some(scr) = words.get(i + 1) else {
                                 return Vec::new();
                             };
-                            if scr.has_quotes
-                                && !scr.has_unquoted_glob
-                                && is_safe_sed_script(&scr.value)
-                            {
-                                spans.push((scr.start, scr.end));
+                            if scr.is_dynamic {
+                                hit_dynamic = true;
+                                break;
+                            }
+                            if scr.has_quotes && !scr.has_unquoted_glob {
+                                spans.extend(sed_word_regex_spans(command, scr, None));
                             }
                             i += 2;
                         } else {
@@ -1173,8 +2261,12 @@ fn sed_script_spans(words: &[StageWord]) -> Vec<(usize, usize)> {
                         }
                         let rest: String = fchars.collect();
                         if rest.is_empty() {
-                            if words.get(i + 1).is_none() {
+                            let Some(val) = words.get(i + 1) else {
                                 return Vec::new();
+                            };
+                            if val.is_dynamic {
+                                hit_dynamic = true;
+                                break;
                             }
                             i += 2;
                         } else {
@@ -1190,6 +2282,9 @@ fn sed_script_spans(words: &[StageWord]) -> Vec<(usize, usize)> {
                         break;
                     }
                 }
+                if hit_dynamic {
+                    break;
+                }
                 continue;
             }
         }
@@ -1198,9 +2293,8 @@ fn sed_script_spans(words: &[StageWord]) -> Vec<(usize, usize)> {
             && !saw_positional
             && w.has_quotes
             && !w.has_unquoted_glob
-            && is_safe_sed_script(arg)
         {
-            spans.push((w.start, w.end));
+            spans.extend(sed_word_regex_spans(command, w, None));
         }
         saw_positional = true;
         i += 1;
@@ -1209,8 +2303,8 @@ fn sed_script_spans(words: &[StageWord]) -> Vec<(usize, usize)> {
     spans
 }
 
-/// Identify byte spans of quoted regex / safe `sed` script operands in simple
-/// `rg`, `grep`/`egrep`/`fgrep`, and `sed`/`gsed` commands.
+/// Identify byte spans of quoted regex / safe `sed` script operands in parsed
+/// `rg`, `grep`/`egrep`/`fgrep`, and `sed`/`gsed` stages.
 fn quoted_regex_spans(command: &str) -> Vec<(usize, usize)> {
     let Some(stages) = parse_shell_stages(command) else {
         return Vec::new();
@@ -1218,16 +2312,39 @@ fn quoted_regex_spans(command: &str) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     for stage in &stages {
         let mut idx = 0usize;
+        while idx < stage.len() {
+            let w = &stage[idx];
+            if !w.has_quotes
+                && !w.has_unquoted_glob
+                && !w.is_dynamic
+                && is_control_prefix_keyword(&w.value)
+            {
+                idx += 1;
+                if w.value == "time" {
+                    if let Some(next) = stage.get(idx) {
+                        if !next.has_quotes
+                            && !next.has_unquoted_glob
+                            && !next.is_dynamic
+                            && next.value == "-p"
+                        {
+                            idx += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+            break;
+        }
         while idx < stage.len()
             && !stage[idx].has_unquoted_glob
-            && is_env_assignment_word(&stage[idx].value)
+            && is_env_assignment_word(&command[stage[idx].start..stage[idx].end])
         {
             idx += 1;
         }
         let Some(cmd_word) = stage.get(idx) else {
             continue;
         };
-        if cmd_word.has_unquoted_glob {
+        if cmd_word.has_unquoted_glob || cmd_word.is_dynamic {
             continue;
         }
         let bin = casefold(
@@ -1241,7 +2358,7 @@ fn quoted_regex_spans(command: &str) -> Vec<(usize, usize)> {
         match bin.as_str() {
             "rg" => spans.extend(rg_or_grep_regex_spans(tail, true)),
             "grep" | "egrep" | "fgrep" => spans.extend(rg_or_grep_regex_spans(tail, false)),
-            "sed" | "gsed" => spans.extend(sed_script_spans(tail)),
+            "sed" | "gsed" => spans.extend(sed_script_spans(command, tail)),
             _ => {}
         }
     }
@@ -2489,12 +3606,91 @@ mod tests {
             "cat keys/id_*",
             "cat id_*",
             "git show HEAD:.e*",
+            // Compound/shell bypass attempts must stay blocked (fail closed).
+            "cat $(echo x | sed 's/x/.*/')",
+            "cat $( (echo x | sed 's/x/.*/') )",
+            "cat $(case x in a) echo x | sed 's/x/.*/' ;; esac)",
+            "cat $(cat <<'EOF'\n)\nEOF\necho x | sed 's/x/.*/')",
+            "cat $(# )\necho x | sed 's/x/.*/')",
+            "cat `echo x | sed 's/x/.*/'`",
+            "sh <(echo x | sed 's/x/cat .*/')",
+            "arr=(rg '.*'); cat ${arr[1]}",
+            "rg {-g,'.*'} foo src",
+            "rg $OPT '.*' src",
+            "sed $OPT 's/.*\\.//' src",
+            "rg -n \"$(cat .*)\" src",
+            "rg -n \"`cat .*`\" src",
+            "rg -n \".*$VAR\" src",
+            "rg -n 'fn .*' \"$dir\" -g '.*'",
+            "for r in .*; do rg -n 'fn .*' \"$r\"; done",
+            "f() { echo x | sed 's/x/.*/'; }; cat $(f)",
+            "f () { echo x | sed 's/x/.*/'; }; cat $(f)",
+            "function f { echo x | sed 's/x/.*/'; }; cat $(f)",
+            "bash <<'EOF'\nrg '.*'\nEOF",
+            "echo 'unclosed; rg '.*'",
+            "case $x in rg) '.*' ;; esac",
+            "case $x in (rg) '.*' ;; esac",
+            "FOO=.env rg -n 'fn .*' src",
+            "FOO='.*' rg -n 'fn .*' src",
+            "$FOO=bar rg -n '.*' src",
+            "rg -n '.*' src < .*",
+            "rg -n 'fn .*' .env",
+            "rg -n 'fn .*' src; cat .*",
+            // Reviewer-discovered bypass PoCs (must all stay blocked):
+            // 1. Quotes inside double-quoted "${...}"
+            r#"echo "${x:-'}" '}"; rg ' ; cat .* # '"#,
+            r#"case y in y) echo "${x:-'}" ; cat $(echo "a'}" >/dev/null; echo x | sed 's/x/.*/') ;; esac"#,
+            // 2. sed [...] bracket desync & sed replacement text emission
+            "echo x | sed 's/[/]/;s|x/g;e cat .* #|y|'",
+            r"echo x | sed 's/[\]/;e cat .* #/y/'",
+            "echo x | sed 's/x/cat .*/' | sh",
+            "echo x | sed 's/x/.*/' | while read p; do cat $p; done",
+            "sed 's/.env/ok/'",
+            // 3. grep --color/--colour optional-arg flag misalignment
+            "grep -r --color --include '.*' '' .",
+            "grep -r --colour --include '.*' '' .",
+            // 4. Line-continuation `\<newline>` lexing bypasses
+            "rg -u -g \\\n '.*' '' .",
+            "grep -r --include \\\n '.*' '' .",
+            "cat <\\\n<'EOF'\nrg '\nEOF\ncat .*; exit\n'",
+            "case y in y) cat $(ca\\\nse a in a) echo x | sed 's/x/.*/' ;; \\\n esac) ;; esac",
+            // 5. Heredoc trailing `\r` Unix-vs-CRLF desync
+            "bash <<'EOF'\necho '\nEOF\r\nrg '\ncat .*; exit\n'\nEOF",
+            "cat <<'EOF' | awk 'NR==2{print $2}' | tr -d \"'\" | xargs sh -c 'cat $1' _\nEOF\r\nrg '.*'\nEOF",
+            // 6. Function-definition syntax variants & stray `}` / interleaved blocks
+            "if true; then f () { echo x | sed 's/x/.*/'; }; fi; cat $(f)",
+            "f( ) { echo x | sed 's/x/.*/'; }; cat $(f)",
+            "f ( ) { echo x | sed 's/x/.*/'; }; cat $(f)",
+            "f g() { echo x | sed 's/x/.*/'; }; cat $(f)",
+            "( { rg -n 'fn .*' src; ) }",
+            "rg -n 'fn .*' src; }",
+            // 7. `$'...'` dash/ash quote desync
+            r#"echo $'\''; rg ' ; cat .* # '"#,
+            // 8. Delta-review PoCs: sed mixed-quote parity, `{#` comment desync,
+            //    heredoc header `\r`, BSD grep `--context`/`-C`, comment-padded fn defs
+            r"sed 's/a'b'/ok/' ; cat .e\nv",
+            r#"sed 's/a'"b/c/" </dev/null; cat .\env"#,
+            r"sed 's/'a'b/x/' </dev/null; cat .\env",
+            "echo $(echo {#) ; echo '\n); rg ' ; cat .* # '",
+            "bash <<EOF\r\necho '\nEOF\nrg '\ncat .*; exit\n'\nEOF\r\n",
+            "grep -r --context --include '.*' '' .",
+            "grep -r -C --include '.*' '' .",
+            "rg( #\n) if true; then cat $1; fi; rg '.*'",
+            "f ( #\n) if true; then rg -I -o -F '.*' core/src/hook.rs | head -1; fi; cat $(f)",
         ] {
             assert!(
                 !secret_command_denied(Some(&json!(secret_glob))).is_empty(),
                 "secret_glob={secret_glob}"
             );
         }
+        // Excessive nesting fails closed without overflowing the stack.
+        let deep = format!(
+            "echo {}ok{}; rg -n 'fn .*' src",
+            "$(".repeat(80),
+            ")".repeat(80)
+        );
+        assert!(!secret_command_denied(Some(&json!(deep))).is_empty());
+
         for regex_cmd in [
             "rg -n 'fn .*keep_log' src",
             r"sed -E 's/.*test result: ok\./ok/'",
@@ -2517,6 +3713,37 @@ mod tests {
             "rg -n '.*local' src",
             "grep -n 'fn .*keep_log' src",
             r"cargo test 2>&1 | sed -E 's/.*test result: ok\./ok/'",
+            // Exact regression from live Devin session: $r in for-loop + sed 's/.*\.//'
+            r#"cd /home/zozi/workspace/prometheus/core && sed -n 812,862p src/impact.rs; sed -n 965,1000p src/impact.rs; cd ~/workspace && for r in prometheus prometheos Tonsores/tonsores-pos; do echo "== $r"; git -C $r rev-list --count HEAD 2>&1; git -C $r log -1 --format=%cI 2>&1; git -C $r log --reverse --format=%cI 2>/dev/null | head -1; git -C $r ls-files | sed 's/.*\.//' | sort | uniq -c | sort -rn | head -8; done"#,
+            // Compound shell constructs around safe rg/grep/sed stages.
+            r#"for f in src/*.rs; do rg -n 'fn .*' "$f"; done"#,
+            r#"if true; then rg -n 'fn .*' "$dir"; else grep -E 'foo.*bar' src; fi"#,
+            r#"case "$x" in a) sed 's/.*\.//' ;; b) rg -n 'fn .*' src ;; esac"#,
+            r#"case "$x" in (a) sed 's/.*\.//' ;; (b|c) rg -n 'fn .*' src ;; esac"#,
+            r#"(case "$x" in a) sed 's/.*\.//' ;; esac)"#,
+            r#"case "$x" in a) (rg -n 'fn .*' src) ;; esac"#,
+            r#"(cd core && rg -n 'fn .*' src)"#,
+            r#"{ git ls-files | sed 's/.*\.//'; }"#,
+            "python3 - <<'EOF'\nprint(\"don't fail\")\nEOF\ngit ls-files | sed 's/.*\\.//'",
+            "# don't break on comment\ngit ls-files | sed 's/.*\\.//' # trailing comment",
+            r#"d=docs/research && rg -n "zozi.*OUT" $d/mine2.py &>/dev/null"#,
+            r#"rg -n 'fn .*' src > "$out""#,
+            r#"time -p rg -n 'fn .*' src"#,
+            r#"FOO=$val rg -n 'fn .*' src"#,
+            r#"arr=(); (( n++ )); rg -n 'fn .*' src"#,
+            r#"echo "hi $(date)"; git ls-files | sed 's/.*\.//'"#,
+            r#"echo "${x:-default}"; git ls-files | sed 's/.*\.//'"#,
+            r#"sed -n 's/.*\.//p' "$f""#,
+            r#"sed -n '/.*foo/p' "$f""#,
+            r#"sed 's/[^.]*\.//'"#,
+            r#"sed 's/[[:space:]].*//'"#,
+            r#"sed --expression='s/.*\.//'"#,
+            r#"sed "--expression=s/.*\\.//""#,
+            r#"sed -E "s/.*test result: ok\\./ok/""#,
+            r#"grep -r --color 'fn .*' src"#,
+            r#"grep -r --color=always 'fn .*' src"#,
+            r#"grep -r -C 2 'fn .*' src"#,
+            r#"grep -r --context 2 'fn .*' src"#,
         ] {
             assert!(
                 secret_command_denied(Some(&json!(regex_cmd))).is_empty(),
@@ -2551,6 +3778,8 @@ mod tests {
             "sed -E 's/(.*)/\\1/'",
             "rg -n 'pub struct LineIndex|fn .*offset|fn .*line' core/src/outline/lexer.rs",
             "rg -n 'fn .?keep_log' src",
+            r#"for r in prometheus prometheos; do git -C $r ls-files | sed 's/.*\.//' | sort; done"#,
+            r#"for f in src/*.rs; do rg -n 'fn .*' "$f"; done"#,
         ] {
             let devin_ev = json!({
                 "hook_event_name": "PreToolUse",
