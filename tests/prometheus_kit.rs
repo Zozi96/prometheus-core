@@ -1763,22 +1763,16 @@ fn keep_log_issue_examples_trace_with_and_without_rtk() {
 }
 
 #[test]
-fn keep_log_secret_command_is_denied_before_rewrite() {
+fn keep_log_secret_command_passes_through_without_rewrite_or_ask() {
     let home = MetricsHome::new("keeplog_secret");
     let ev = keep_log_event("dotnet test --settings .env | tail -5", &home.repo);
     let out = home.hook("droid", &ev);
     assert_eq!(out.status.code(), Some(0));
     let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
-        reply
-            .pointer("/hookSpecificOutput/permissionDecision")
-            .and_then(Value::as_str),
-        Some("ask"),
-        "reply={reply}"
-    );
-    assert!(
-        reply.pointer("/hookSpecificOutput/updatedInput").is_none(),
-        "secret events must refuse before rewrite: {reply}"
+        reply,
+        serde_json::json!({}),
+        "shell commands with secret file operands must neither ask nor rewrite to keep-log: {reply}"
     );
 }
 
