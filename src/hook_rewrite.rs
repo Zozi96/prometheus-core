@@ -456,6 +456,7 @@ fn scan_and_split_cd_prefix(command: &str) -> Option<(Option<&str>, &str)> {
                 in_double = true;
                 i += 1;
             }
+            b'$' if bytes.get(i + 1) == Some(&b'"') => return None,
             b'|' | b';' | b'>' | b'<' => return None,
             b'&' => {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'&' {
@@ -2573,6 +2574,9 @@ mod tests {
             "pytest !(slow) | tail -5",
             "dotnet test $\"hello\" | tail -5",
             "dotnet test $\".env\" | tail -5",
+            "dotnet test --settings $\".env\"",
+            "cd $\".ssh\" && git status",
+            "cat $\".env\"",
             "dotnet test | grep FAIL",
             "dotnet test | grep error | tail -5",
             "cd a && cd b && dotnet test | tail -5",

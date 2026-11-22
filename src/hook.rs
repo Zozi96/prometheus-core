@@ -1433,23 +1433,49 @@ fn handle_cursor(raw: &[u8]) -> Value {
         return cursor_deny_reply(&reason);
     }
     let roots = cursor_roots(event);
-    let dump = inline_dump_guard(
-        "cursor",
-        event,
-        session_id,
-        roots.first().map(PathBuf::as_path),
-    );
+    let root = roots.first().map(PathBuf::as_path);
+    let shell_input: Option<Map<String, Value>> = get(event, "tool_input")
+        .and_then(Value::as_object)
+        .or_else(|| get(event, "input").and_then(Value::as_object))
+        .cloned()
+        .or_else(|| {
+            get(event, "command")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(|cmd| {
+                    let mut m = Map::new();
+                    m.insert("command".to_owned(), Value::String(cmd.to_owned()));
+                    m
+                })
+        });
+    if let Some(inp) = shell_input.as_ref() {
+        if let crate::hook_rewrite::ShellAction::Rewrite {
+            command_key,
+            rewritten,
+            ..
+        } = crate::hook_rewrite::evaluate_shell_policy(
+            "cursor",
+            crate::hook_rewrite::ShellPolicyTier::Rewrite,
+            tool_name(event),
+            inp,
+            session_id,
+            root,
+        ) {
+            let mut updated = inp.clone();
+            updated.insert(command_key, Value::String(rewritten));
+            return json!({
+                "permission": "allow",
+                "updated_input": Value::Object(updated),
+            });
+        }
+    }
+    let dump = inline_dump_guard("cursor", event, session_id, root);
     if dump != ReadGuard::Pass {
         return read_guard_reply("cursor", dump);
     }
     read_guard_reply(
         "cursor",
-        read_guard(
-            "cursor",
-            event,
-            session_id,
-            roots.first().map(PathBuf::as_path),
-        ),
+        read_guard("cursor", event, session_id, root),
     )
 }
 
@@ -1666,10 +1692,11 @@ mod tests {
                 "workspace_roots": [tmp.0],
                 "conversation_id": "s-cursor",
             });
-            assert_eq!(
-                json!({}),
-                run_hook("cursor", cursor_ev.to_string().as_bytes()),
-                "cursor {cmd}"
+            let cursor_reply = run_hook("cursor", cursor_ev.to_string().as_bytes());
+            assert_ne!(
+                Some("deny"),
+                cursor_reply.get("permission").and_then(Value::as_str),
+                "cursor {cmd}: {cursor_reply}"
             );
         }
 
@@ -2770,5 +2797,70 @@ mod tests {
             read_bytes_estimate(&p(vec![("limit", json!(5))]), 100, 0),
             0
         );
+    }
+
+    #[test]
+    fn cursor_rewrites_shell_via_updated_input_preserves_siblings_and_defers_to_rtk() {
+        let _g = env_guard();
+        let tmp = TempDir::new("cursor_rw");
+        let _env = EnvOverride::set(&[
+            ("PROMETHEUS_KIT_NO_REWRITE", None),
+            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
+        ]);
+        let ev = json!({
+            "hook_event_name": "preToolUse",
+            "tool_name": "Shell",
+            "tool_input": {
+                "command": "git status",
+                "working_directory": tmp.0,
+                "timeout": 30,
+            },
+            "workspace_roots": [tmp.0],
+            "conversation_id": "s-cursor-rw",
+        });
+        let reply = run_hook("cursor", ev.to_string().as_bytes());
+        assert_eq!("allow", reply["permission"]);
+        let updated = reply["updated_input"].as_object().expect("updated_input object");
+        assert!(updated["command"].as_str().unwrap().contains("diff --status"), "{reply}");
+        assert_eq!(tmp.0.to_string_lossy().as_ref(), updated["working_directory"].as_str().unwrap());
+        assert_eq!(30, updated["timeout"].as_i64().unwrap());
+        assert!(reply.get("agent_message").is_none());
+
+        // Unsupported / write shell commands pass through untouched.
+        let write_ev = json!({
+            "hook_event_name": "preToolUse",
+            "tool_name": "Shell",
+            "tool_input": {"command": "echo hi > out.txt"},
+            "workspace_roots": [tmp.0],
+            "conversation_id": "s-cursor-rw",
+        });
+        assert_eq!(json!({}), run_hook("cursor", write_ev.to_string().as_bytes()));
+
+        // Secret paths still deny before any rewrite.
+        let sec_ev = json!({
+            "hook_event_name": "preToolUse",
+            "tool_name": "Read",
+            "tool_input": {"path": ".env"},
+            "workspace_roots": [tmp.0],
+            "conversation_id": "s-cursor-rw",
+        });
+        assert_eq!("deny", run_hook("cursor", sec_ev.to_string().as_bytes())["permission"]);
+
+        // RTK deferral skips RTK-owned commands while keeping RTK-gap commands.
+        let _rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("1"))]);
+        assert_eq!(json!({}), run_hook("cursor", ev.to_string().as_bytes()));
+        let dt_ev = json!({
+            "hook_event_name": "preToolUse",
+            "tool_name": "Shell",
+            "tool_input": {"command": "dotnet test", "working_directory": tmp.0},
+            "workspace_roots": [tmp.0],
+            "conversation_id": "s-cursor-rw",
+        });
+        let dt_reply = run_hook("cursor", dt_ev.to_string().as_bytes());
+        assert_eq!("allow", dt_reply["permission"]);
+        assert!(dt_reply["updated_input"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("compact --mode test -- dotnet test"));
     }
 }

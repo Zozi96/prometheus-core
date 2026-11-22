@@ -758,10 +758,25 @@ fn metrics_records_shell_rewrite_for_rewrite_hosts() {
             "host={host}: {command}"
         );
     }
+    let cursor_ev = serde_json::json!({
+        "hook_event_name": "preToolUse",
+        "tool_name": "Shell",
+        "tool_input": {"command": REWRITE_COMMAND, "working_directory": home.repo.to_str().unwrap()},
+        "workspace_roots": [home.repo.to_str().unwrap()],
+        "conversation_id": "sess-cursor",
+    });
+    let c_out = home.hook("cursor", &cursor_ev);
+    assert_eq!(c_out.status.code(), Some(0));
+    let c_reply: Value = serde_json::from_slice(&c_out.stdout).unwrap();
+    assert_eq!("allow", c_reply["permission"]);
+    assert!(c_reply["updated_input"]["command"]
+        .as_str()
+        .unwrap()
+        .contains("compact --mode test"));
 
     let rows = home.rows();
-    assert_eq!(rows.len(), 3, "rows: {rows:?}");
-    for host in ["claude", "droid", "muse"] {
+    assert_eq!(rows.len(), 4, "rows: {rows:?}");
+    for host in ["claude", "cursor", "droid", "muse"] {
         let row = find_row(&rows, host, "shell-rewrite");
         assert_metric_row_keys(row);
         assert_eq!(
@@ -775,8 +790,8 @@ fn metrics_records_shell_rewrite_for_rewrite_hosts() {
     let totals = home.metrics();
     assert_eq!(totals.status.code(), Some(0));
     let parsed: Value = serde_json::from_slice(&totals.stdout).unwrap();
-    assert_eq!(parsed["by_rule"]["shell-rewrite"]["count"], 3);
-    for host in ["claude", "droid", "muse"] {
+    assert_eq!(parsed["by_rule"]["shell-rewrite"]["count"], 4);
+    for host in ["claude", "cursor", "droid", "muse"] {
         assert_eq!(parsed["by_host"][host]["count"], 1, "host={host}");
     }
 }
