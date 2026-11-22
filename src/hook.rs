@@ -4042,7 +4042,11 @@ mod tests {
         let shell = ev("run_terminal_command", json!({"command": "sed -n '1,3p' big.rs"}));
         let s1 = run_hook("grok", shell.to_string().as_bytes());
         assert_eq!("deny", s1["decision"].as_str().unwrap(), "{s1}");
-        assert!(s1["reason"].as_str().unwrap().contains("slice 'big.rs:1-3'"), "{s1}");
+        // The kit command in the reason is built from the current exe and
+        // platform quoting (POSIX always quotes, Windows only when needed),
+        // so assert on the command parts, not the quoted form.
+        assert!(s1["reason"].as_str().unwrap().contains("slice"), "{s1}");
+        assert!(s1["reason"].as_str().unwrap().contains("big.rs:1-3"), "{s1}");
         assert_eq!(json!({}), run_hook("grok", shell.to_string().as_bytes()));
         // Uncovered shell passes {}.
         assert_eq!(
