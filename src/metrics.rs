@@ -19,11 +19,14 @@ const MAX_BYTES: u64 = 1024 * 1024;
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 pub enum Host {
+    Antigravity,
     Claude,
     Cursor,
     Devin,
     Droid,
+    Grok,
     Muse,
+    Omp,
     Standalone,
 }
 
@@ -31,11 +34,14 @@ impl Host {
     /// Map a `prometheus-kit hook` host name; other hosts have no metrics identity.
     pub fn from_hook(host: &str) -> Option<Self> {
         match host {
+            "antigravity" => Some(Self::Antigravity),
             "claude" => Some(Self::Claude),
             "cursor" => Some(Self::Cursor),
             "devin" => Some(Self::Devin),
             "droid" => Some(Self::Droid),
+            "grok" => Some(Self::Grok),
             "muse" => Some(Self::Muse),
+            "omp" => Some(Self::Omp),
             _ => None,
         }
     }
@@ -48,10 +54,12 @@ impl Host {
 pub fn command_host() -> Host {
     let mut found: Option<Host> = None;
     for (var, host) in [
+        ("ANTIGRAVITY_CONVERSATION_ID", Host::Antigravity),
         ("CURSOR_PROJECT_DIR", Host::Cursor),
         ("DEVIN_PROJECT_DIR", Host::Devin),
         ("CLAUDECODE", Host::Claude),
         ("FACTORY_DROID_SESSION_ID", Host::Droid),
+        ("GROK_SESSION_ID", Host::Grok),
         ("MUSE_SESSION_ID", Host::Muse),
     ] {
         if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
@@ -69,7 +77,10 @@ pub fn command_host() -> Host {
 #[serde(rename_all = "kebab-case")]
 pub enum Rule {
     ShellRewrite,
+    ShellDenial,
+    InlineDumpDenial,
     LargeReadAdvisory,
+    FirstReadDenial,
     RereadWarning,
     RereadDenial,
     AllowedRetry,

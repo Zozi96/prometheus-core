@@ -61,10 +61,17 @@ pub fn rtk_hook_active(host: &str) -> bool {
             _ => {}
         }
     }
+    if host == "grok" {
+        return grok_dir_has_rtk_hook();
+    }
     let Some(config_path) = host_hooks_config_path(host) else {
         return false;
     };
-    let Some(bytes) = read_config_bounded(&config_path) else {
+    json_file_has_rtk_hook(&config_path)
+}
+
+fn json_file_has_rtk_hook(config_path: &Path) -> bool {
+    let Some(bytes) = read_config_bounded(config_path) else {
         return false;
     };
     let Ok(parsed) = serde_json::from_slice::<Value>(&bytes) else {
@@ -73,20 +80,84 @@ pub fn rtk_hook_active(host: &str) -> bool {
     json_has_rtk_hook(&parsed)
 }
 
-fn host_hooks_config_path(host: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").filter(|v| !v.is_empty()).map(PathBuf::from)?;
+fn abs_env_dir(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+fn abs_home_dir() -> Option<PathBuf> {
+    crate::droid_mode::default_home()
+        .ok()
+        .filter(|p| p.is_absolute())
+}
+
+fn grok_dir_has_rtk_hook_in(home: Option<&Path>) -> bool {
+    let Some(home) = home.filter(|p| p.is_absolute()) else {
+        return false;
+    };
+    let dir = home.join(".grok").join("hooks");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    for entry in entries.take(64).flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") && json_file_has_rtk_hook(&path)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn grok_dir_has_rtk_hook() -> bool {
+    grok_dir_has_rtk_hook_in(abs_home_dir().as_deref())
+}
+
+fn host_hooks_config_path_in(
+    host: &str,
+    home: Option<&Path>,
+    xdg: Option<&Path>,
+    agy: Option<&Path>,
+) -> Option<PathBuf> {
+    let abs_home = home.filter(|p| p.is_absolute());
+    let abs_xdg = xdg.filter(|p| p.is_absolute());
+    let abs_agy = agy.filter(|p| p.is_absolute());
     match host {
-        "droid" => Some(home.join(".factory").join("hooks.json")),
-        "claude" => Some(home.join(".claude").join("settings.json")),
+        "droid" => Some(abs_home?.join(".factory").join("hooks.json")),
+        "claude" => Some(abs_home?.join(".claude").join("settings.json")),
+        "cursor" => Some(abs_home?.join(".cursor").join("hooks.json")),
+        "devin" => {
+            let base = match abs_xdg {
+                Some(dir) => dir.to_path_buf(),
+                None => abs_home?.join(".config"),
+            };
+            Some(base.join("devin").join("config.json"))
+        }
+        "antigravity" => {
+            let base = match abs_agy {
+                Some(dir) => dir.to_path_buf(),
+                None => abs_home?.join(".gemini").join("config"),
+            };
+            Some(base.join("hooks.json"))
+        }
         "muse" => {
-            let xdg = std::env::var_os("XDG_CONFIG_HOME")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".config"));
-            Some(xdg.join("muse").join("settings.json"))
+            let base = match abs_xdg {
+                Some(dir) => dir.to_path_buf(),
+                None => abs_home?.join(".config"),
+            };
+            Some(base.join("muse").join("settings.json"))
         }
         _ => None,
     }
+}
+
+fn host_hooks_config_path(host: &str) -> Option<PathBuf> {
+    let xdg = abs_env_dir("XDG_CONFIG_HOME");
+    let agy = abs_env_dir("AGY_CONFIG_DIR");
+    let home = abs_home_dir();
+    host_hooks_config_path_in(host, home.as_deref(), xdg.as_deref(), agy.as_deref())
 }
 
 fn json_has_rtk_hook(value: &Value) -> bool {
@@ -117,10 +188,10 @@ fn command_invokes_rtk_hook(cmd: &str) -> bool {
     })
 }
 
-fn is_shell_tool(tool_name: &str) -> bool {
+pub(crate) fn is_shell_tool(tool_name: &str) -> bool {
     matches!(
         tool_name.to_ascii_lowercase().as_str(),
-        "execute" | "bash" | "shell" | "run_command" | "run_shell_command" | "terminal"
+        "execute" | "bash" | "shell" | "exec" | "run_command" | "run_shell_command" | "terminal"
     )
 }
 
@@ -1430,65 +1501,155 @@ pub fn rewrite_command_str(
     }
 }
 
-/// Evaluate a `PreToolUse` event for shell command auto-rewrite.
+/// Interception capability tier for shell commands (ADR-0014).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellPolicyTier {
+    /// Tier 1: transparently rewrite covered shell commands.
+    Rewrite,
+    /// Tier 2: deny once naming the exact `prometheus-kit` command, allow immediate retry.
+    DenyOnce,
+}
+
+/// Shared outcome of evaluating a shell tool call across Tier 1 and Tier 2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellAction {
+    Pass,
+    Rewrite {
+        command_key: String,
+        rewritten: String,
+        raw_bytes: usize,
+    },
+    DenyOnce {
+        reason: String,
+        suggested: String,
+        raw_bytes: usize,
+    },
+}
+
+pub(crate) fn extract_shell_command(
+    tool_input: &Map<String, Value>,
+) -> Option<(&'static str, &str)> {
+    for key in ["command", "CommandLine"] {
+        if let Some(cmd) = tool_input
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some((key, cmd));
+        }
+    }
+    None
+}
+
+/// Shared Tier-1 / Tier-2 shell evaluation helper honoring `rtk` deferral (ADR-0013 D7).
+pub fn evaluate_shell_policy(
+    host: &str,
+    tier: ShellPolicyTier,
+    tool_name: &str,
+    tool_input: &Map<String, Value>,
+    session_id: &str,
+    event_cwd: Option<&Path>,
+) -> ShellAction {
+    if rewrite_disabled() || !is_shell_tool(tool_name) {
+        return ShellAction::Pass;
+    }
+    let Some((command_key, command)) = extract_shell_command(tool_input) else {
+        return ShellAction::Pass;
+    };
+    let rtk_active = rtk_hook_active(host);
+    let Some(kit_bin) = kit_bin_quoted() else {
+        return ShellAction::Pass;
+    };
+    let Some(rewritten) = rewrite_command_str(command, &kit_bin, rtk_active, event_cwd) else {
+        return ShellAction::Pass;
+    };
+    match tier {
+        ShellPolicyTier::Rewrite => {
+            if let Some(metrics_host) = crate::metrics::Host::from_hook(host) {
+                crate::metrics::record(
+                    metrics_host,
+                    crate::metrics::Rule::ShellRewrite,
+                    command.len(),
+                    rewritten.len(),
+                );
+            }
+            ShellAction::Rewrite {
+                command_key: command_key.to_owned(),
+                rewritten,
+                raw_bytes: command.len(),
+            }
+        }
+        ShellPolicyTier::DenyOnce => {
+            match crate::hook::shell_deny_once_decision(host, session_id, event_cwd, command, &rewritten) {
+                Some(reason) => ShellAction::DenyOnce {
+                    reason,
+                    suggested: rewritten,
+                    raw_bytes: command.len(),
+                },
+                None => ShellAction::Pass,
+            }
+        }
+    }
+}
+
+/// Evaluate a `PreToolUse` event for shell command auto-rewrite (Claude/Droid/Muse envelope).
 /// Returns `None` when the command should pass through unchanged.
 pub fn rewrite_command_reply(host: &str, event: &Value) -> Option<Value> {
-    if !matches!(host, "claude" | "droid" | "muse") || rewrite_disabled() {
+    if !matches!(host, "claude" | "droid" | "muse") {
         return None;
     }
     let tool = event
         .get("tool_name")
         .or_else(|| event.get("toolName"))
         .and_then(Value::as_str)?;
-    if !is_shell_tool(tool) {
-        return None;
-    }
     let tool_input = event.get("tool_input").and_then(Value::as_object)?;
-    let command = tool_input
-        .get("command")
+    let session_id = event
+        .get("session_id")
         .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())?;
-
+        .unwrap_or("");
     let event_cwd = event
         .get("cwd")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(Path::new);
-    let rtk_active = rtk_hook_active(host);
-    let kit_bin = kit_bin_quoted()?;
-    let rewritten = rewrite_command_str(command, &kit_bin, rtk_active, event_cwd)?;
-    if let Some(host) = crate::metrics::Host::from_hook(host) {
-        crate::metrics::record(
-            host,
-            crate::metrics::Rule::ShellRewrite,
-            command.len(),
-            rewritten.len(),
-        );
-    }
-
-    let mut updated: Map<String, Value> = tool_input.clone();
-    updated.insert("command".to_owned(), Value::String(rewritten));
-
-    Some(json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecisionReason": "prometheus-kit auto-rewrite",
-            "updatedInput": Value::Object(updated),
+    match evaluate_shell_policy(
+        host,
+        ShellPolicyTier::Rewrite,
+        tool,
+        tool_input,
+        session_id,
+        event_cwd,
+    ) {
+        ShellAction::Rewrite {
+            command_key,
+            rewritten,
+            ..
+        } => {
+            let mut updated: Map<String, Value> = tool_input.clone();
+            updated.insert(command_key, Value::String(rewritten));
+            Some(json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecisionReason": "prometheus-kit auto-rewrite",
+                    "updatedInput": Value::Object(updated),
+                }
+            }))
         }
-    }))
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     fn env_guard() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+        crate::hook::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     struct EnvOverride {
@@ -1953,6 +2114,7 @@ mod tests {
         {
             let _env = EnvOverride::set(&[
                 ("HOME", Some(tmp.to_str().unwrap())),
+                ("USERPROFILE", Some(tmp.to_str().unwrap())),
                 ("PROMETHEUS_KIT_RTK_COEXIST", None),
                 ("PROMETHEUS_KIT_NO_REWRITE", None),
             ]);
@@ -1992,6 +2154,7 @@ mod tests {
         {
             let _env = EnvOverride::set(&[
                 ("HOME", Some(tmp.to_str().unwrap())),
+                ("USERPROFILE", Some(tmp.to_str().unwrap())),
                 ("PROMETHEUS_KIT_RTK_COEXIST", None),
                 ("PROMETHEUS_KIT_NO_REWRITE", Some("1")),
             ]);
@@ -2417,5 +2580,192 @@ mod tests {
             assert_eq!(None, rewrite_command_str(cmd, KIT, false, None), "cmd={cmd}");
             assert_eq!(None, rewrite_command_str(cmd, KIT, true, None), "rtk cmd={cmd}");
         }
+    }
+
+    #[test]
+    fn shared_shell_policy_supports_tier1_rewrite_tier2_deny_once_and_rtk_deferral() {
+        let _g = env_guard();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!("prom_tier2_{}_{nanos}", std::process::id()));
+        let rt = tmp.join("xdg");
+        let repo = tmp.join("repo");
+        fs::create_dir_all(&rt).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _env = EnvOverride::set(&[
+            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
+            ("PROMETHEUS_KIT_NO_REWRITE", None),
+            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
+        ]);
+        let mut inp = Map::new();
+        inp.insert("command".into(), json!("git status"));
+        let sid = format!("s-tier2-{nanos}");
+
+        // Tier 1 rewrites directly.
+        match evaluate_shell_policy("claude", ShellPolicyTier::Rewrite, "Bash", &inp, &sid, Some(&repo)) {
+            ShellAction::Rewrite { command_key, rewritten, .. } => {
+                assert_eq!(command_key, "command");
+                assert!(rewritten.contains("diff --status"), "{rewritten}");
+            }
+            other => panic!("expected Rewrite, got {other:?}"),
+        }
+
+        // Tier 2 denies once naming the exact kit command, allows immediate retry,
+        // and denies again on a later repeat.
+        match evaluate_shell_policy("grok", ShellPolicyTier::DenyOnce, "bash", &inp, &sid, Some(&repo)) {
+            ShellAction::DenyOnce { reason, suggested, .. } => {
+                assert!(suggested.contains("diff --status"), "{suggested}");
+                assert!(reason.contains(&suggested), "{reason}");
+            }
+            other => panic!("expected DenyOnce, got {other:?}"),
+        }
+        assert_eq!(
+            ShellAction::Pass,
+            evaluate_shell_policy("grok", ShellPolicyTier::DenyOnce, "bash", &inp, &sid, Some(&repo))
+        );
+        assert!(matches!(
+            evaluate_shell_policy("grok", ShellPolicyTier::DenyOnce, "bash", &inp, &sid, Some(&repo)),
+            ShellAction::DenyOnce { .. }
+        ));
+
+        // With RTK active, RTK-owned commands defer in BOTH Tier 1 and Tier 2,
+        // while RTK-gap commands (`dotnet test`) still apply in both tiers.
+        let _rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("1"))]);
+        assert_eq!(
+            ShellAction::Pass,
+            evaluate_shell_policy("claude", ShellPolicyTier::Rewrite, "Bash", &inp, &sid, Some(&repo))
+        );
+        assert_eq!(
+            ShellAction::Pass,
+            evaluate_shell_policy("grok", ShellPolicyTier::DenyOnce, "bash", &inp, &sid, Some(&repo))
+        );
+
+        let mut dt_inp = Map::new();
+        dt_inp.insert("command".into(), json!("dotnet test"));
+        assert!(matches!(
+            evaluate_shell_policy("grok", ShellPolicyTier::DenyOnce, "bash", &dt_inp, &sid, Some(&repo)),
+            ShellAction::DenyOnce { .. }
+        ));
+
+        // Antigravity CommandLine key is also supported by the shared helper.
+        let mut agy_inp = Map::new();
+        agy_inp.insert("CommandLine".into(), json!("dotnet test"));
+        match evaluate_shell_policy("antigravity", ShellPolicyTier::Rewrite, "run_command", &agy_inp, &sid, Some(&repo)) {
+            ShellAction::Rewrite { command_key, rewritten, .. } => {
+                assert_eq!(command_key, "CommandLine");
+                assert!(rewritten.contains("compact --mode test"), "{rewritten}");
+            }
+            other => panic!("expected CommandLine Rewrite, got {other:?}"),
+        }
+
+        // Tier-2 fails open on unwritable session directory.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if unsafe { libc::getuid() } != 0 {
+                let _no_rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("0"))]);
+                let ro_sid = format!("s-ro-{nanos}");
+                let parent = rt.join("prometheus");
+                let ro_dir = parent.join(&ro_sid);
+                fs::create_dir_all(&ro_dir).unwrap();
+                fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o500)).unwrap();
+                assert_eq!(
+                    ShellAction::Pass,
+                    evaluate_shell_policy("grok", ShellPolicyTier::DenyOnce, "bash", &inp, &ro_sid, Some(&repo))
+                );
+                fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rtk_hook_active_detects_all_host_configs_and_rejects_relative_env_dirs() {
+        let _g = env_guard();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let tmp = std::env::temp_dir().join(format!("prom_rtk_cfg_{}_{nanos}", std::process::id()));
+        let home = tmp.join("home");
+        let xdg = tmp.join("xdg_cfg");
+        let agy = tmp.join("agy_cfg");
+        fs::create_dir_all(home.join(".grok/hooks")).unwrap();
+        fs::create_dir_all(home.join(".cursor")).unwrap();
+        fs::create_dir_all(xdg.join("devin")).unwrap();
+        fs::create_dir_all(&agy).unwrap();
+
+        let rtk_json = json!({"PreToolUse": [{"hooks": [{"type": "command", "command": "rtk hook"}]}]}).to_string();
+        fs::write(home.join(".grok/hooks/rtk.json"), &rtk_json).unwrap();
+        fs::write(home.join(".cursor/hooks.json"), &rtk_json).unwrap();
+        fs::write(xdg.join("devin/config.json"), &rtk_json).unwrap();
+        fs::write(agy.join("hooks.json"), &rtk_json).unwrap();
+
+        // Pure path resolution & grok dir scan work without mutating process-wide HOME.
+        assert!(grok_dir_has_rtk_hook_in(Some(&home)));
+        assert!(!grok_dir_has_rtk_hook_in(None));
+        assert!(!grok_dir_has_rtk_hook_in(Some(Path::new("relative/home"))));
+
+        assert_eq!(
+            Some(home.join(".cursor/hooks.json")),
+            host_hooks_config_path_in("cursor", Some(&home), Some(&xdg), Some(&agy))
+        );
+        assert!(json_file_has_rtk_hook(
+            &host_hooks_config_path_in("cursor", Some(&home), None, None).unwrap()
+        ));
+        // Env overrides (XDG_CONFIG_HOME / AGY_CONFIG_DIR) resolve even when home is None.
+        assert_eq!(
+            Some(xdg.join("devin/config.json")),
+            host_hooks_config_path_in("devin", None, Some(&xdg), None)
+        );
+        assert_eq!(
+            Some(agy.join("hooks.json")),
+            host_hooks_config_path_in("antigravity", None, None, Some(&agy))
+        );
+        // Relative dirs are rejected (defense-in-depth).
+        assert_eq!(
+            None,
+            host_hooks_config_path_in(
+                "cursor",
+                Some(Path::new("relative/home")),
+                Some(Path::new("relative/xdg")),
+                Some(Path::new("relative/agy")),
+            )
+        );
+        assert_eq!(
+            None,
+            host_hooks_config_path_in("devin", None, Some(Path::new("relative/xdg")), None)
+        );
+        assert_eq!(
+            None,
+            host_hooks_config_path_in("antigravity", None, None, Some(Path::new("relative/agy")))
+        );
+
+        // Live env resolution for XDG_CONFIG_HOME and AGY_CONFIG_DIR (no HOME mutation).
+        {
+            let _env = EnvOverride::set(&[
+                ("PROMETHEUS_KIT_RTK_COEXIST", None),
+                ("XDG_CONFIG_HOME", Some(xdg.to_str().unwrap())),
+                ("AGY_CONFIG_DIR", Some(agy.to_str().unwrap())),
+            ]);
+            assert!(rtk_hook_active("devin"));
+            assert!(rtk_hook_active("antigravity"));
+        }
+        {
+            let _env = EnvOverride::set(&[
+                ("PROMETHEUS_KIT_RTK_COEXIST", None),
+                ("XDG_CONFIG_HOME", Some("relative/xdg")),
+                ("AGY_CONFIG_DIR", Some("relative/agy")),
+            ]);
+            assert_eq!(None, abs_env_dir("XDG_CONFIG_HOME"));
+            assert_eq!(None, abs_env_dir("AGY_CONFIG_DIR"));
+        }
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
