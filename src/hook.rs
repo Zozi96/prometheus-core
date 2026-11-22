@@ -35,7 +35,7 @@ pub fn host_delivers_pretool_context(host: &str) -> bool {
 fn read_hint_disabled() -> bool {
     std::env::var_os("PROMETHEUS_KIT_NO_READ_HINT").as_deref() == Some(OsStr::new("1"))
 }
-const PARTIAL_KEYS: [&str; 10] = [
+const PARTIAL_KEYS: [&str; 11] = [
     "offset",
     "start",
     "end",
@@ -46,6 +46,7 @@ const PARTIAL_KEYS: [&str; 10] = [
     "endline",
     "view_range",
     "limit",
+    "sel",
 ];
 
 const SECRET_SUFFIXES: [&str; 4] = [".example", ".sample", ".template", ".dist"];
@@ -67,6 +68,16 @@ const SECRET_BASENAMES: [&str; 14] = [
     "secrets.yaml",
 ];
 const SECRET_DIRS: [&str; 3] = [".ssh", ".aws", ".gnupg"];
+const GENERIC_SECRET_BASENAMES: [&str; 8] = [
+    "config",
+    "credentials",
+    "known_hosts",
+    "authorized_keys",
+    "auth",
+    "key",
+    "secret",
+    "token",
+];
 
 const OTHER_HOSTS: [&str; 3] = ["CURSOR_PROJECT_DIR", "DEVIN_PROJECT_DIR", "GROK_SESSION_ID"];
 
@@ -167,10 +178,7 @@ pub fn secret_path_denied(path: &str) -> String {
     )
 }
 
-fn secret_denied(raw: Option<&Value>) -> String {
-    let Some(raw) = raw.and_then(Value::as_str) else {
-        return String::new();
-    };
+fn normalize_secret_candidate(raw: &str) -> String {
     let mut path = raw.trim().to_string();
     let chars: Vec<char> = path.chars().collect();
     if chars.len() >= 2 && chars[0] == chars[chars.len() - 1] && matches!(chars[0], '"' | '\'') {
@@ -184,7 +192,272 @@ fn secret_denied(raw: Option<&Value>) -> String {
     while path.contains("//") {
         path = path.replace("//", "/");
     }
-    secret_path_denied(&path)
+    path
+}
+
+fn secret_denied(raw: Option<&Value>) -> String {
+    secret_denied_with_prompt(raw, "")
+}
+
+fn is_prompt_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '_' | '.' | '/' | '\\' | '~' | '+' | '@' | '%' | ':' | '=' | '-'
+        )
+}
+
+fn norm_secret(raw: &str) -> String {
+    raw.replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn prompt_bounded(prompt: &str, needle: &str) -> bool {
+    if needle.len() < 3 {
+        return false;
+    }
+    let mut offset = 0usize;
+    while let Some(rel) = prompt[offset..].find(needle) {
+        let start = offset + rel;
+        let end = start + needle.len();
+        let before_ok = prompt[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_prompt_token_char(c));
+        let after_ok = prompt[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_prompt_token_char(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        let step = prompt[start..].chars().next().map_or(1, char::len_utf8);
+        offset = start + step;
+    }
+    false
+}
+
+/// Turn-scoped prompt unlock for secret paths on hosts that expose the latest
+/// user prompt (`omp`, `antigravity`). Generic basenames (`config`, `token`, …)
+/// and paths inside `.ssh`/`.aws`/`.gnupg` require an explicit multi-segment
+/// path token (and any secret directory segment present in `candidate`).
+pub(crate) fn prompt_allows_secret(candidate: &str, prompt: &str) -> bool {
+    if prompt.is_empty() {
+        return false;
+    }
+    let lowered = casefold(prompt);
+    let norm = norm_secret(&casefold(candidate));
+    if norm.is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = norm.split('/').collect();
+    let basename = *parts.last().unwrap_or(&"");
+    let has_secret_dir = parts.iter().any(|part| SECRET_DIRS.contains(part));
+    let strict = GENERIC_SECRET_BASENAMES.contains(&basename) || has_secret_dir;
+    if !strict && (prompt_bounded(&lowered, basename) || prompt_bounded(&lowered, &norm)) {
+        return true;
+    }
+    let mut start = None::<usize>;
+    for (idx, ch) in lowered.char_indices() {
+        if is_prompt_token_char(ch) {
+            if start.is_none() {
+                start = Some(idx);
+            }
+        } else if let Some(s) = start.take() {
+            if token_matches_secret(&lowered[s..idx], &norm, strict, has_secret_dir) {
+                return true;
+            }
+        }
+    }
+    if let Some(s) = start {
+        if token_matches_secret(&lowered[s..], &norm, strict, has_secret_dir) {
+            return true;
+        }
+    }
+    false
+}
+
+fn secret_segment_unlocks(seg: &str, norm: &str, strict: bool, has_secret_dir: bool) -> bool {
+    if seg.is_empty() {
+        return false;
+    }
+    if strict && !seg.contains('/') {
+        return false;
+    }
+    if has_secret_dir && !seg.split('/').any(|part| SECRET_DIRS.contains(&part)) {
+        return false;
+    }
+    seg == norm || norm.ends_with(&format!("/{seg}"))
+}
+
+fn token_matches_secret(token: &str, norm: &str, strict: bool, has_secret_dir: bool) -> bool {
+    if !token.contains('/') && !token.contains('\\') {
+        return false;
+    }
+    let found = norm_secret(token);
+    if secret_segment_unlocks(&found, norm, strict, has_secret_dir) {
+        return true;
+    }
+    if let Some(rest) = found.strip_prefix("~/") {
+        if secret_segment_unlocks(rest, norm, strict, has_secret_dir) {
+            return true;
+        }
+    }
+    false
+}
+
+fn expand_tilde_path(raw: &str) -> Option<PathBuf> {
+    if raw == "~" {
+        return crate::droid_mode::default_home().ok();
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return crate::droid_mode::default_home().ok().map(|h| h.join(rest));
+    }
+    None
+}
+
+fn resolve_candidate_against_root(path: &str, root: Option<&Path>) -> Option<PathBuf> {
+    let joined = if let Some(home_path) = expand_tilde_path(path) {
+        home_path
+    } else {
+        let p = Path::new(path);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root?.join(p)
+        }
+    };
+    Some(resolve_loose(&joined))
+}
+
+fn secret_denied_with_prompt(raw: Option<&Value>, prompt: &str) -> String {
+    secret_denied_with_prompt_and_root(raw, prompt, None, false)
+}
+
+fn secret_denied_with_prompt_and_root(
+    raw: Option<&Value>,
+    prompt: &str,
+    root: Option<&Path>,
+    resolve_fs: bool,
+) -> String {
+    let Some(raw) = raw.and_then(Value::as_str) else {
+        return String::new();
+    };
+    let path = normalize_secret_candidate(raw);
+    let reason = secret_path_denied(&path);
+    if !reason.is_empty() && !prompt_allows_secret(&path, prompt) {
+        return reason;
+    }
+    if resolve_fs && !path.is_empty() {
+        if let Some(resolved) = resolve_candidate_against_root(&path, root) {
+            let resolved_str = resolved.to_string_lossy();
+            let resolved_reason = secret_path_denied(&resolved_str);
+            if !resolved_reason.is_empty() && !prompt_allows_secret(&resolved_str, prompt) {
+                return resolved_reason;
+            }
+        }
+    }
+    String::new()
+}
+
+fn check_keys_for_secret_with_prompt(
+    source: &Map<String, Value>,
+    keys: &[&str],
+    prompt: &str,
+) -> String {
+    check_keys_for_secret_with_prompt_and_root(source, keys, prompt, None, &[])
+}
+
+fn check_keys_for_secret_with_prompt_and_root(
+    source: &Map<String, Value>,
+    keys: &[&str],
+    prompt: &str,
+    root: Option<&Path>,
+    resolve_keys: &[&str],
+) -> String {
+    for key in keys {
+        let resolve_fs = resolve_keys.contains(key);
+        match source.get(*key) {
+            Some(Value::Array(items)) => {
+                for item in items {
+                    let reason =
+                        secret_denied_with_prompt_and_root(Some(item), prompt, root, resolve_fs);
+                    if !reason.is_empty() {
+                        return reason;
+                    }
+                }
+            }
+            Some(item) => {
+                let reason =
+                    secret_denied_with_prompt_and_root(Some(item), prompt, root, resolve_fs);
+                if !reason.is_empty() {
+                    return reason;
+                }
+            }
+            None => {}
+        }
+    }
+    String::new()
+}
+
+fn omp_secret_denial(event: &Value, prompt: &str, root: Option<&Path>) -> String {
+    const KEYS: [&str; 9] = [
+        "path",
+        "file_path",
+        "filePath",
+        "AbsolutePath",
+        "paths",
+        "pattern",
+        "glob",
+        "target",
+        "notebook_path",
+    ];
+    const PATH_KEYS: [&str; 7] = [
+        "path",
+        "file_path",
+        "filePath",
+        "AbsolutePath",
+        "paths",
+        "target",
+        "notebook_path",
+    ];
+    let mut saw_path_arg = false;
+    for key in ["input", "tool_input"] {
+        if let Some(inp) = get(event, key).and_then(Value::as_object) {
+            if PATH_KEYS.iter().any(|k| {
+                inp.get(*k).is_some_and(|v| match v {
+                    Value::String(s) => !s.trim().is_empty(),
+                    Value::Array(arr) => !arr.is_empty(),
+                    _ => false,
+                })
+            }) {
+                saw_path_arg = true;
+            }
+            let reason =
+                check_keys_for_secret_with_prompt_and_root(inp, &KEYS, prompt, root, &PATH_KEYS);
+            if !reason.is_empty() {
+                return reason;
+            }
+        }
+    }
+    // File-read/search tools omitting a path argument target `cwd` implicitly (e.g. `ls({})`, `grep({pattern})`).
+    if !saw_path_arg {
+        let tool = tool_name(event);
+        let is_file_read = file_reads("omp").is_some_and(|allowed| allowed.contains(&tool));
+        if is_file_read {
+            if let Some(base) = root {
+                let base_str = base.to_string_lossy();
+                let reason = secret_path_denied(&base_str);
+                if !reason.is_empty() && !prompt_allows_secret(&base_str, prompt) {
+                    return reason;
+                }
+            }
+        }
+    }
+    String::new()
 }
 
 /// Literal secret-path check for shell rewrite passthrough (`hook_rewrite.rs`):
@@ -238,26 +511,7 @@ fn split_command(text: &str) -> Vec<String> {
 }
 
 fn check_keys_for_secret(source: &Map<String, Value>, keys: &[&str]) -> String {
-    for key in keys {
-        match source.get(*key) {
-            Some(Value::Array(items)) => {
-                for item in items {
-                    let reason = secret_denied(Some(item));
-                    if !reason.is_empty() {
-                        return reason;
-                    }
-                }
-            }
-            Some(item) => {
-                let reason = secret_denied(Some(item));
-                if !reason.is_empty() {
-                    return reason;
-                }
-            }
-            None => {}
-        }
-    }
-    String::new()
+    check_keys_for_secret_with_prompt(source, keys, "")
 }
 
 fn secret_tool_denial(event: &Value) -> String {
@@ -368,6 +622,19 @@ fn file_reads(host: &str) -> Option<&'static [&'static str]> {
             "LS",
             "Search",
             "Find",
+        ]),
+        "omp" => Some(&[
+            "read",
+            "grep",
+            "find",
+            "glob",
+            "ls",
+            "ast_grep",
+            "Read",
+            "Grep",
+            "Find",
+            "Glob",
+            "LS",
         ]),
         _ => None,
     }
@@ -751,8 +1018,11 @@ fn read_path(event: &Value, host: &str) -> Option<(String, Vec<(String, Value)>)
         .iter()
         .filter_map(|(key, value)| {
             let lower = casefold(key);
-            // A null partial parameter is an omitted one: whole-file read.
-            if value.is_null() || !PARTIAL_KEYS.contains(&lower.as_str()) {
+            // A null or blank-string partial parameter is an omitted one: whole-file read.
+            if value.is_null()
+                || matches!(value, Value::String(s) if s.trim().is_empty())
+                || !PARTIAL_KEYS.contains(&lower.as_str())
+            {
                 return None;
             }
             Some((lower, value.clone()))
@@ -1188,6 +1458,7 @@ fn read_guard_reply(host: &str, guard: ReadGuard) -> Value {
                 }
             }),
             "devin" => json!({"decision": "block", "reason": text}),
+            "omp" => json!({"block": true, "reason": text}),
             "cursor" => json!({
                 "permission": "deny",
                 "user_message": text,
@@ -1484,8 +1755,113 @@ fn handle_cursor(raw: &[u8]) -> Value {
     )
 }
 
+fn omp_block_reply(reason: &str) -> Value {
+    json!({"block": true, "reason": reason})
+}
+
+fn resolve_optional_root(cwd: &str) -> Option<PathBuf> {
+    if !cwd.is_empty() {
+        return std::fs::canonicalize(cwd).ok().filter(|p| p.is_dir());
+    }
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .filter(|p| p.is_dir())
+}
+
+fn handle_omp(raw: &[u8]) -> Value {
+    let parsed: Option<Value> = serde_json::from_slice(raw).ok();
+    let Some(event) = parsed.as_ref().filter(|v| v.is_object()) else {
+        let problem = if parsed.is_some() {
+            "event-malformed"
+        } else {
+            "invalid-json"
+        };
+        return omp_block_reply(&format!(
+            "Hook warning: {problem} — consent could not be evaluated"
+        ));
+    };
+    let root = resolve_optional_root(as_str(get(event, "cwd")));
+    let prompt = as_str(py_or(
+        get(event, "lastPrompt"),
+        py_or(get(event, "last_prompt"), get(event, "prompt")),
+    ));
+    let denial = omp_secret_denial(event, prompt, root.as_deref());
+    if !denial.is_empty() {
+        return omp_block_reply(&denial);
+    }
+    let session_id = as_str(py_or(get(event, "sessionId"), get(event, "session_id")));
+    if !session_id.is_empty() && !valid_session_id_str(session_id) {
+        if read_failure_allows("omp", event) && omp_secret_denial(event, "", root.as_deref()).is_empty() {
+            return json!({});
+        }
+        return omp_block_reply(
+            "Hook warning: session-id-invalid — consent could not be evaluated",
+        );
+    }
+    let inp = get(event, "input")
+        .and_then(Value::as_object)
+        .or_else(|| get(event, "tool_input").and_then(Value::as_object));
+    let explicit_shell_cwd = inp
+        .and_then(|m| m.get("cwd"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let (shell_root, shell_cwd_is_secret, skip_inline_dump) = match explicit_shell_cwd {
+        Some(sub) => {
+            let sub_norm = normalize_secret_candidate(sub);
+            let raw_secret = !command_token_denied(&sub_norm).is_empty();
+            let resolved_loose = resolve_candidate_against_root(&sub_norm, root.as_deref());
+            let resolved_secret = resolved_loose
+                .as_ref()
+                .is_some_and(|p| !secret_path_denied(&p.to_string_lossy()).is_empty());
+            let canonical = resolved_loose
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .filter(|d| d.is_dir());
+            let uncanonicalizable = canonical.is_none();
+            (canonical, raw_secret || resolved_secret, uncanonicalizable)
+        }
+        None => {
+            let root_secret = root
+                .as_ref()
+                .is_some_and(|p| !secret_path_denied(&p.to_string_lossy()).is_empty());
+            (root.clone(), root_secret, false)
+        }
+    };
+    if !shell_cwd_is_secret {
+        if let Some(inp) = inp {
+            if let crate::hook_rewrite::ShellAction::Rewrite {
+                command_key,
+                rewritten,
+                ..
+            } = crate::hook_rewrite::evaluate_shell_policy(
+                "omp",
+                crate::hook_rewrite::ShellPolicyTier::Rewrite,
+                tool_name(event),
+                inp,
+                session_id,
+                shell_root.as_deref(),
+            ) {
+                let mut updated = inp.clone();
+                updated.insert(command_key, Value::String(rewritten));
+                return json!({ "input": Value::Object(updated) });
+            }
+        }
+        if !skip_inline_dump {
+            let dump = inline_dump_guard("omp", event, session_id, shell_root.as_deref());
+            if dump != ReadGuard::Pass {
+                return read_guard_reply("omp", dump);
+            }
+        }
+    }
+    read_guard_reply(
+        "omp",
+        read_guard("omp", event, session_id, root.as_deref()),
+    )
+}
+
 pub fn is_supported_host(host: &str) -> bool {
-    matches!(host, "claude" | "cursor" | "devin" | "droid" | "muse")
+    matches!(host, "claude" | "cursor" | "devin" | "droid" | "muse" | "omp")
 }
 
 /// Evaluate one hook event from raw stdin JSON for `host`.
@@ -1495,16 +1871,17 @@ pub fn run_hook(host: &str, raw_stdin: &[u8]) -> Value {
         "droid" => handle_droid(raw_stdin),
         "devin" => handle_devin(raw_stdin),
         "cursor" => handle_cursor(raw_stdin),
+        "omp" => handle_omp(raw_stdin),
         _ => json!({}),
     }
 }
 
 /// Fail-closed fallback reply if hook evaluation panics.
 pub fn panic_fallback(host: &str) -> Value {
-    if host == "cursor" {
-        cursor_deny_reply("the secret guard failed")
-    } else {
-        ask_reply("consent could not be evaluated")
+    match host {
+        "cursor" => cursor_deny_reply("the secret guard failed"),
+        "omp" => omp_block_reply("consent could not be evaluated"),
+        _ => ask_reply("consent could not be evaluated"),
     }
 }
 
@@ -2952,5 +3329,286 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("compact --mode test -- dotnet test"));
+    }
+
+    #[test]
+    fn prompt_allows_secret_enforces_boundaries_and_strict_dirs() {
+        assert!(!prompt_allows_secret(".env", ""));
+        assert!(prompt_allows_secret(".env", "please read .env today"));
+        assert!(prompt_allows_secret(".env", "compare .env.example and .env now"));
+        assert!(!prompt_allows_secret(".env", "check .env.example only"));
+        assert!(!prompt_allows_secret("config/secrets.yml", "please read .env today"));
+        assert!(prompt_allows_secret("config/secrets.yml", "inspect secrets.yml"));
+        // Generic basenames and secret dirs require explicit multi-segment path tokens
+        // naming the secret directory; slash-adjacent single segments never unlock.
+        for prompt in [
+            "update config please",
+            "debug the /config endpoint",
+            "check config/ folder",
+            "check ./config now",
+            "read ~/config",
+        ] {
+            assert!(!prompt_allows_secret(".ssh/config", prompt), "prompt={prompt}");
+            assert!(!prompt_allows_secret("/home/alice/.ssh/config", prompt), "prompt={prompt}");
+            assert!(!prompt_allows_secret(".aws/config", prompt), "prompt={prompt}");
+        }
+        assert!(!prompt_allows_secret(".aws/credentials", "POST /credentials"));
+        assert!(!prompt_allows_secret(".aws/credentials", "check ./credentials"));
+        assert!(!prompt_allows_secret(".ssh/id_rsa", "check ./id_rsa"));
+        assert!(!prompt_allows_secret(".aws/sso/config", "check sso/config"));
+        assert!(prompt_allows_secret(".aws/sso/config", "check .aws/sso/config"));
+        assert!(prompt_allows_secret("/home/alice/.aws/sso/config", "check ~/.aws/sso/config"));
+        assert!(prompt_allows_secret(".ssh/config", "inspect .ssh/config"));
+        assert!(prompt_allows_secret("/home/alice/.ssh/id_rsa", "read ~/.ssh/id_rsa"));
+        assert!(prompt_allows_secret("/home/alice/.env", "read ~/.env"));
+    }
+
+    #[test]
+    fn omp_handles_rewrites_guards_unlock_fallback_and_rtk_deferral() {
+        let _g = env_guard();
+        let tmp = TempDir::new("omp_hook");
+        let rt = TempDir::new("omp_rt");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&rt.0, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _env = EnvOverride::set(&[
+            ("XDG_RUNTIME_DIR", Some(rt.0.to_str().unwrap())),
+            ("PROMETHEUS_KIT_NO_REWRITE", None),
+            ("PROMETHEUS_KIT_NO_READ_HINT", None),
+            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
+        ]);
+        let big_rs = tmp.0.join("big.rs");
+        fs::write(
+            &big_rs,
+            (0..220)
+                .map(|i| format!("pub fn f{i}() {{}}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let big_json = tmp.0.join("big.json");
+        fs::write(
+            &big_json,
+            format!(
+                "{{\n{}\n}}\n",
+                (0..220)
+                    .map(|i| format!("  \"k{i}\": {i}"))
+                    .collect::<Vec<_>>()
+                    .join(",\n")
+            ),
+        )
+        .unwrap();
+        let ssh_dir = tmp.0.join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        fs::write(ssh_dir.join("config"), "Host example\n").unwrap();
+        let secret_env = tmp.0.join(".env");
+        fs::write(&secret_env, "SECRET=1\n").unwrap();
+
+        // 1. Tier-1 bash rewrite returns complete raw `{ input }` preserving sibling fields.
+        let rw_ev = json!({
+            "toolName": "bash",
+            "input": {"command": "cargo test", "timeout": 30, "pty": false},
+            "cwd": tmp.0,
+            "sessionId": "omp-sess-1",
+            "lastPrompt": "",
+        });
+        let rw = run_hook("omp", rw_ev.to_string().as_bytes());
+        assert!(rw.get("block").is_none(), "{rw}");
+        let inp = rw["input"].as_object().expect("rewritten input object");
+        assert!(inp["command"].as_str().unwrap().contains("compact --mode test -- cargo test"), "{rw}");
+        assert_eq!(30, inp["timeout"].as_i64().unwrap());
+        assert!(!inp["pty"].as_bool().unwrap());
+
+        // 2. Shell commands with secret operands or secret input.cwd pass through unrewritten.
+        let cat_env = json!({
+            "toolName": "bash",
+            "input": {"command": "cat .env"},
+            "cwd": tmp.0,
+            "sessionId": "omp-sess-1",
+            "lastPrompt": "",
+        });
+        assert_eq!(json!({}), run_hook("omp", cat_env.to_string().as_bytes()));
+        let ssh_cwd_bash = json!({
+            "toolName": "bash",
+            "input": {"command": "cat config", "cwd": ssh_dir},
+            "cwd": tmp.0,
+            "sessionId": "omp-sess-1",
+            "lastPrompt": "",
+        });
+        assert_eq!(json!({}), run_hook("omp", ssh_cwd_bash.to_string().as_bytes()));
+        let bad_sub_cwd_dump = json!({
+            "toolName": "bash",
+            "input": {"command": "jq '.k0' big.json", "cwd": tmp.0.join("does-not-exist")},
+            "cwd": tmp.0,
+            "sessionId": "omp-sess-1",
+            "lastPrompt": "",
+        });
+        assert_eq!(json!({}), run_hook("omp", bad_sub_cwd_dump.to_string().as_bytes()));
+
+        // 3. Secret path blocks without prompt, catches cwd-relative/symlink secrets, and unlocks when named.
+        let sec = json!({
+            "toolName": "read",
+            "input": {"path": ".env"},
+            "cwd": tmp.0,
+            "sessionId": "omp-sess-1",
+            "lastPrompt": "",
+        });
+        let sec_reply = run_hook("omp", sec.to_string().as_bytes());
+        assert!(sec_reply["block"].as_bool().unwrap());
+        assert!(sec_reply["reason"].as_str().unwrap().contains(".env"));
+
+        let sec_unlocked = json!({
+            "toolName": "read",
+            "input": {"path": ".env"},
+            "cwd": tmp.0,
+            "sessionId": "omp-sess-1",
+            "lastPrompt": "please inspect .env now",
+        });
+        assert_eq!(json!({}), run_hook("omp", sec_unlocked.to_string().as_bytes()));
+
+        let ssh_rel_read = json!({
+            "toolName": "read",
+            "input": {"path": "config"},
+            "cwd": ssh_dir,
+            "sessionId": "omp-sess-1",
+            "lastPrompt": "debug /config",
+        });
+        assert!(run_hook("omp", ssh_rel_read.to_string().as_bytes())["block"].as_bool().unwrap());
+        let ssh_ls = json!({
+            "toolName": "ls",
+            "input": {},
+            "cwd": ssh_dir,
+            "sessionId": "omp-sess-1",
+            "lastPrompt": "",
+        });
+        assert!(run_hook("omp", ssh_ls.to_string().as_bytes())["block"].as_bool().unwrap());
+
+        #[cfg(unix)]
+        {
+            let link = tmp.0.join("notes.md");
+            std::os::unix::fs::symlink(&secret_env, &link).unwrap();
+            let sym_ev = json!({
+                "toolName": "read",
+                "input": {"path": "notes.md"},
+                "cwd": tmp.0,
+                "sessionId": "omp-sess-1",
+                "lastPrompt": "please read notes.md",
+            });
+            assert!(run_hook("omp", sym_ev.to_string().as_bytes())["block"].as_bool().unwrap());
+        }
+
+        // 4. Four-state Guided deny-once on 220-line read + ranged read (`offset`/`limit`/`sel`) passes first time;
+        //    empty `sel: ""` counts as whole-file read.
+        let ranged = json!({
+            "toolName": "read",
+            "input": {"path": big_rs, "offset": 1, "limit": 20},
+            "cwd": tmp.0,
+            "sessionId": "omp-sess-1",
+            "lastPrompt": "",
+        });
+        assert_eq!(json!({}), run_hook("omp", ranged.to_string().as_bytes()));
+        let sel_ranged = json!({
+            "toolName": "read",
+            "input": {"path": big_rs, "sel": "L1-L20"},
+            "cwd": tmp.0,
+            "sessionId": "omp-sess-1",
+            "lastPrompt": "",
+        });
+        assert_eq!(json!({}), run_hook("omp", sel_ranged.to_string().as_bytes()));
+        let blank_sel = json!({
+            "toolName": "read",
+            "input": {"path": big_rs, "sel": "   "},
+            "cwd": tmp.0,
+            "sessionId": "omp-sess-sel-blank",
+            "lastPrompt": "",
+        });
+        assert!(run_hook("omp", blank_sel.to_string().as_bytes())["block"].as_bool().unwrap());
+
+        let whole = json!({
+            "toolName": "read",
+            "input": {"path": big_rs},
+            "cwd": tmp.0,
+            "sessionId": "omp-sess-1",
+            "lastPrompt": "",
+        });
+        let r1 = run_hook("omp", whole.to_string().as_bytes());
+        assert!(r1["block"].as_bool().unwrap());
+        assert!(r1["reason"].as_str().unwrap().contains("Large whole-file read"));
+        assert_eq!(json!({}), run_hook("omp", whole.to_string().as_bytes()));
+        let r3 = run_hook("omp", whole.to_string().as_bytes());
+        assert!(r3["block"].as_bool().unwrap());
+        assert!(r3["reason"].as_str().unwrap().contains("Unchanged reread denied once"));
+        assert_eq!(json!({}), run_hook("omp", whole.to_string().as_bytes()));
+
+        // 5. High-waste inline structured-file dump denies once then allows retry.
+        let dump_ev = json!({
+            "toolName": "bash",
+            "input": {"command": "jq '.k0' big.json"},
+            "cwd": tmp.0,
+            "sessionId": "omp-sess-1",
+            "lastPrompt": "",
+        });
+        let d1 = run_hook("omp", dump_ev.to_string().as_bytes());
+        assert!(d1["block"].as_bool().unwrap());
+        assert!(d1["reason"].as_str().unwrap().contains("prometheus-kit slice"));
+        assert_eq!(json!({}), run_hook("omp", dump_ev.to_string().as_bytes()));
+
+        // 6. Malformed JSON and malformed non-empty session fail closed on non-reads, open on safe reads;
+        //    empty sessionId still enforces secrets and rewrites safe shell commands without hard-blocking edits.
+        let bad_json = run_hook("omp", b"{not json");
+        assert!(bad_json["block"].as_bool().unwrap());
+        let bad_sess_edit = json!({
+            "toolName": "edit",
+            "input": {"path": "src/a.rs"},
+            "cwd": tmp.0,
+            "sessionId": "../bad",
+        });
+        assert!(run_hook("omp", bad_sess_edit.to_string().as_bytes())["block"].as_bool().unwrap());
+        let bad_sess_read = json!({
+            "toolName": "read",
+            "input": {"path": "src/a.rs"},
+            "cwd": tmp.0,
+            "sessionId": "../bad",
+        });
+        assert_eq!(json!({}), run_hook("omp", bad_sess_read.to_string().as_bytes()));
+        let empty_sess_edit = json!({
+            "toolName": "edit",
+            "input": {"path": "src/a.rs"},
+            "cwd": tmp.0,
+            "sessionId": "",
+        });
+        assert_eq!(json!({}), run_hook("omp", empty_sess_edit.to_string().as_bytes()));
+        let empty_sess_bash = json!({
+            "toolName": "bash",
+            "input": {"command": "cargo test"},
+            "cwd": tmp.0,
+            "sessionId": "",
+        });
+        assert!(run_hook("omp", empty_sess_bash.to_string().as_bytes())["input"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("compact --mode test -- cargo test"));
+        let empty_sess_sec = json!({
+            "toolName": "read",
+            "input": {"path": ".env"},
+            "cwd": tmp.0,
+            "sessionId": "",
+        });
+        assert!(run_hook("omp", empty_sess_sec.to_string().as_bytes())["block"].as_bool().unwrap());
+        assert!(panic_fallback("omp")["block"].as_bool().unwrap());
+
+        // 7. RTK deferral skips RTK-owned commands while rewriting RTK-gap commands.
+        let _rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("1"))]);
+        assert_eq!(json!({}), run_hook("omp", rw_ev.to_string().as_bytes()));
+        let dt_ev = json!({
+            "toolName": "bash",
+            "input": {"command": "dotnet test", "timeout": 15},
+            "cwd": tmp.0,
+            "sessionId": "omp-sess-1",
+        });
+        let dt = run_hook("omp", dt_ev.to_string().as_bytes());
+        assert!(dt["input"]["command"].as_str().unwrap().contains("compact --mode test -- dotnet test"));
+        assert_eq!(15, dt["input"]["timeout"].as_i64().unwrap());
     }
 }

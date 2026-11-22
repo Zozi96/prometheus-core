@@ -2300,3 +2300,136 @@ fn metrics_records_inline_dump_denial_and_aggregates_new_hosts_and_rules() {
     assert_eq!(parsed["by_host"]["grok"]["count"], 1);
     assert_eq!(parsed["by_host"]["omp"]["count"], 1);
 }
+
+#[test]
+fn hook_omp_rewrites_guards_unlocks_and_records_metrics() {
+    let home = MetricsHome::new("hook_omp");
+    let big_rs = home.repo.join("big.rs");
+    fs::write(
+        &big_rs,
+        (0..220)
+            .map(|i| format!("pub fn fn_{i}() {{}}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let big_json = home.repo.join("big.json");
+    fs::write(
+        &big_json,
+        format!(
+            "{{\n{}\n}}\n",
+            (0..220)
+                .map(|i| format!("  \"k{i}\": {i}"))
+                .collect::<Vec<_>>()
+                .join(",\n")
+        ),
+    )
+    .unwrap();
+
+    // 1. Bash shell rewrite emits `{ input }` with untouched fields preserved.
+    let rw_ev = serde_json::json!({
+        "toolName": "bash",
+        "input": {"command": "git status", "timeout": 45},
+        "cwd": home.repo.to_str().unwrap(),
+        "sessionId": "omp-int-1",
+        "lastPrompt": "",
+    });
+    let rw_out = home.hook("omp", &rw_ev);
+    assert_eq!(rw_out.status.code(), Some(0));
+    let rw_val: Value = serde_json::from_slice(&rw_out.stdout).unwrap();
+    assert!(rw_val["input"]["command"]
+        .as_str()
+        .unwrap()
+        .contains("diff --status"));
+    assert_eq!(rw_val["input"]["timeout"], 45);
+
+    // 2. Four-state Guided deny-once on 220-line whole-file read.
+    let read_ev = serde_json::json!({
+        "toolName": "read",
+        "input": {"path": big_rs.to_str().unwrap()},
+        "cwd": home.repo.to_str().unwrap(),
+        "sessionId": "omp-int-1",
+        "lastPrompt": "",
+    });
+    let r1: Value = serde_json::from_slice(&home.hook("omp", &read_ev).stdout).unwrap();
+    assert_eq!(r1["block"], Value::Bool(true));
+    let r2: Value = serde_json::from_slice(&home.hook("omp", &read_ev).stdout).unwrap();
+    assert_eq!(r2, serde_json::json!({}));
+    let r3: Value = serde_json::from_slice(&home.hook("omp", &read_ev).stdout).unwrap();
+    assert_eq!(r3["block"], Value::Bool(true));
+    let r4: Value = serde_json::from_slice(&home.hook("omp", &read_ev).stdout).unwrap();
+    assert_eq!(r4, serde_json::json!({}));
+
+    // 3. Large inline JSON dump denies once then allows retry.
+    let dump_ev = serde_json::json!({
+        "toolName": "bash",
+        "input": {"command": "jq '.k0' big.json"},
+        "cwd": home.repo.to_str().unwrap(),
+        "sessionId": "omp-int-1",
+        "lastPrompt": "",
+    });
+    let d1: Value = serde_json::from_slice(&home.hook("omp", &dump_ev).stdout).unwrap();
+    assert_eq!(d1["block"], Value::Bool(true));
+    let d2: Value = serde_json::from_slice(&home.hook("omp", &dump_ev).stdout).unwrap();
+    assert_eq!(d2, serde_json::json!({}));
+
+    // 4. Secret guard blocks by default, rejects slash-adjacent generic tokens, and unlocks when named.
+    let sec_blocked: Value = serde_json::from_slice(
+        &home
+            .hook(
+                "omp",
+                &serde_json::json!({
+                    "toolName": "read",
+                    "input": {"path": ".env"},
+                    "cwd": home.repo.to_str().unwrap(),
+                    "sessionId": "omp-int-1",
+                    "lastPrompt": "",
+                }),
+            )
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(sec_blocked["block"], Value::Bool(true));
+    let sec_unlocked: Value = serde_json::from_slice(
+        &home
+            .hook(
+                "omp",
+                &serde_json::json!({
+                    "toolName": "read",
+                    "input": {"path": ".env"},
+                    "cwd": home.repo.to_str().unwrap(),
+                    "sessionId": "omp-int-1",
+                    "lastPrompt": "inspect .env please",
+                }),
+            )
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(sec_unlocked, serde_json::json!({}));
+    let strict_blocked: Value = serde_json::from_slice(
+        &home
+            .hook(
+                "omp",
+                &serde_json::json!({
+                    "toolName": "read",
+                    "input": {"path": ".ssh/config"},
+                    "cwd": home.repo.to_str().unwrap(),
+                    "sessionId": "omp-int-1",
+                    "lastPrompt": "debug the /config endpoint",
+                }),
+            )
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(strict_blocked["block"], Value::Bool(true));
+
+    // 5. Unified metrics record all omp activity cleanly.
+    let totals = home.metrics();
+    assert_eq!(totals.status.code(), Some(0));
+    let parsed: Value = serde_json::from_slice(&totals.stdout).unwrap();
+    assert_eq!(parsed["by_host"]["omp"]["count"], 7, "{parsed}");
+    assert_eq!(parsed["by_rule"]["shell-rewrite"]["count"], 1, "{parsed}");
+    assert_eq!(parsed["by_rule"]["first-read-denial"]["count"], 1, "{parsed}");
+    assert_eq!(parsed["by_rule"]["reread-denial"]["count"], 1, "{parsed}");
+    assert_eq!(parsed["by_rule"]["inline-dump-denial"]["count"], 1, "{parsed}");
+    assert_eq!(parsed["by_rule"]["allowed-retry"]["count"], 3, "{parsed}");
+}
