@@ -191,7 +191,14 @@ fn command_invokes_rtk_hook(cmd: &str) -> bool {
 pub(crate) fn is_shell_tool(tool_name: &str) -> bool {
     matches!(
         tool_name.to_ascii_lowercase().as_str(),
-        "execute" | "bash" | "shell" | "exec" | "run_command" | "run_shell_command" | "terminal"
+        "execute"
+            | "bash"
+            | "shell"
+            | "exec"
+            | "run_command"
+            | "run_shell_command"
+            | "run_terminal_command"
+            | "terminal"
     )
 }
 

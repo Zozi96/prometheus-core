@@ -481,8 +481,51 @@ fn hook_subcommand_handles_all_five_hosts() {
     let cursor_parsed: Value = serde_json::from_slice(&cursor_out.stdout).unwrap();
     assert_eq!("deny", cursor_parsed["permission"]);
 
+    // Antigravity (#87): secret ask, and pass paths never emit `{}`.
+    let agy_ev = serde_json::json!({
+        "hookEventName": "PreToolUse",
+        "conversationId": "sess-antigravity",
+        "workspacePaths": [repo],
+        "cwd": repo,
+        "lastUserInput": "",
+        "toolCall": {"name": "view_file", "args": {"AbsolutePath": ".env"}},
+    });
+    let agy_out = run_kit_stdin(&["hook", "antigravity"], agy_ev.to_string().as_bytes());
+    assert_eq!(agy_out.status.code(), Some(0));
+    let agy_parsed: Value = serde_json::from_slice(&agy_out.stdout).unwrap();
+    assert_eq!("ask", agy_parsed["decision"]);
+    let agy_pass = serde_json::json!({
+        "hookEventName": "PreToolUse",
+        "conversationId": "sess-antigravity",
+        "workspacePaths": [repo],
+        "cwd": repo,
+        "lastUserInput": "",
+        "toolCall": {"name": "run_command", "args": {"CommandLine": "echo hi"}},
+    });
+    let agy_pass_out = run_kit_stdin(&["hook", "antigravity"], agy_pass.to_string().as_bytes());
+    let agy_pass_parsed: Value = serde_json::from_slice(&agy_pass_out.stdout).unwrap();
+    assert_eq!(
+        serde_json::json!({"decision": "allow"}),
+        agy_pass_parsed,
+        "antigravity pass must never emit {{}}"
+    );
+
+    // Grok (#88): secret deny; pass is `{}`.
+    let grok_ev = serde_json::json!({
+        "hookEventName": "PreToolUse",
+        "sessionId": "sess-grok",
+        "cwd": repo,
+        "workspaceRoot": repo,
+        "toolName": "read_file",
+        "toolInput": {"file_path": ".env"},
+    });
+    let grok_out = run_kit_stdin(&["hook", "grok"], grok_ev.to_string().as_bytes());
+    assert_eq!(grok_out.status.code(), Some(0));
+    let grok_parsed: Value = serde_json::from_slice(&grok_out.stdout).unwrap();
+    assert_eq!("deny", grok_parsed["decision"]);
+
     // Invalid host exits 2.
-    let bad = run_kit(&["hook", "grok"], None);
+    let bad = run_kit(&["hook", "bogus"], None);
     assert_eq!(bad.status.code(), Some(2));
 }
 

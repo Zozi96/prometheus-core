@@ -636,6 +636,22 @@ fn file_reads(host: &str) -> Option<&'static [&'static str]> {
             "Glob",
             "LS",
         ]),
+        "antigravity" => Some(&[
+            "view_file",
+            "read_file",
+            "grep_search",
+            "find_by_name",
+            "list_dir",
+        ]),
+        "grok" => Some(&[
+            "read_file",
+            "read",
+            "Read",
+            "grep",
+            "Grep",
+            "list_dir",
+            "search",
+        ]),
         _ => None,
     }
 }
@@ -1005,7 +1021,8 @@ pub(crate) fn shell_deny_once_decision(
 /// sorted by key; an empty vec means a whole-file read.
 fn read_path(event: &Value, host: &str) -> Option<(String, Vec<(String, Value)>)> {
     let tool = casefold(tool_name(event));
-    let is_read = tool == "read" || (host == "antigravity" && tool == "view_file");
+    let is_read = tool == "read"
+        || (matches!(host, "antigravity" | "grok") && matches!(tool.as_str(), "view_file" | "read_file"));
     if !is_read {
         return None;
     }
@@ -1458,6 +1475,7 @@ fn read_guard_reply(host: &str, guard: ReadGuard) -> Value {
                 }
             }),
             "devin" => json!({"decision": "block", "reason": text}),
+            "antigravity" | "grok" => json!({"decision": "deny", "reason": text}),
             "omp" => json!({"block": true, "reason": text}),
             "cursor" => json!({
                 "permission": "deny",
@@ -1860,8 +1878,238 @@ fn handle_omp(raw: &[u8]) -> Value {
     )
 }
 
+const ANTIGRAVITY_FILE_TOOLS: [&str; 10] = [
+    "view_file",
+    "read_file",
+    "write_to_file",
+    "write_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+    "edit_file",
+    "list_dir",
+    "find_by_name",
+    "grep_search",
+];
+
+const ANTIGRAVITY_SECRET_KEYS: [&str; 10] = [
+    "AbsolutePath",
+    "Path",
+    "TargetFile",
+    "DirectoryPath",
+    "SearchDirectory",
+    "SearchPath",
+    "file_path",
+    "path",
+    "pattern",
+    "glob",
+];
+
+fn antigravity_allow() -> Value {
+    json!({"decision": "allow"})
+}
+
+/// Normalize an Antigravity camelCase payload (`toolCall.{name,args}`,
+/// `conversationId`, `workspacePaths`) into the shared event shape.
+fn antigravity_event(event: &Value) -> Value {
+    let mut normalized = match event.as_object() {
+        Some(map) => map.clone(),
+        None => Map::new(),
+    };
+    let tool_call = get(event, "toolCall").cloned().unwrap_or(Value::Null);
+    let name = as_str(get(&tool_call, "name")).to_string();
+    let args = get(&tool_call, "args").cloned().unwrap_or_else(|| json!({}));
+    normalized.insert("tool_name".to_string(), Value::String(name));
+    normalized.insert("tool_input".to_string(), args);
+    let session = as_str(py_or(
+        get(event, "conversationId"),
+        get(event, "session_id"),
+    ))
+    .to_string();
+    normalized.insert("session_id".to_string(), Value::String(session));
+    if as_str(get(event, "cwd")).is_empty() {
+        if let Some(Value::Array(paths)) = get(event, "workspacePaths") {
+            if let Some(first) = paths.iter().find_map(Value::as_str) {
+                if !first.is_empty() {
+                    normalized.insert("cwd".to_string(), Value::String(first.to_string()));
+                }
+            }
+        }
+    }
+    Value::Object(normalized)
+}
+
+fn handle_antigravity(raw: &[u8]) -> Value {
+    let parsed: Option<Value> = serde_json::from_slice(raw).ok();
+    let Some(event) = parsed.as_ref().filter(|v| v.is_object()) else {
+        // Malformed payload: never emit `{}` (that denies on Antigravity);
+        // `ask` is the fail-closed secret-safe fallback.
+        return json!({
+            "decision": "ask",
+            "reason": "Hook warning: consent could not be evaluated",
+        });
+    };
+    if event_name_normalized(event) != "pretooluse" {
+        return antigravity_allow();
+    }
+    let normalized = antigravity_event(event);
+    let tool = casefold(tool_name(&normalized));
+    let prompt = as_str(get(event, "lastUserInput"));
+    if ANTIGRAVITY_FILE_TOOLS.contains(&tool.as_str()) {
+        if let Some(inp) = get(&normalized, "tool_input").and_then(Value::as_object) {
+            let reason =
+                check_keys_for_secret_with_prompt(inp, &ANTIGRAVITY_SECRET_KEYS, prompt);
+            if !reason.is_empty() {
+                return json!({"decision": "ask", "reason": reason});
+            }
+        }
+    }
+    let session_id = as_str(get(&normalized, "session_id")).to_string();
+    let root = resolve_optional_root(as_str(get(&normalized, "cwd")));
+    if tool == "run_command" {
+        if let Some(inp) = get(&normalized, "tool_input").and_then(Value::as_object) {
+            if let crate::hook_rewrite::ShellAction::Rewrite { rewritten, .. } =
+                crate::hook_rewrite::evaluate_shell_policy(
+                    "antigravity",
+                    crate::hook_rewrite::ShellPolicyTier::Rewrite,
+                    tool_name(&normalized),
+                    inp,
+                    &session_id,
+                    root.as_deref(),
+                )
+            {
+                return json!({
+                    "decision": "allow",
+                    "overwrite": {"CommandLine": rewritten},
+                });
+            }
+        }
+        let dump = inline_dump_guard("antigravity", &normalized, &session_id, root.as_deref());
+        if let ReadGuard::Deny(text) = dump {
+            return json!({"decision": "deny", "reason": text});
+        }
+        return antigravity_allow();
+    }
+    if tool == "view_file" || tool == "read_file" {
+        let guard = read_guard("antigravity", &normalized, &session_id, root.as_deref());
+        if let ReadGuard::Deny(text) = guard {
+            return json!({"decision": "deny", "reason": text});
+        }
+        return antigravity_allow();
+    }
+    antigravity_allow()
+}
+
+const GROK_SECRET_KEYS: [&str; 10] = [
+    "file_path",
+    "filePath",
+    "path",
+    "AbsolutePath",
+    "target_file",
+    "TargetFile",
+    "pattern",
+    "glob",
+    "directory",
+    "dir",
+];
+
+const GROK_FILE_TOOLS: [&str; 12] = [
+    "read_file",
+    "read",
+    "write_file",
+    "edit_file",
+    "create_file",
+    "list_dir",
+    "grep",
+    "search",
+    "glob",
+    "view_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+];
+
+/// Normalize a Grok Build camelCase payload (`toolName`, `toolInput`,
+/// `sessionId`, `workspaceRoot`) into the shared event shape.
+fn grok_event(event: &Value) -> Value {
+    let mut normalized = match event.as_object() {
+        Some(map) => map.clone(),
+        None => Map::new(),
+    };
+    normalized.insert(
+        "tool_name".to_string(),
+        Value::String(as_str(get(event, "toolName")).to_string()),
+    );
+    normalized.insert(
+        "tool_input".to_string(),
+        get(event, "toolInput").cloned().unwrap_or_else(|| json!({})),
+    );
+    normalized.insert(
+        "session_id".to_string(),
+        Value::String(as_str(get(event, "sessionId")).to_string()),
+    );
+    if as_str(get(event, "cwd")).is_empty() {
+        let root = as_str(get(event, "workspaceRoot"));
+        if !root.is_empty() {
+            normalized.insert("cwd".to_string(), Value::String(root.to_string()));
+        }
+    }
+    Value::Object(normalized)
+}
+
+fn handle_grok(raw: &[u8]) -> Value {
+    let parsed: Option<Value> = serde_json::from_slice(raw).ok();
+    let Some(event) = parsed.as_ref().filter(|v| v.is_object()) else {
+        return json!({});
+    };
+    if event_name_normalized(event) != "pretooluse" {
+        return json!({});
+    }
+    let normalized = grok_event(event);
+    let tool = casefold(tool_name(&normalized));
+    if GROK_FILE_TOOLS.contains(&tool.as_str()) {
+        if let Some(inp) = get(&normalized, "tool_input").and_then(Value::as_object) {
+            let reason = check_keys_for_secret(inp, &GROK_SECRET_KEYS);
+            if !reason.is_empty() {
+                return json!({"decision": "deny", "reason": reason});
+            }
+        }
+    }
+    let session_id = as_str(get(&normalized, "session_id")).to_string();
+    let root = resolve_optional_root(as_str(get(&normalized, "cwd")));
+    if crate::hook_rewrite::is_shell_tool(tool_name(&normalized)) {
+        if let Some(inp) = get(&normalized, "tool_input").and_then(Value::as_object) {
+            if let crate::hook_rewrite::ShellAction::DenyOnce { reason, .. } =
+                crate::hook_rewrite::evaluate_shell_policy(
+                    "grok",
+                    crate::hook_rewrite::ShellPolicyTier::DenyOnce,
+                    tool_name(&normalized),
+                    inp,
+                    &session_id,
+                    root.as_deref(),
+                )
+            {
+                return json!({"decision": "deny", "reason": reason});
+            }
+        }
+        let dump = inline_dump_guard("grok", &normalized, &session_id, root.as_deref());
+        if let ReadGuard::Deny(text) = dump {
+            return json!({"decision": "deny", "reason": text});
+        }
+        return json!({});
+    }
+    if matches!(tool.as_str(), "read" | "read_file" | "view_file") {
+        let guard = read_guard("grok", &normalized, &session_id, root.as_deref());
+        if let ReadGuard::Deny(text) = guard {
+            return json!({"decision": "deny", "reason": text});
+        }
+    }
+    json!({})
+}
+
 pub fn is_supported_host(host: &str) -> bool {
-    matches!(host, "claude" | "cursor" | "devin" | "droid" | "muse" | "omp")
+    matches!(
+        host,
+        "claude" | "cursor" | "devin" | "droid" | "muse" | "omp" | "antigravity" | "grok"
+    )
 }
 
 /// Evaluate one hook event from raw stdin JSON for `host`.
@@ -1872,6 +2120,8 @@ pub fn run_hook(host: &str, raw_stdin: &[u8]) -> Value {
         "devin" => handle_devin(raw_stdin),
         "cursor" => handle_cursor(raw_stdin),
         "omp" => handle_omp(raw_stdin),
+        "antigravity" => handle_antigravity(raw_stdin),
+        "grok" => handle_grok(raw_stdin),
         _ => json!({}),
     }
 }
@@ -1881,6 +2131,16 @@ pub fn panic_fallback(host: &str) -> Value {
     match host {
         "cursor" => cursor_deny_reply("the secret guard failed"),
         "omp" => omp_block_reply("consent could not be evaluated"),
+        // `{}` denies on Antigravity, so its panic fallback must be explicit;
+        // `ask` keeps the secret guard fail-closed without a hard deny.
+        "antigravity" => json!({
+            "decision": "ask",
+            "reason": "consent could not be evaluated",
+        }),
+        "grok" => json!({
+            "decision": "deny",
+            "reason": "consent could not be evaluated",
+        }),
         _ => ask_reply("consent could not be evaluated"),
     }
 }
@@ -3610,5 +3870,204 @@ mod tests {
         let dt = run_hook("omp", dt_ev.to_string().as_bytes());
         assert!(dt["input"]["command"].as_str().unwrap().contains("compact --mode test -- dotnet test"));
         assert_eq!(15, dt["input"]["timeout"].as_i64().unwrap());
+    }
+
+    #[test]
+    fn antigravity_tier1_rewrite_read_guard_secret_ask_and_never_empty() {
+        let _g = env_guard();
+        let tmp = TempDir::new("antigravity");
+        let rt = tmp.0.join("rt");
+        fs::create_dir_all(&rt).unwrap();
+        let _env = EnvOverride::set(&[
+            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
+            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
+            ("PROMETHEUS_KIT_NO_REWRITE", None),
+            ("PROMETHEUS_KIT_NO_METRICS", Some("1")),
+        ]);
+        let big = tmp.0.join("big.rs");
+        fs::write(&big, "pub fn f() {}\n".repeat(220)).unwrap();
+        let big_json = tmp.0.join("big.json");
+        fs::write(
+            &big_json,
+            format!("{{\n{}\n}}\n", (0..220).map(|i| format!("\"k{i}\": {i}")).collect::<Vec<_>>().join(",\n")),
+        )
+        .unwrap();
+        let sess = "agy-sess-1";
+        let ev = |name: &str, args: Value| {
+            json!({
+                "hookEventName": "PreToolUse",
+                "conversationId": sess,
+                "workspacePaths": [tmp.0],
+                "cwd": tmp.0,
+                "lastUserInput": "",
+                "toolCall": {"name": name, "args": args},
+            })
+        };
+        // Rewrite via overwrite with explicit allow.
+        let rw = run_hook(
+            "antigravity",
+            ev("run_command", json!({"CommandLine": "cargo test", "Cwd": tmp.0}))
+                .to_string()
+                .as_bytes(),
+        );
+        assert_eq!("allow", rw["decision"].as_str().unwrap(), "{rw}");
+        assert!(
+            rw["overwrite"]["CommandLine"]
+                .as_str()
+                .unwrap()
+                .contains("compact --mode test -- cargo test"),
+            "{rw}"
+        );
+        // Pass-through shell emits explicit allow, never {}.
+        let pass = run_hook(
+            "antigravity",
+            ev("run_command", json!({"CommandLine": "echo hi"})).to_string().as_bytes(),
+        );
+        assert_eq!(json!({"decision": "allow"}), pass);
+        // Non-PreToolUse also allows explicitly.
+        let other = json!({
+            "hookEventName": "Stop", "conversationId": sess, "cwd": tmp.0,
+            "toolCall": {"name": "run_command", "args": {"CommandLine": "cargo test"}},
+        });
+        assert_eq!(
+            json!({"decision": "allow"}),
+            run_hook("antigravity", other.to_string().as_bytes())
+        );
+        // Secret ask on structured tools, unlock via lastUserInput.
+        let sec = run_hook(
+            "antigravity",
+            ev("view_file", json!({"AbsolutePath": tmp.0.join(".env")}))
+                .to_string()
+                .as_bytes(),
+        );
+        assert_eq!("ask", sec["decision"].as_str().unwrap(), "{sec}");
+        assert!(sec["reason"].as_str().unwrap().contains(".env"));
+        let mut unlocked = ev("view_file", json!({"AbsolutePath": tmp.0.join(".env")}));
+        unlocked["lastUserInput"] = json!("please read .env today");
+        assert_eq!(
+            json!({"decision": "allow"}),
+            run_hook("antigravity", unlocked.to_string().as_bytes())
+        );
+        for (tool, args) in [
+            ("write_to_file", json!({"TargetFile": tmp.0.join(".ssh/id_rsa")})),
+            ("grep_search", json!({"SearchPath": tmp.0.join("config/secrets.yml")})),
+            ("list_dir", json!({"DirectoryPath": tmp.0.join(".aws")})),
+        ] {
+            let reply = run_hook("antigravity", ev(tool, args).to_string().as_bytes());
+            assert_eq!("ask", reply["decision"].as_str().unwrap(), "{tool} {reply}");
+        }
+        // Four-state deny-once on view_file; ranged StartLine/EndLine passes first.
+        let whole = ev("view_file", json!({"AbsolutePath": big}));
+        let r1 = run_hook("antigravity", whole.to_string().as_bytes());
+        assert_eq!("deny", r1["decision"].as_str().unwrap(), "{r1}");
+        assert!(r1["reason"].as_str().unwrap().contains("Large whole-file read"));
+        assert_eq!(
+            json!({"decision": "allow"}),
+            run_hook("antigravity", whole.to_string().as_bytes())
+        );
+        let r3 = run_hook("antigravity", whole.to_string().as_bytes());
+        assert_eq!("deny", r3["decision"].as_str().unwrap(), "{r3}");
+        assert_eq!(
+            json!({"decision": "allow"}),
+            run_hook("antigravity", whole.to_string().as_bytes())
+        );
+        let ranged = ev(
+            "view_file",
+            json!({"AbsolutePath": big, "StartLine": 1, "EndLine": 20}),
+        );
+        assert_eq!(
+            json!({"decision": "allow"}),
+            run_hook("antigravity", ranged.to_string().as_bytes())
+        );
+        // read_file alias also guarded (fresh session).
+        let mut rf = ev("read_file", json!({"AbsolutePath": big}));
+        rf["conversationId"] = json!("agy-sess-2");
+        let rf1 = run_hook("antigravity", rf.to_string().as_bytes());
+        assert_eq!("deny", rf1["decision"].as_str().unwrap(), "{rf1}");
+        // Inline dump denies once, then allows.
+        let dump = ev("run_command", json!({"CommandLine": "jq '.k0' big.json"}));
+        let d1 = run_hook("antigravity", dump.to_string().as_bytes());
+        assert_eq!("deny", d1["decision"].as_str().unwrap(), "{d1}");
+        assert_eq!(
+            json!({"decision": "allow"}),
+            run_hook("antigravity", dump.to_string().as_bytes())
+        );
+        // Malformed payload and panic fallback never emit {}.
+        let bad = run_hook("antigravity", b"{not json");
+        assert_eq!("ask", bad["decision"].as_str().unwrap(), "{bad}");
+        assert_eq!("ask", panic_fallback("antigravity")["decision"].as_str().unwrap());
+        assert!(is_supported_host("antigravity"));
+        // RTK deferral: RTK-owned command passes with explicit allow.
+        let _rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("1"))]);
+        let deferred = run_hook(
+            "antigravity",
+            ev("run_command", json!({"CommandLine": "git status"})).to_string().as_bytes(),
+        );
+        assert_eq!(json!({"decision": "allow"}), deferred);
+    }
+
+    #[test]
+    fn grok_tier2_secret_deny_shell_deny_once_and_read_guard() {
+        let _g = env_guard();
+        let tmp = TempDir::new("grok");
+        let rt = tmp.0.join("rt");
+        fs::create_dir_all(&rt).unwrap();
+        let _env = EnvOverride::set(&[
+            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
+            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
+            ("PROMETHEUS_KIT_NO_REWRITE", None),
+            ("PROMETHEUS_KIT_NO_METRICS", Some("1")),
+        ]);
+        let big = tmp.0.join("big.rs");
+        fs::write(&big, "pub fn f() {}\n".repeat(220)).unwrap();
+        let sess = "grok-sess-1";
+        let ev = |name: &str, input: Value| {
+            json!({
+                "hookEventName": "PreToolUse",
+                "sessionId": sess,
+                "cwd": tmp.0,
+                "workspaceRoot": tmp.0,
+                "toolName": name,
+                "toolInput": input,
+            })
+        };
+        // Secret deny on structured file tools.
+        let sec = run_hook(
+            "grok",
+            ev("read_file", json!({"file_path": ".env"})).to_string().as_bytes(),
+        );
+        assert_eq!("deny", sec["decision"].as_str().unwrap(), "{sec}");
+        assert!(sec["reason"].as_str().unwrap().contains(".env"));
+        // Tier-2 deny-once on covered shell: first denies with exact kit command, retry passes {}.
+        let shell = ev("run_terminal_command", json!({"command": "sed -n '1,3p' big.rs"}));
+        let s1 = run_hook("grok", shell.to_string().as_bytes());
+        assert_eq!("deny", s1["decision"].as_str().unwrap(), "{s1}");
+        assert!(s1["reason"].as_str().unwrap().contains("slice 'big.rs:1-3'"), "{s1}");
+        assert_eq!(json!({}), run_hook("grok", shell.to_string().as_bytes()));
+        // Uncovered shell passes {}.
+        assert_eq!(
+            json!({}),
+            run_hook("grok", ev("run_terminal_command", json!({"command": "echo hi"}))
+                .to_string()
+                .as_bytes())
+        );
+        // Four-state read guard on read_file.
+        let whole = ev("read_file", json!({"file_path": big}));
+        let r1 = run_hook("grok", whole.to_string().as_bytes());
+        assert_eq!("deny", r1["decision"].as_str().unwrap(), "{r1}");
+        assert_eq!(json!({}), run_hook("grok", whole.to_string().as_bytes()));
+        let r3 = run_hook("grok", whole.to_string().as_bytes());
+        assert_eq!("deny", r3["decision"].as_str().unwrap(), "{r3}");
+        assert_eq!(json!({}), run_hook("grok", whole.to_string().as_bytes()));
+        // Non-PreToolUse and malformed pass {}.
+        let other = json!({"hookEventName": "Stop", "sessionId": sess, "toolName": "read_file", "toolInput": {"file_path": ".env"}});
+        assert_eq!(json!({}), run_hook("grok", other.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook("grok", b"{not json"));
+        assert_eq!("deny", panic_fallback("grok")["decision"].as_str().unwrap());
+        assert!(is_supported_host("grok"));
+        // RTK deferral: with rtk active in ~/.grok/hooks, covered commands are not denied.
+        let _rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("1"))]);
+        let deferred = ev("run_terminal_command", json!({"command": "git status"}));
+        assert_eq!(json!({}), run_hook("grok", deferred.to_string().as_bytes()));
     }
 }
