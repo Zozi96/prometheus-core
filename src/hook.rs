@@ -920,7 +920,7 @@ fn read_guard_reply(host: &str, guard: ReadGuard) -> Value {
 }
 
 fn cursor_deny_reply(reason: &str) -> Value {
-    let text = format!("SureForge: {reason}.");
+    let text = format!("Prometheus: {reason}.");
     json!({
         "permission": "deny",
         "user_message": text,
