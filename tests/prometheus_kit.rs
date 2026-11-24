@@ -1,4 +1,4 @@
-use prometheus_core::hook::REREAD_DENIAL_MESSAGE;
+use prometheus_core::hook::REREAD_MESSAGE;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -880,22 +880,28 @@ fn metrics_records_shell_rewrite_for_rewrite_hosts() {
 }
 
 #[test]
-fn metrics_records_read_denials_for_all_hosts() {
-    let home = MetricsHome::new("deny_metrics");
+fn metrics_records_read_advisories_only_for_context_hosts() {
+    let home = MetricsHome::new("read_metrics");
     let mut big = String::new();
     for i in 0..250 {
         big.push_str(&format!("fn func_{i}() {{}}\n"));
     }
     fs::write(home.repo.join("big.rs"), &big).unwrap();
-    let big_bytes = big.len() as u64;
     fs::write(home.repo.join("small.rs"), "fn s() {}\n".repeat(10)).unwrap();
 
     for host in ["claude", "cursor", "devin", "droid", "muse"] {
         let ev = read_event(host, &home.repo, "big.rs");
-        // 4-state cycle: first-read-denial -> allowed-retry -> reread-denial -> allowed-retry.
-        for _ in 0..4 {
+        for _ in 0..3 {
             let out = home.hook(host, &ev);
             assert_eq!(out.status.code(), Some(0), "host={host}");
+            let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_ne!(
+                reply["hookSpecificOutput"]["permissionDecision"],
+                "deny",
+                "host={host}"
+            );
+            assert_ne!(reply["decision"], "block", "host={host}");
+            assert_ne!(reply["permission"], "deny", "host={host}");
         }
         let small = read_event(host, &home.repo, "small.rs");
         for _ in 0..2 {
@@ -903,8 +909,6 @@ fn metrics_records_read_denials_for_all_hosts() {
             assert_eq!(out.status.code(), Some(0), "host={host}");
         }
         if host == "claude" {
-            // An identical range on the same large file passes on first read,
-            // denies once on reread, and allows retry with proportional estimate.
             let range_ev = serde_json::json!({
                 "hook_event_name": "PreToolUse",
                 "tool_name": "Read",
@@ -912,7 +916,7 @@ fn metrics_records_read_denials_for_all_hosts() {
                 "cwd": home.repo.to_str().unwrap(),
                 "session_id": "sess-claude",
             });
-            for _ in 0..3 {
+            for _ in 0..2 {
                 let out = home.hook(host, &range_ev);
                 assert_eq!(out.status.code(), Some(0), "host={host}");
             }
@@ -920,78 +924,31 @@ fn metrics_records_read_denials_for_all_hosts() {
     }
 
     let rows = home.rows();
-    // Per host (4 calls on big.rs): first-read-denial + allowed-retry + reread-denial + allowed-retry = 4 rows.
-    // Small.rs reread warns ONLY on context-delivering hosts (claude, muse) = +2 rows (zero phantom metrics on cursor/devin/droid).
-    // Claude range reads add reread-denial + allowed-retry = +2 rows. Total = 5*4 + 2 + 2 = 24.
-    assert_eq!(rows.len(), 24, "rows: {rows:?}");
+    // Only context-delivering hosts (`claude`, `muse`) record `reread-warning` rows:
+    // 2 on `big.rs` (calls 2 & 3) + 1 on `small.rs` (call 2) = 3 per host, 6 total.
+    assert_eq!(rows.len(), 6, "rows: {rows:?}");
     for row in &rows {
         assert_metric_row_keys(row);
-    }
-    let range_estimate = (big_bytes as u128 * 50 / 250) as u64;
-    for host in ["claude", "cursor", "devin", "droid", "muse"] {
-        let first_denial = find_row(&rows, host, "first-read-denial");
-        assert_eq!(first_denial["raw_bytes"].as_u64().unwrap(), big_bytes);
-        assert!(first_denial["emitted_bytes"].as_u64().unwrap() > 0);
-
-        let denial = find_row(&rows, host, "reread-denial");
-        assert_eq!(denial["raw_bytes"].as_u64().unwrap(), big_bytes);
+        assert_eq!(row["rule_id"].as_str(), Some("reread-warning"));
+        assert_eq!(row["raw_bytes"].as_u64(), Some(0));
         assert_eq!(
-            denial["emitted_bytes"].as_u64().unwrap(),
-            REREAD_DENIAL_MESSAGE.len() as u64
+            row["emitted_bytes"].as_u64(),
+            Some(REREAD_MESSAGE.len() as u64)
         );
-
-        let whole_retries: Vec<&Value> = rows
-            .iter()
-            .filter(|r| {
-                r["host"].as_str() == Some(host)
-                    && r["rule_id"].as_str() == Some("allowed-retry")
-                    && r["emitted_bytes"].as_u64() == Some(big_bytes)
-            })
-            .collect();
-        assert_eq!(whole_retries.len(), 2, "host={host} whole retries: {whole_retries:?}");
-        for retry in whole_retries {
-            assert_eq!(retry["raw_bytes"].as_u64().unwrap(), 0);
-        }
-
-        let has_warning = rows
-            .iter()
-            .any(|r| r["host"].as_str() == Some(host) && r["rule_id"].as_str() == Some("reread-warning"));
-        if matches!(host, "claude" | "muse") {
-            assert!(has_warning, "expected reread-warning for {host}");
-        } else {
-            assert!(!has_warning, "phantom reread-warning recorded for {host}");
-        }
+        let host = row["host"].as_str().unwrap();
+        assert!(matches!(host, "claude" | "muse"), "phantom warning for {host}");
     }
-
-    // No phantom large-read-advisory rows are ever emitted.
-    assert!(
-        !rows.iter().any(|r| r["rule_id"].as_str() == Some("large-read-advisory")),
-        "unexpected large-read-advisory row: {rows:?}"
-    );
-
-    // Claude's range reads produced their own denial/retry pair with the
-    // proportional byte estimate.
-    let range_denial = rows
-        .iter()
-        .find(|row| {
-            row["host"].as_str() == Some("claude")
-                && row["rule_id"].as_str() == Some("reread-denial")
-                && row["raw_bytes"].as_u64() == Some(range_estimate)
-        })
-        .expect("missing range reread-denial row");
-    assert_eq!(
-        range_denial["emitted_bytes"].as_u64().unwrap(),
-        REREAD_DENIAL_MESSAGE.len() as u64
-    );
-    let range_retry = rows
-        .iter()
-        .find(|row| {
-            row["host"].as_str() == Some("claude")
-                && row["rule_id"].as_str() == Some("allowed-retry")
-                && row["emitted_bytes"].as_u64() == Some(range_estimate)
-        })
-        .expect("missing range allowed-retry row");
-    assert_eq!(range_retry["raw_bytes"].as_u64().unwrap(), 0);
+    for forbidden in [
+        "first-read-denial",
+        "reread-denial",
+        "allowed-retry",
+        "large-read-advisory",
+    ] {
+        assert!(
+            !rows.iter().any(|r| r["rule_id"].as_str() == Some(forbidden)),
+            "unexpected {forbidden} row: {rows:?}"
+        );
+    }
 }
 
 #[test]
@@ -2328,7 +2285,7 @@ fn metrics_records_inline_dump_denial_and_aggregates_new_hosts_and_rules() {
     assert_eq!(serde_json::from_slice::<Value>(&s_out.stdout).unwrap(), serde_json::json!({}));
     assert!(!home.metrics_file().exists(), "small dump must record no phantom row");
 
-    // Large structured file on droid denies once (inline-dump-denial), then retry allows (allowed-retry).
+    // Large structured file on droid passes silently without blocking or phantom metrics.
     let big_ev = serde_json::json!({
         "hook_event_name": "PreToolUse",
         "tool_name": "Execute",
@@ -2337,12 +2294,11 @@ fn metrics_records_inline_dump_denial_and_aggregates_new_hosts_and_rules() {
         "session_id": "sess-dump",
     });
     let d1 = home.hook("droid", &big_ev);
-    let d1v: Value = serde_json::from_slice(&d1.stdout).unwrap();
-    assert_eq!(d1v["hookSpecificOutput"]["permissionDecision"], "deny");
-    let d2 = home.hook("droid", &big_ev);
-    assert_eq!(serde_json::from_slice::<Value>(&d2.stdout).unwrap(), serde_json::json!({}));
+    assert_eq!(serde_json::from_slice::<Value>(&d1.stdout).unwrap(), serde_json::json!({}));
+    assert!(!home.metrics_file().exists(), "no-context inline dump must record no phantom row");
 
-    // Verify new CLI host markers (antigravity, grok) and metrics aggregation of new host/rule enums.
+    // Verify new CLI host markers (antigravity, grok, opencode) and backward-compatible
+    // metrics aggregation over legacy denial rows in existing savings.jsonl files.
     let agy_cmd = kit_stdin_env(
         &home,
         &["compact", "--no-spillover"],
@@ -2365,21 +2321,24 @@ fn metrics_records_inline_dump_denial_and_aggregates_new_hosts_and_rules() {
     );
     assert_eq!(opencode_cmd.status.code(), Some(0));
 
-    // Append synthetic omp + shell-denial row and confirm `prometheus-kit metrics` aggregates cleanly.
     use std::io::Write;
     let mut f = fs::OpenOptions::new().append(true).open(home.metrics_file()).unwrap();
-    writeln!(
-        f,
-        "{{\"timestamp\":1,\"host\":\"omp\",\"rule_id\":\"shell-denial\",\"raw_bytes\":12,\"emitted_bytes\":40}}"
-    )
-    .unwrap();
+    for legacy_row in [
+        "{\"timestamp\":1,\"host\":\"omp\",\"rule_id\":\"shell-denial\",\"raw_bytes\":12,\"emitted_bytes\":40}",
+        "{\"timestamp\":1,\"host\":\"devin\",\"rule_id\":\"first-read-denial\",\"raw_bytes\":200,\"emitted_bytes\":40}",
+        "{\"timestamp\":1,\"host\":\"devin\",\"rule_id\":\"reread-denial\",\"raw_bytes\":200,\"emitted_bytes\":40}",
+        "{\"timestamp\":1,\"host\":\"droid\",\"rule_id\":\"inline-dump-denial\",\"raw_bytes\":300,\"emitted_bytes\":40}",
+    ] {
+        writeln!(f, "{legacy_row}").unwrap();
+    }
     drop(f);
 
     let totals = home.metrics();
     assert_eq!(totals.status.code(), Some(0));
     let parsed: Value = serde_json::from_slice(&totals.stdout).unwrap();
+    assert_eq!(parsed["by_rule"]["first-read-denial"]["count"], 1);
+    assert_eq!(parsed["by_rule"]["reread-denial"]["count"], 1);
     assert_eq!(parsed["by_rule"]["inline-dump-denial"]["count"], 1);
-    assert_eq!(parsed["by_rule"]["allowed-retry"]["count"], 1);
     assert_eq!(parsed["by_rule"]["shell-denial"]["count"], 1);
     assert_eq!(parsed["by_host"]["antigravity"]["count"], 1);
     assert_eq!(parsed["by_host"]["grok"]["count"], 1);
@@ -2428,7 +2387,7 @@ fn hook_omp_rewrites_guards_unlocks_and_records_metrics() {
         .contains("diff --status"));
     assert_eq!(rw_val["input"]["timeout"], 45);
 
-    // 2. Four-state Guided deny-once on 220-line whole-file read.
+    // 2. Whole-file reads of 220-line files never block on omp.
     let read_ev = serde_json::json!({
         "toolName": "read",
         "input": {"path": big_rs.to_str().unwrap()},
@@ -2436,16 +2395,12 @@ fn hook_omp_rewrites_guards_unlocks_and_records_metrics() {
         "sessionId": "omp-int-1",
         "lastPrompt": "",
     });
-    let r1: Value = serde_json::from_slice(&home.hook("omp", &read_ev).stdout).unwrap();
-    assert_eq!(r1["block"], Value::Bool(true));
-    let r2: Value = serde_json::from_slice(&home.hook("omp", &read_ev).stdout).unwrap();
-    assert_eq!(r2, serde_json::json!({}));
-    let r3: Value = serde_json::from_slice(&home.hook("omp", &read_ev).stdout).unwrap();
-    assert_eq!(r3["block"], Value::Bool(true));
-    let r4: Value = serde_json::from_slice(&home.hook("omp", &read_ev).stdout).unwrap();
-    assert_eq!(r4, serde_json::json!({}));
+    for _ in 0..4 {
+        let r: Value = serde_json::from_slice(&home.hook("omp", &read_ev).stdout).unwrap();
+        assert_eq!(r, serde_json::json!({}));
+    }
 
-    // 3. Large inline JSON dump denies once then allows retry.
+    // 3. Inline structured-file scripts never block on omp.
     let dump_ev = serde_json::json!({
         "toolName": "bash",
         "input": {"command": "jq '.k0' big.json"},
@@ -2453,10 +2408,10 @@ fn hook_omp_rewrites_guards_unlocks_and_records_metrics() {
         "sessionId": "omp-int-1",
         "lastPrompt": "",
     });
-    let d1: Value = serde_json::from_slice(&home.hook("omp", &dump_ev).stdout).unwrap();
-    assert_eq!(d1["block"], Value::Bool(true));
-    let d2: Value = serde_json::from_slice(&home.hook("omp", &dump_ev).stdout).unwrap();
-    assert_eq!(d2, serde_json::json!({}));
+    for _ in 0..2 {
+        let d: Value = serde_json::from_slice(&home.hook("omp", &dump_ev).stdout).unwrap();
+        assert_eq!(d, serde_json::json!({}));
+    }
 
     // 4. Secret guard blocks by default, rejects slash-adjacent generic tokens, and unlocks when named.
     let sec_blocked: Value = serde_json::from_slice(
@@ -2508,14 +2463,13 @@ fn hook_omp_rewrites_guards_unlocks_and_records_metrics() {
     .unwrap();
     assert_eq!(strict_blocked["block"], Value::Bool(true));
 
-    // 5. Unified metrics record all omp activity cleanly.
+    // 5. Unified metrics record only the shell rewrite under omp (no read/dump denials).
     let totals = home.metrics();
     assert_eq!(totals.status.code(), Some(0));
     let parsed: Value = serde_json::from_slice(&totals.stdout).unwrap();
-    assert_eq!(parsed["by_host"]["omp"]["count"], 7, "{parsed}");
+    assert_eq!(parsed["by_host"]["omp"]["count"], 1, "{parsed}");
     assert_eq!(parsed["by_rule"]["shell-rewrite"]["count"], 1, "{parsed}");
-    assert_eq!(parsed["by_rule"]["first-read-denial"]["count"], 1, "{parsed}");
-    assert_eq!(parsed["by_rule"]["reread-denial"]["count"], 1, "{parsed}");
-    assert_eq!(parsed["by_rule"]["inline-dump-denial"]["count"], 1, "{parsed}");
-    assert_eq!(parsed["by_rule"]["allowed-retry"]["count"], 3, "{parsed}");
+    assert!(parsed["by_rule"].get("first-read-denial").is_none(), "{parsed}");
+    assert!(parsed["by_rule"].get("reread-denial").is_none(), "{parsed}");
+    assert!(parsed["by_rule"].get("inline-dump-denial").is_none(), "{parsed}");
 }
