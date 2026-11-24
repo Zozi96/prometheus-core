@@ -481,6 +481,40 @@ fn hook_subcommand_handles_all_five_hosts() {
     let cursor_parsed: Value = serde_json::from_slice(&cursor_out.stdout).unwrap();
     assert_eq!("deny", cursor_parsed["permission"]);
 
+    // OpenCode (#154): the plugin sends the canonical payload; file paths and
+    // shell tokens deny, safe paths pass.
+    let oc_ev = serde_json::json!({
+        "event_name": "PreToolUse",
+        "tool_name": "read",
+        "tool_input": {"path": ".env"},
+        "cwd": repo,
+        "session_id": "sess-opencode",
+    });
+    let oc_out = run_kit_stdin(&["hook", "opencode"], oc_ev.to_string().as_bytes());
+    assert_eq!(oc_out.status.code(), Some(0));
+    let oc_parsed: Value = serde_json::from_slice(&oc_out.stdout).unwrap();
+    assert_eq!("deny", oc_parsed["decision"]);
+    let oc_shell = serde_json::json!({
+        "event_name": "PreToolUse",
+        "tool_name": "shell",
+        "tool_input": {"command": "cat .env"},
+        "cwd": repo,
+        "session_id": "sess-opencode",
+    });
+    let oc_shell_out = run_kit_stdin(&["hook", "opencode"], oc_shell.to_string().as_bytes());
+    let oc_shell_parsed: Value = serde_json::from_slice(&oc_shell_out.stdout).unwrap();
+    assert_eq!("deny", oc_shell_parsed["decision"]);
+    let oc_pass = serde_json::json!({
+        "event_name": "PreToolUse",
+        "tool_name": "read",
+        "tool_input": {"path": "hello.rs"},
+        "cwd": repo,
+        "session_id": "sess-opencode",
+    });
+    let oc_pass_out = run_kit_stdin(&["hook", "opencode"], oc_pass.to_string().as_bytes());
+    let oc_pass_parsed: Value = serde_json::from_slice(&oc_pass_out.stdout).unwrap();
+    assert_eq!(serde_json::json!({}), oc_pass_parsed);
+
     // Antigravity (#87): secret ask, and pass paths never emit `{}`.
     let agy_ev = serde_json::json!({
         "hookEventName": "PreToolUse",

@@ -27,6 +27,7 @@ pub enum Host {
     Grok,
     Muse,
     Omp,
+    Opencode,
     Standalone,
 }
 
@@ -42,6 +43,7 @@ impl Host {
             "grok" => Some(Self::Grok),
             "muse" => Some(Self::Muse),
             "omp" => Some(Self::Omp),
+            "opencode" => Some(Self::Opencode),
             _ => None,
         }
     }

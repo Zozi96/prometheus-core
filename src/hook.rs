@@ -1475,7 +1475,7 @@ fn read_guard_reply(host: &str, guard: ReadGuard) -> Value {
                 }
             }),
             "devin" => json!({"decision": "block", "reason": text}),
-            "antigravity" | "grok" => json!({"decision": "deny", "reason": text}),
+            "antigravity" | "grok" | "opencode" => json!({"decision": "deny", "reason": text}),
             "omp" => json!({"block": true, "reason": text}),
             "cursor" => json!({
                 "permission": "deny",
@@ -1785,6 +1785,46 @@ fn resolve_optional_root(cwd: &str) -> Option<PathBuf> {
         .ok()
         .and_then(|p| std::fs::canonicalize(p).ok())
         .filter(|p| p.is_dir())
+}
+
+fn opencode_deny_reply(reason: &str) -> Value {
+    json!({"decision": "deny", "reason": format!("Prometheus: {reason}.")})
+}
+
+fn opencode_secret_denial(event: &Value) -> String {
+    let denial = secret_tool_denial(event);
+    if !denial.is_empty() {
+        return denial;
+    }
+    if let Some(inp) = get(event, "tool_input").and_then(Value::as_object) {
+        if let Some(command) = inp.get("command").and_then(Value::as_str) {
+            for token in split_command(command) {
+                let reason = command_token_denied(&token);
+                if !reason.is_empty() {
+                    return reason;
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// OpenCode permission-`evaluate` payload (plugin-constructed canonical shape):
+/// `event_name`, `tool_name` (the permission action), `tool_input`
+/// (`path` for file actions, `command` for shell), `cwd`, `session_id`.
+fn handle_opencode(raw: &[u8]) -> Value {
+    let parsed: Option<Value> = serde_json::from_slice(raw).ok();
+    let Some(event) = parsed.as_ref().filter(|v| v.is_object()) else {
+        return opencode_deny_reply("the secret guard failed");
+    };
+    if event_name_normalized(event) != "pretooluse" {
+        return json!({});
+    }
+    let denial = opencode_secret_denial(event);
+    if !denial.is_empty() {
+        return opencode_deny_reply(&denial);
+    }
+    json!({})
 }
 
 fn handle_omp(raw: &[u8]) -> Value {
@@ -2108,7 +2148,7 @@ fn handle_grok(raw: &[u8]) -> Value {
 pub fn is_supported_host(host: &str) -> bool {
     matches!(
         host,
-        "claude" | "cursor" | "devin" | "droid" | "muse" | "omp" | "antigravity" | "grok"
+        "claude" | "cursor" | "devin" | "droid" | "muse" | "omp" | "opencode" | "antigravity" | "grok"
     )
 }
 
@@ -2120,6 +2160,7 @@ pub fn run_hook(host: &str, raw_stdin: &[u8]) -> Value {
         "devin" => handle_devin(raw_stdin),
         "cursor" => handle_cursor(raw_stdin),
         "omp" => handle_omp(raw_stdin),
+        "opencode" => handle_opencode(raw_stdin),
         "antigravity" => handle_antigravity(raw_stdin),
         "grok" => handle_grok(raw_stdin),
         _ => json!({}),
@@ -2138,6 +2179,10 @@ pub fn panic_fallback(host: &str) -> Value {
             "reason": "consent could not be evaluated",
         }),
         "grok" => json!({
+            "decision": "deny",
+            "reason": "consent could not be evaluated",
+        }),
+        "opencode" => json!({
             "decision": "deny",
             "reason": "consent could not be evaluated",
         }),

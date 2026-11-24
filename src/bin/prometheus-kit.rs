@@ -992,7 +992,7 @@ fn run_map(raw: &[String]) -> i32 {
 }
 
 const HOOK_USAGE: &str = "\
-usage: prometheus-kit hook <claude|cursor|devin|droid|muse|omp|antigravity|grok>
+usage: prometheus-kit hook <claude|cursor|devin|droid|muse|omp|opencode|antigravity|grok>
 
 Reads one hook event JSON object from stdin and prints the host reply JSON
 (secret guard, large-read/reread advisory, and shell auto-rewrite).";
