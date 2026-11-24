@@ -2880,16 +2880,25 @@ mod tests {
 
         // Plain read and nulled partial parameters share the whole-file state key
         // and emit only a non-blocking reread warning on Claude.
-        let whole = ev("s-null-a", false);
+        let sid = format!(
+            "s-null-a-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let whole = ev(&sid, false);
         assert_eq!(json!({}), run_hook("claude", whole.to_string().as_bytes()));
-        let nulled = ev("s-null-a", true);
+        let nulled = ev(&sid, true);
         let second = run_hook("claude", nulled.to_string().as_bytes());
         assert_eq!(REREAD_MESSAGE, second["hookSpecificOutput"]["additionalContext"]);
         assert!(second["hookSpecificOutput"].get("permissionDecision").is_none());
 
         // Legacy state files containing " first-denied" or " denied" are still
         // recognized as valid hashes and never deny.
-        let state_files: Vec<_> = fs::read_dir(rt.join("prometheus").join("s-null-a"))
+        let sess_dir = session_dir(&sid).expect("session dir");
+        let state_files: Vec<_> = fs::read_dir(&sess_dir)
             .unwrap()
             .filter_map(Result::ok)
             .map(|e| e.path())
@@ -2900,6 +2909,7 @@ mod tests {
         let third = run_hook("claude", whole.to_string().as_bytes());
         assert_eq!(REREAD_MESSAGE, third["hookSpecificOutput"]["additionalContext"]);
         assert!(third["hookSpecificOutput"].get("permissionDecision").is_none());
+        let _ = fs::remove_dir_all(&sess_dir);
     }
 
     #[test]
