@@ -13,7 +13,8 @@
 use crate::metrics::{self, Host, Rule};
 use crate::store::{ensure_private_dir, sha256_hex};
 use serde_json::{json, Map, Value};
-use std::ffi::OsStr;
+use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -25,6 +26,7 @@ pub const REREAD_DENIAL_MESSAGE: &str = "Unchanged reread denied once: reuse the
 pub const LARGE_READ_LINES: usize = 200;
 pub const LARGE_STRUCTURED_BYTES: usize = 8 * 1024;
 const REREAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SYMLINK_HOPS: usize = 40;
 
 /// True only for hosts whose `PreToolUse` protocol delivers non-blocking
 /// context (`additionalContext`) to the model (ADR-0014 D3).
@@ -319,7 +321,7 @@ fn expand_tilde_path(raw: &str) -> Option<PathBuf> {
     None
 }
 
-fn resolve_candidate_against_root(path: &str, root: Option<&Path>) -> Option<PathBuf> {
+fn resolve_candidate_against_root(path: &str, root: Option<&Path>) -> Option<Result<PathBuf, ()>> {
     let joined = if let Some(home_path) = expand_tilde_path(path) {
         home_path
     } else {
@@ -330,7 +332,7 @@ fn resolve_candidate_against_root(path: &str, root: Option<&Path>) -> Option<Pat
             root?.join(p)
         }
     };
-    Some(resolve_loose(&joined))
+    Some(resolve_secret_path(&joined))
 }
 
 fn secret_denied_with_prompt(raw: Option<&Value>, prompt: &str) -> String {
@@ -352,12 +354,18 @@ fn secret_denied_with_prompt_and_root(
         return reason;
     }
     if resolve_fs && !path.is_empty() {
-        if let Some(resolved) = resolve_candidate_against_root(&path, root) {
-            let resolved_str = resolved.to_string_lossy();
-            let resolved_reason = secret_path_denied(&resolved_str);
-            if !resolved_reason.is_empty() && !prompt_allows_secret(&resolved_str, prompt) {
-                return resolved_reason;
+        match resolve_candidate_against_root(&path, root) {
+            Some(Err(())) => {
+                return SYMLINK_BLOCK_REASON.to_string();
             }
+            Some(Ok(resolved)) => {
+                let resolved_str = resolved.to_string_lossy();
+                let resolved_reason = secret_path_denied(&resolved_str);
+                if !resolved_reason.is_empty() && !prompt_allows_secret(&resolved_str, prompt) {
+                    return resolved_reason;
+                }
+            }
+            None => {}
         }
     }
     String::new()
@@ -403,7 +411,10 @@ fn check_keys_for_secret_with_prompt_and_root(
     String::new()
 }
 
-fn omp_secret_denial(event: &Value, prompt: &str, root: Option<&Path>) -> String {
+const SYMLINK_BLOCK_REASON: &str =
+    "unresolved symlink chain is blocked; ask the user to approve it explicitly";
+
+fn scan_secret_path_keys(event: &Value, prompt: &str, root: Option<&Path>) -> (String, bool) {
     const KEYS: [&str; 9] = [
         "path",
         "file_path",
@@ -429,8 +440,11 @@ fn omp_secret_denial(event: &Value, prompt: &str, root: Option<&Path>) -> String
         if let Some(inp) = get(event, key).and_then(Value::as_object) {
             if PATH_KEYS.iter().any(|k| {
                 inp.get(*k).is_some_and(|v| match v {
-                    Value::String(s) => !s.trim().is_empty(),
-                    Value::Array(arr) => !arr.is_empty(),
+                    Value::String(s) => !normalize_secret_candidate(s).is_empty(),
+                    Value::Array(arr) => arr.iter().any(|item| {
+                        item.as_str()
+                            .is_some_and(|s| !normalize_secret_candidate(s).is_empty())
+                    }),
                     _ => false,
                 })
             }) {
@@ -439,9 +453,17 @@ fn omp_secret_denial(event: &Value, prompt: &str, root: Option<&Path>) -> String
             let reason =
                 check_keys_for_secret_with_prompt_and_root(inp, &KEYS, prompt, root, &PATH_KEYS);
             if !reason.is_empty() {
-                return reason;
+                return (reason, saw_path_arg);
             }
         }
+    }
+    (String::new(), saw_path_arg)
+}
+
+fn omp_secret_denial(event: &Value, prompt: &str, root: Option<&Path>) -> String {
+    let (reason, saw_path_arg) = scan_secret_path_keys(event, prompt, root);
+    if !reason.is_empty() {
+        return reason;
     }
     // File-read/search tools omitting a path argument target `cwd` implicitly (e.g. `ls({})`, `grep({pattern})`).
     if !saw_path_arg {
@@ -709,6 +731,87 @@ fn session_dir(session_id: &str) -> Option<PathBuf> {
     ensure_private_dir(&parent).ok()?;
     ensure_private_dir(&folder).ok()?;
     Some(folder)
+}
+
+enum OwnedComponent {
+    Prefix(OsString),
+    RootDir,
+    ParentDir,
+    Normal(OsString),
+}
+
+fn push_path_components(path: &Path, into: &mut Vec<OwnedComponent>) {
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                into.push(OwnedComponent::Prefix(prefix.as_os_str().to_os_string()))
+            }
+            Component::RootDir => into.push(OwnedComponent::RootDir),
+            Component::CurDir => {}
+            Component::ParentDir => into.push(OwnedComponent::ParentDir),
+            Component::Normal(name) => into.push(OwnedComponent::Normal(name.to_os_string())),
+        }
+    }
+}
+
+fn resolve_secret_path(path: &Path) -> Result<PathBuf, ()> {
+    let mut initial = Vec::new();
+    if !path.is_absolute() {
+        let cur = std::env::current_dir().unwrap_or_default();
+        if path.has_root() {
+            if let Some(Component::Prefix(prefix)) = cur.components().next() {
+                initial.push(OwnedComponent::Prefix(prefix.as_os_str().to_os_string()));
+            }
+        } else {
+            push_path_components(&cur, &mut initial);
+        }
+    }
+    push_path_components(path, &mut initial);
+    let mut queue: VecDeque<OwnedComponent> = initial.into();
+    let mut out = PathBuf::new();
+    let mut hops = 0usize;
+    while let Some(component) = queue.pop_front() {
+        match component {
+            OwnedComponent::Prefix(prefix) => out.push(prefix),
+            OwnedComponent::RootDir => out.push(Path::new("/")),
+            OwnedComponent::ParentDir => {
+                out.pop();
+            }
+            OwnedComponent::Normal(name) => {
+                let next = out.join(&name);
+                match std::fs::symlink_metadata(&next) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        hops += 1;
+                        if hops > MAX_SYMLINK_HOPS {
+                            return Err(());
+                        }
+                        let target = std::fs::read_link(&next).map_err(|_| ())?;
+                        let mut target_parts = Vec::new();
+                        push_path_components(&target, &mut target_parts);
+                        if target.is_absolute() {
+                            out.clear();
+                        } else if target.has_root() {
+                            let prefix = out.components().next().and_then(|c| match c {
+                                Component::Prefix(p) => Some(p.as_os_str().to_os_string()),
+                                _ => None,
+                            });
+                            out.clear();
+                            if let Some(p) = prefix {
+                                out.push(p);
+                            }
+                        }
+                        for part in target_parts.into_iter().rev() {
+                            queue.push_front(part);
+                        }
+                    }
+                    _ => {
+                        out = std::fs::canonicalize(&next).unwrap_or(next);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn resolve_loose(path: &Path) -> PathBuf {
@@ -1787,19 +1890,44 @@ fn resolve_optional_root(cwd: &str) -> Option<PathBuf> {
         .filter(|p| p.is_dir())
 }
 
+fn resolve_secret_root(cwd: &str) -> Result<Option<PathBuf>, ()> {
+    let raw = normalize_secret_candidate(cwd);
+    if !raw.is_empty() {
+        let path = expand_tilde_path(&raw).unwrap_or_else(|| PathBuf::from(&raw));
+        return resolve_secret_path(&path).map(Some);
+    }
+    match std::env::current_dir() {
+        Ok(cur) => resolve_secret_path(&cur).map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
 fn opencode_deny_reply(reason: &str) -> Value {
     json!({"decision": "deny", "reason": format!("Prometheus: {reason}.")})
 }
 
-fn opencode_secret_denial(event: &Value) -> String {
-    let denial = secret_tool_denial(event);
-    if !denial.is_empty() {
-        return denial;
+fn opencode_secret_denial(event: &Value, root: Option<&Path>) -> String {
+    let (reason, saw_path_arg) = scan_secret_path_keys(event, "", root);
+    if !reason.is_empty() {
+        return reason;
     }
-    if let Some(inp) = get(event, "tool_input").and_then(Value::as_object) {
-        if let Some(command) = inp.get("command").and_then(Value::as_str) {
-            for token in split_command(command) {
-                let reason = command_token_denied(&token);
+    for key in ["tool_input", "input"] {
+        if let Some(inp) = get(event, key).and_then(Value::as_object) {
+            if let Some(command) = inp.get("command").and_then(Value::as_str) {
+                for token in split_command(command) {
+                    let reason = command_token_denied(&token);
+                    if !reason.is_empty() {
+                        return reason;
+                    }
+                }
+            }
+        }
+    }
+    if !saw_path_arg {
+        let tool = tool_name(event);
+        if matches!(tool, "read" | "edit" | "write" | "glob" | "grep" | "list") {
+            if let Some(base) = root {
+                let reason = secret_path_denied(&base.to_string_lossy());
                 if !reason.is_empty() {
                     return reason;
                 }
@@ -1811,7 +1939,7 @@ fn opencode_secret_denial(event: &Value) -> String {
 
 /// OpenCode permission-`evaluate` payload (plugin-constructed canonical shape):
 /// `event_name`, `tool_name` (the permission action), `tool_input`
-/// (`path` for file actions, `command` for shell), `cwd`, `session_id`.
+/// (`path`/`paths` for file actions, `command` for shell), `cwd`, `session_id`.
 fn handle_opencode(raw: &[u8]) -> Value {
     let parsed: Option<Value> = serde_json::from_slice(raw).ok();
     let Some(event) = parsed.as_ref().filter(|v| v.is_object()) else {
@@ -1820,7 +1948,11 @@ fn handle_opencode(raw: &[u8]) -> Value {
     if event_name_normalized(event) != "pretooluse" {
         return json!({});
     }
-    let denial = opencode_secret_denial(event);
+    let root = match resolve_secret_root(as_str(get(event, "cwd"))) {
+        Ok(root) => root,
+        Err(()) => return opencode_deny_reply(SYMLINK_BLOCK_REASON),
+    };
+    let denial = opencode_secret_denial(event, root.as_deref());
     if !denial.is_empty() {
         return opencode_deny_reply(&denial);
     }
@@ -1839,7 +1971,10 @@ fn handle_omp(raw: &[u8]) -> Value {
             "Hook warning: {problem} — consent could not be evaluated"
         ));
     };
-    let root = resolve_optional_root(as_str(get(event, "cwd")));
+    let root = match resolve_secret_root(as_str(get(event, "cwd"))) {
+        Ok(root) => root,
+        Err(()) => return omp_block_reply(SYMLINK_BLOCK_REASON),
+    };
     let prompt = as_str(py_or(
         get(event, "lastPrompt"),
         py_or(get(event, "last_prompt"), get(event, "prompt")),
@@ -1857,6 +1992,10 @@ fn handle_omp(raw: &[u8]) -> Value {
             "Hook warning: session-id-invalid — consent could not be evaluated",
         );
     }
+    let canonical_root = root
+        .as_ref()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .filter(|d| d.is_dir());
     let inp = get(event, "input")
         .and_then(Value::as_object)
         .or_else(|| get(event, "tool_input").and_then(Value::as_object));
@@ -1870,10 +2009,15 @@ fn handle_omp(raw: &[u8]) -> Value {
             let sub_norm = normalize_secret_candidate(sub);
             let raw_secret = !command_token_denied(&sub_norm).is_empty();
             let resolved_loose = resolve_candidate_against_root(&sub_norm, root.as_deref());
+            if matches!(resolved_loose, Some(Err(()))) {
+                return omp_block_reply(SYMLINK_BLOCK_REASON);
+            }
             let resolved_secret = resolved_loose
                 .as_ref()
+                .and_then(|res| res.as_ref().ok())
                 .is_some_and(|p| !secret_path_denied(&p.to_string_lossy()).is_empty());
             let canonical = resolved_loose
+                .and_then(Result::ok)
                 .and_then(|p| std::fs::canonicalize(p).ok())
                 .filter(|d| d.is_dir());
             let uncanonicalizable = canonical.is_none();
@@ -1883,7 +2027,7 @@ fn handle_omp(raw: &[u8]) -> Value {
             let root_secret = root
                 .as_ref()
                 .is_some_and(|p| !secret_path_denied(&p.to_string_lossy()).is_empty());
-            (root.clone(), root_secret, false)
+            (canonical_root.clone(), root_secret, false)
         }
     };
     if !shell_cwd_is_secret {
@@ -1914,7 +2058,7 @@ fn handle_omp(raw: &[u8]) -> Value {
     }
     read_guard_reply(
         "omp",
-        read_guard("omp", event, session_id, root.as_deref()),
+        read_guard("omp", event, session_id, canonical_root.as_deref()),
     )
 }
 
@@ -4118,5 +4262,130 @@ mod tests {
         let _rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("1"))]);
         let deferred = ev("run_terminal_command", json!({"command": "git status"}));
         assert_eq!(json!({}), run_hook("grok", deferred.to_string().as_bytes()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_secret_guard_resolves_symlinks_loops_and_secret_cwd() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new("opencode_secret_guard");
+        let work = tmp.0.join("work");
+        let ssh_dir = tmp.0.join(".ssh");
+        let ssh_sub = ssh_dir.join("sub");
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&ssh_sub).unwrap();
+        fs::write(tmp.0.join(".env"), "SECRET=1\n").unwrap();
+        fs::write(ssh_dir.join("config"), "Host *\n").unwrap();
+        fs::write(work.join("README.md"), "ok\n").unwrap();
+
+        symlink(tmp.0.join(".env"), work.join("leak.txt")).unwrap();
+        symlink(&ssh_dir, work.join("ssh-link")).unwrap();
+        symlink(&ssh_sub, work.join("sub-link")).unwrap();
+        symlink(tmp.0.join(".env.local"), work.join("dangling.txt")).unwrap();
+        for i in (0..=9).rev() {
+            let next = if i == 9 {
+                ssh_dir.join("authorized_keys")
+            } else {
+                work.join(format!("d{}", i + 1))
+            };
+            symlink(next, work.join(format!("d{i}"))).unwrap();
+        }
+        symlink(work.join("loop-b"), work.join("loop-a")).unwrap();
+        symlink(work.join("loop-a"), work.join("loop-b")).unwrap();
+        for i in (0..=41).rev() {
+            let next = if i == 41 {
+                work.join("README.md")
+            } else {
+                work.join(format!("b{}", i + 1))
+            };
+            symlink(next, work.join(format!("b{i}"))).unwrap();
+        }
+        let missing_ssh = tmp.0.join("missing").join(".ssh");
+        symlink(&missing_ssh, work.join("dangling-ssh")).unwrap();
+
+        let call = |cwd: &Path, tool: &str, input: Value| {
+            let ev = json!({
+                "event_name": "PreToolUse",
+                "tool_name": tool,
+                "tool_input": input,
+                "cwd": cwd.to_str().unwrap(),
+                "session_id": "sess-oc",
+            });
+            run_hook("opencode", ev.to_string().as_bytes())
+        };
+
+        for (tool, path) in [
+            ("read", "leak.txt"),
+            ("write", "ssh-link/new_key"),
+            ("read", "sub-link/../config"),
+            ("write", "sub-link/../authorized_keys"),
+            ("edit", "dangling.txt"),
+            ("write", "d0"),
+            ("read", "b0"),
+            ("write", "loop-a"),
+        ] {
+            let reply = call(&work, tool, json!({"paths": [path]}));
+            assert_eq!("deny", reply["decision"].as_str().unwrap_or(""), "{tool} {path}: {reply}");
+        }
+
+        assert_eq!(json!({}), call(&work, "read", json!({"paths": ["README.md"]})));
+
+        for input in [
+            json!({}),
+            json!({"paths": []}),
+            json!({"paths": ["", "   "]}),
+            json!({"paths": ["\"\""]}),
+        ] {
+            let reply = call(&ssh_dir, "glob", input.clone());
+            assert_eq!("deny", reply["decision"].as_str().unwrap_or(""), "{input}: {reply}");
+        }
+
+        for (cwd, tool, input) in [
+            (work.join("loop-a"), "read", json!({"paths": ["README.md"]})),
+            (work.join("loop-a"), "glob", json!({})),
+            (missing_ssh.clone(), "write", json!({"paths": ["authorized_keys2"]})),
+            (work.join("dangling-ssh"), "glob", json!({})),
+        ] {
+            let reply = call(&cwd, tool, input.clone());
+            assert_eq!(
+                "deny",
+                reply["decision"].as_str().unwrap_or(""),
+                "cwd={} tool={tool} input={input}: {reply}",
+                cwd.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omp_shell_cwd_blocks_symlink_loops_and_overlong_chains() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new("omp_shell_cwd_symlinks");
+        let work = tmp.0.join("work");
+        fs::create_dir_all(&work).unwrap();
+        symlink(work.join("loop-b"), work.join("loop-a")).unwrap();
+        symlink(work.join("loop-a"), work.join("loop-b")).unwrap();
+        for i in (0..=41).rev() {
+            let next = if i == 41 {
+                work.join("leaf")
+            } else {
+                work.join(format!("c{}", i + 1))
+            };
+            symlink(next, work.join(format!("c{i}"))).unwrap();
+        }
+        for bad_cwd in ["loop-a", "c0"] {
+            let ev = json!({
+                "toolName": "bash",
+                "input": {"command": "echo hi", "cwd": bad_cwd},
+                "cwd": work.to_str().unwrap(),
+                "sessionId": "sess-omp-sym",
+            });
+            let reply = run_hook("omp", ev.to_string().as_bytes());
+            assert_eq!(
+                Some(true),
+                reply["block"].as_bool(),
+                "omp shell cwd={bad_cwd} must fail closed: {reply}"
+            );
+        }
     }
 }

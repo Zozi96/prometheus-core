@@ -704,7 +704,8 @@ impl MetricsHome {
             .env_remove("FACTORY_DROID_SESSION_ID")
             .env_remove("MUSE_SESSION_ID")
             .env_remove("GROK_SESSION_ID")
-            .env_remove("ANTIGRAVITY_CONVERSATION_ID");
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+            .env_remove("OPENCODE_SESSION_ID");
         cmd
     }
 
@@ -2356,6 +2357,13 @@ fn metrics_records_inline_dump_denial_and_aggregates_new_hosts_and_rules() {
         &[("GROK_SESSION_ID", "grok-1")],
     );
     assert_eq!(grok_cmd.status.code(), Some(0));
+    let opencode_cmd = kit_stdin_env(
+        &home,
+        &["compact", "--no-spillover"],
+        b"squeeze\n",
+        &[("OPENCODE_SESSION_ID", "oc-1")],
+    );
+    assert_eq!(opencode_cmd.status.code(), Some(0));
 
     // Append synthetic omp + shell-denial row and confirm `prometheus-kit metrics` aggregates cleanly.
     use std::io::Write;
@@ -2376,6 +2384,7 @@ fn metrics_records_inline_dump_denial_and_aggregates_new_hosts_and_rules() {
     assert_eq!(parsed["by_host"]["antigravity"]["count"], 1);
     assert_eq!(parsed["by_host"]["grok"]["count"], 1);
     assert_eq!(parsed["by_host"]["omp"]["count"], 1);
+    assert_eq!(parsed["by_host"]["opencode"]["count"], 1);
 }
 
 #[test]

@@ -778,7 +778,7 @@ fn vstest_parse(line: &str) -> Option<(Verdict, DotnetValues, String)> {
 
 /// Normal/detailed VSTest reports run totals, omitting zero outcome fields.
 fn vstest_detailed_parse(lines: &[&str], known_failure: bool) -> Result<DotnetValues, &'static str> {
-    let success = match lines[0] {
+    let success = match lines[0].trim_matches([' ', '\t']) {
         "Test Run Successful." => true,
         "Test Run Failed." => false,
         _ => return Err("vstest-incomplete-run"),
@@ -788,8 +788,11 @@ fn vstest_detailed_parse(lines: &[&str], known_failure: bool) -> Result<DotnetVa
             .filter(|&value| value <= i64::MAX as i128)
             .ok_or("dotnet-not-a-count")
     };
-    let total = lines.get(1).and_then(|line| line.strip_prefix("Total tests:"))
-        .ok_or("dotnet-missing-field").and_then(count)?;
+    let total = lines
+        .get(1)
+        .and_then(|line| line.trim_start_matches([' ', '\t']).strip_prefix("Total tests:"))
+        .ok_or("dotnet-missing-field")
+        .and_then(count)?;
     let (mut passed, mut failed, mut skipped) = (None, None, None);
     for line in &lines[2..] {
         let line = line.trim_start_matches([' ', '\t']);
@@ -900,10 +903,25 @@ fn resolve_dotnet(
         }
         details.push((project, values));
     }
+    let mut detailed_values: Vec<DotnetValues> = Vec::new();
     for lines in vstest_detailed {
-        let values = vstest_detailed_parse(lines, known_failure)?;
-        if aggregate.replace(values).is_some() {
+        detailed_values.push(vstest_detailed_parse(lines, known_failure)?);
+    }
+    if detailed_values.len() == 1 {
+        if aggregate.replace(detailed_values.pop().unwrap()).is_some() {
             return Err("dotnet-duplicate-aggregate");
+        }
+    } else if detailed_values.len() > 1 {
+        if aggregate.is_some() || details.is_empty() || detailed_values.len() != details.len() {
+            return Err("dotnet-duplicate-aggregate");
+        }
+        let tuple = |v: &DotnetValues| (v.total, v.failed, v.succeeded, v.skipped);
+        let mut detailed_sorted: Vec<_> = detailed_values.iter().map(tuple).collect();
+        let mut details_sorted: Vec<_> = details.iter().map(|(_, v)| tuple(v)).collect();
+        detailed_sorted.sort_unstable();
+        details_sorted.sort_unstable();
+        if detailed_sorted != details_sorted {
+            return Err("dotnet-aggregate-disagrees");
         }
     }
     let mut counts = Counts::default();
@@ -1067,8 +1085,11 @@ fn parse_impl(text: &str, exit_code: Option<i64>) -> String {
         if vstest_candidate(line) {
             vstest_lines.push(line);
         }
-        if matches!(*line, "Test Run Successful." | "Test Run Failed." | "Test Run Aborted." | "Test Run Canceled.")
-            || line.starts_with("Test Run Aborted with error ")
+        let trimmed = line.trim_matches([' ', '\t']);
+        if matches!(
+            trimmed,
+            "Test Run Successful." | "Test Run Failed." | "Test Run Aborted." | "Test Run Canceled."
+        ) || trimmed.starts_with("Test Run Aborted with error ")
         {
             vstest_detailed.push(&lines[index..]);
         }
@@ -1123,6 +1144,14 @@ mod tests {
         assert_eq!(parse(DETAILED_PASS, 0)["counts"], expected);
         assert_eq!(parse(TERSE_PASS, 0)["counts"], expected);
         assert_eq!(parse(&format!("{TERSE_PASS}{DETAILED_PASS}"), 0)["counts"], expected);
+        let indented = "  Test Run Successful.\n  Total tests: 63\n     Passed: 63\n";
+        assert_eq!(parse(indented, 0)["counts"], expected);
+        let terse_b = "Passed! - Failed: 0, Passed: 12, Skipped: 0, Total: 12, Duration: 2 s - Other.dll\n";
+        let detailed_b = "Test Run Successful.\nTotal tests: 12\n     Passed: 12\n";
+        assert_eq!(
+            parse(&format!("{TERSE_PASS}{DETAILED_PASS}{terse_b}{detailed_b}"), 0)["counts"],
+            json!({"passed": 75, "failed": 0, "skipped": 0, "total": 75})
+        );
         let failed = "Test Run Failed.\nTotal tests: 5\n     Passed: 2\n     Failed: 1\n    Skipped: 2\n";
         assert_eq!(parse(failed, 1)["counts"], json!({"passed": 2, "failed": 1, "skipped": 2, "total": 5}));
         let skipped = "Test Run Successful.\nTotal tests: 2\n    Skipped: 2\n";
@@ -1131,6 +1160,8 @@ mod tests {
 
     #[test]
     fn vstest_detailed_rejects_ambiguous_or_invalid_summary() {
+        let terse_b = "Passed! - Failed: 0, Passed: 12, Skipped: 0, Total: 12, Duration: 2 s - Other.dll\n";
+        let wrong_b = "Test Run Successful.\nTotal tests: 1\n     Passed: 1\n";
         for (log, error) in [
             ("Total tests: 1\n     Passed: 1\n".into(), "no-summary"),
             ("Test Run Successful.\n".into(), "dotnet-missing-field"),
@@ -1142,6 +1173,7 @@ mod tests {
             (format!("{TERSE_PASS}Test Run Aborted.\nTotal tests: Unknown\n"), "vstest-incomplete-run"),
             (format!("{DETAILED_PASS}{DETAILED_PASS}"), "dotnet-duplicate-aggregate"),
             (format!("{TERSE_PASS}Test Run Successful.\nTotal tests: 1\n     Passed: 1\n"), "dotnet-aggregate-disagrees"),
+            (format!("{TERSE_PASS}{DETAILED_PASS}{terse_b}{wrong_b}"), "dotnet-aggregate-disagrees"),
         ] {
             let parsed = parse(&log, 0);
             assert!(parsed["counts"].is_null(), "{parsed}: {log}");

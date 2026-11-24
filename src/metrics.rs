@@ -63,6 +63,7 @@ pub fn command_host() -> Host {
         ("FACTORY_DROID_SESSION_ID", Host::Droid),
         ("GROK_SESSION_ID", Host::Grok),
         ("MUSE_SESSION_ID", Host::Muse),
+        ("OPENCODE_SESSION_ID", Host::Opencode),
     ] {
         if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
             match found {
