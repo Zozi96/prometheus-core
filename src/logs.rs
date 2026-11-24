@@ -776,9 +776,53 @@ fn vstest_parse(line: &str) -> Option<(Verdict, DotnetValues, String)> {
     ))
 }
 
+/// Normal/detailed VSTest reports run totals, omitting zero outcome fields.
+fn vstest_detailed_parse(lines: &[&str], known_failure: bool) -> Result<DotnetValues, &'static str> {
+    let success = match lines[0] {
+        "Test Run Successful." => true,
+        "Test Run Failed." => false,
+        _ => return Err("vstest-incomplete-run"),
+    };
+    let count = |raw: &str| {
+        is_count(raw.trim())
+            .filter(|&value| value <= i64::MAX as i128)
+            .ok_or("dotnet-not-a-count")
+    };
+    let total = lines.get(1).and_then(|line| line.strip_prefix("Total tests:"))
+        .ok_or("dotnet-missing-field").and_then(count)?;
+    let (mut passed, mut failed, mut skipped) = (None, None, None);
+    for line in &lines[2..] {
+        let line = line.trim_start_matches([' ', '\t']);
+        let (field, raw) = if let Some(raw) = line.strip_prefix("Passed:") {
+            (&mut passed, raw)
+        } else if let Some(raw) = line.strip_prefix("Failed:") {
+            (&mut failed, raw)
+        } else if let Some(raw) = line.strip_prefix("Skipped:") {
+            (&mut skipped, raw)
+        } else {
+            break;
+        };
+        if field.replace(count(raw)?).is_some() {
+            return Err("dotnet-duplicate-field");
+        }
+    }
+    let (succeeded, failed, skipped) = (passed.unwrap_or(0), failed.unwrap_or(0), skipped.unwrap_or(0));
+    if failed + succeeded + skipped != total {
+        return Err("dotnet-counts-mismatch");
+    }
+    if success && failed != 0 {
+        return Err("vstest-passed-contradiction");
+    }
+    if !success && failed == 0 && !known_failure {
+        return Err("vstest-failed-contradiction");
+    }
+    Ok(DotnetValues { total, failed, succeeded, skipped })
+}
+
 fn resolve_dotnet(
     blocks: &[MtpBlock],
     vstest_lines: &[&str],
+    vstest_detailed: &[&[&str]],
     known_failure: bool,
 ) -> Result<(Counts, bool), &'static str> {
     let mut details: Vec<(String, DotnetValues)> = Vec::new();
@@ -855,6 +899,12 @@ fn resolve_dotnet(
             return Err("dotnet-failed-contradiction");
         }
         details.push((project, values));
+    }
+    for lines in vstest_detailed {
+        let values = vstest_detailed_parse(lines, known_failure)?;
+        if aggregate.replace(values).is_some() {
+            return Err("dotnet-duplicate-aggregate");
+        }
     }
     let mut counts = Counts::default();
     let mut found = false;
@@ -972,6 +1022,7 @@ fn parse_impl(text: &str, exit_code: Option<i64>) -> String {
     let mut blocks: Vec<MtpBlock> = Vec::new();
     let mut collecting: Option<usize> = None;
     let mut vstest_lines: Vec<&str> = Vec::new();
+    let mut vstest_detailed = Vec::new();
 
     for (index, line) in lines.iter().enumerate() {
         // An open MTP block consumes field, assembly, and blank lines; any
@@ -1016,12 +1067,17 @@ fn parse_impl(text: &str, exit_code: Option<i64>) -> String {
         if vstest_candidate(line) {
             vstest_lines.push(line);
         }
+        if matches!(*line, "Test Run Successful." | "Test Run Failed." | "Test Run Aborted." | "Test Run Canceled.")
+            || line.starts_with("Test Run Aborted with error ")
+        {
+            vstest_detailed.push(&lines[index..]);
+        }
     }
 
     let (counts, error) = match resolve_unittest(&rans, &ends, &no_tests_ran) {
         Err(code) => (None, Some(code)),
         Ok((unittest, unittest_found)) => {
-            match resolve_dotnet(&blocks, &vstest_lines, known_failure) {
+            match resolve_dotnet(&blocks, &vstest_lines, &vstest_detailed, known_failure) {
                 Err(code) => (None, Some(code)),
                 Ok((dotnet, dotnet_found)) => {
                     if unittest_found || pytest_found || cargo_found || dotnet_found {
@@ -1046,5 +1102,50 @@ pub fn parse_document(text: &str, exit_code: Option<i64>) -> String {
     match std::panic::catch_unwind(|| parse_impl(text, exit_code)) {
         Ok(document) => document,
         Err(_) => receipt_json(None, Some("no-summary"), &[], &[]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_document;
+    use serde_json::{json, Value};
+
+    const DETAILED_PASS: &str = "Test Run Successful.\nTotal tests: 63\n     Passed: 63\n Total time: 19.6319 Seconds\n";
+    const TERSE_PASS: &str = "Passed! - Failed: 0, Passed: 63, Skipped: 0, Total: 63, Duration: 19 s - Sample.dll\n";
+
+    fn parse(log: &str, exit: i64) -> Value {
+        serde_json::from_str(&parse_document(log, Some(exit))).unwrap()
+    }
+
+    #[test]
+    fn vstest_detailed_counts() {
+        let expected = json!({"passed": 63, "failed": 0, "skipped": 0, "total": 63});
+        assert_eq!(parse(DETAILED_PASS, 0)["counts"], expected);
+        assert_eq!(parse(TERSE_PASS, 0)["counts"], expected);
+        assert_eq!(parse(&format!("{TERSE_PASS}{DETAILED_PASS}"), 0)["counts"], expected);
+        let failed = "Test Run Failed.\nTotal tests: 5\n     Passed: 2\n     Failed: 1\n    Skipped: 2\n";
+        assert_eq!(parse(failed, 1)["counts"], json!({"passed": 2, "failed": 1, "skipped": 2, "total": 5}));
+        let skipped = "Test Run Successful.\nTotal tests: 2\n    Skipped: 2\n";
+        assert_eq!(parse(skipped, 0)["counts"], json!({"passed": 0, "failed": 0, "skipped": 2, "total": 2}));
+    }
+
+    #[test]
+    fn vstest_detailed_rejects_ambiguous_or_invalid_summary() {
+        for (log, error) in [
+            ("Total tests: 1\n     Passed: 1\n".into(), "no-summary"),
+            ("Test Run Successful.\n".into(), "dotnet-missing-field"),
+            ("Test Run Successful.\nTotal tests: 1\n".into(), "dotnet-counts-mismatch"),
+            ("Test Run Successful.\nTotal tests: 2\n     Passed: 1\n     Passed: 1\n".into(), "dotnet-duplicate-field"),
+            ("Test Run Successful.\nTotal tests: 1\n     Passed: 1 junk\n".into(), "dotnet-not-a-count"),
+            ("Test Run Successful.\nTotal tests: 1\n     Failed: 1\n".into(), "vstest-passed-contradiction"),
+            ("Test Run Failed.\nTotal tests: 1\n     Passed: 1\n".into(), "vstest-failed-contradiction"),
+            (format!("{TERSE_PASS}Test Run Aborted.\nTotal tests: Unknown\n"), "vstest-incomplete-run"),
+            (format!("{DETAILED_PASS}{DETAILED_PASS}"), "dotnet-duplicate-aggregate"),
+            (format!("{TERSE_PASS}Test Run Successful.\nTotal tests: 1\n     Passed: 1\n"), "dotnet-aggregate-disagrees"),
+        ] {
+            let parsed = parse(&log, 0);
+            assert!(parsed["counts"].is_null(), "{parsed}: {log}");
+            assert_eq!(parsed["error"], error, "{log}");
+        }
     }
 }
