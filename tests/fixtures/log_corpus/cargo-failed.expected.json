@@ -1,0 +1,18 @@
+{
+  "exit": 1,
+  "counts": {
+    "passed": 1,
+    "failed": 2,
+    "skipped": 0,
+    "total": 3
+  },
+  "error": null,
+  "failing_lines": [
+    "failures:",
+    "failures:"
+  ],
+  "failed_tests": [
+    "cargo test -- --exact tests::test_sub",
+    "cargo test -- --exact net::probe::test_connect"
+  ]
+}

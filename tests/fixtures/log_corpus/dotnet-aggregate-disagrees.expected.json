@@ -1,0 +1,7 @@
+{
+  "exit": 0,
+  "counts": null,
+  "error": "dotnet-aggregate-disagrees",
+  "failing_lines": [],
+  "failed_tests": []
+}

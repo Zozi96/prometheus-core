@@ -1,5 +1,6 @@
 //! Exact line-range and structural symbol/path slicing with token budgets.
 
+use crate::budget::{self, KeepPolicy};
 use crate::outline::lexer::LineIndex;
 use crate::outline::structured::{
     resolve_computed_selector, resolve_structured_selector, split_computed_selector,
@@ -650,29 +651,13 @@ fn execute_slice_items(items: &[Result<SliceSpec, SliceError>], opts: &SliceOpti
         }
     }
 
+    // Format-independent lower bound: every kept line emits at least
+    // `text.len() + 1` bytes in both text and JSON, so pre-trimming
+    // against this bound never discards a line that could have fit in
+    // either format while still bounding work/memory to O(budget).
     let unlimited = opts.max_tokens == 0;
-    let total_budget_chars = if unlimited {
-        usize::MAX
-    } else {
-        opts.max_tokens.saturating_mul(4)
-    };
-    let error_bytes: usize = if errors.is_empty() {
-        0
-    } else {
-        1 + errors.iter().map(|e| e.message.len() + 8).sum::<usize>()
-    };
-    let err_reserve = if unlimited || errors.is_empty() {
-        0
-    } else {
-        error_bytes.min(total_budget_chars / 3)
-    };
-    let budget_chars = if unlimited {
-        usize::MAX
-    } else {
-        total_budget_chars.saturating_sub(err_reserve)
-    };
-    const RESERVE: usize = 96;
-    let mut used = 0usize;
+    let budget_chars = budget::byte_budget_or_max(opts.max_tokens);
+    let mut min_bytes = 0usize;
     let mut kept = Vec::new();
     let mut omitted_slices = 0usize;
     let mut omitted_lines = 0usize;
@@ -711,14 +696,12 @@ fn execute_slice_items(items: &[Result<SliceSpec, SliceError>], opts: &SliceOpti
                 omitted_lines += line_total;
                 continue;
             }
-            let header_cost = entry.display.len() + 32;
-            if !unlimited && !kept.is_empty() && used + header_cost + RESERVE > budget_chars {
+            if !unlimited && !kept.is_empty() && min_bytes >= budget_chars {
                 truncated = true;
                 omitted_slices += 1;
                 omitted_lines += line_total;
                 continue;
             }
-            used += header_cost;
 
             let mut block_lines = Vec::new();
             if opts.signatures_only {
@@ -732,10 +715,12 @@ fn execute_slice_items(items: &[Result<SliceSpec, SliceError>], opts: &SliceOpti
                         (raw_line.to_owned(), false)
                     }
                 };
-                if !unlimited && used + text.len() + 10 + RESERVE > budget_chars {
+                let min_cost = text.len() + 1;
+                if !unlimited && min_bytes + min_cost > budget_chars {
                     if kept.is_empty() {
-                        let avail = budget_chars.saturating_sub(used + RESERVE + 10);
+                        let avail = budget_chars.saturating_sub(min_bytes + 1);
                         let (clipped, _) = clip_line_to_chars(&text, avail.max(24));
+                        min_bytes += clipped.len() + 1;
                         text = clipped;
                         line_trunc = true;
                         truncated = true;
@@ -751,7 +736,7 @@ fn execute_slice_items(items: &[Result<SliceSpec, SliceError>], opts: &SliceOpti
                         continue;
                     }
                 } else {
-                    used += text.len() + 10;
+                    min_bytes += min_cost;
                     block_lines.push(SliceLine {
                         line: iv.start,
                         text,
@@ -766,11 +751,12 @@ fn execute_slice_items(items: &[Result<SliceSpec, SliceError>], opts: &SliceOpti
                     } else {
                         (raw_line.to_owned(), false)
                     };
-                    let cost = text.len() + 10;
-                    if !unlimited && used + cost + RESERVE > budget_chars {
+                    let min_cost = text.len() + 1;
+                    if !unlimited && min_bytes + min_cost > budget_chars {
                         if block_lines.is_empty() && kept.is_empty() {
-                            let avail = budget_chars.saturating_sub(used + RESERVE + 10);
+                            let avail = budget_chars.saturating_sub(min_bytes + 1);
                             let (clipped, _) = clip_line_to_chars(&text, avail.max(24));
+                            min_bytes += clipped.len() + 1;
                             text = clipped;
                             line_trunc = true;
                             block_lines.push(SliceLine {
@@ -786,7 +772,7 @@ fn execute_slice_items(items: &[Result<SliceSpec, SliceError>], opts: &SliceOpti
                         }
                         break;
                     }
-                    used += cost;
+                    min_bytes += min_cost;
                     block_lines.push(SliceLine {
                         line: ln,
                         text,
@@ -820,28 +806,41 @@ fn execute_slice_items(items: &[Result<SliceSpec, SliceError>], opts: &SliceOpti
             omitted_lines += computed.lines.len();
             continue;
         }
-        let header_cost = display.len() + 32;
-        if !unlimited && !kept.is_empty() && used + header_cost + RESERVE > budget_chars {
+        if !unlimited && !kept.is_empty() && min_bytes >= budget_chars {
             truncated = true;
             omitted_slices += 1;
             omitted_lines += computed.lines.len();
             continue;
         }
-        used += header_cost;
         let mut block_lines = Vec::new();
         for (i, text) in computed.lines.iter().enumerate() {
-            let (text, line_trunc) = if opts.truncate_long_lines {
+            let (mut text, mut line_trunc) = if opts.truncate_long_lines {
                 truncate_long_line(text)
             } else {
                 (text.clone(), false)
             };
-            let cost = text.len() + 10;
-            if !unlimited && used + cost + RESERVE > budget_chars {
-                truncated = true;
-                omitted_lines += computed.lines.len() - i;
+            let min_cost = text.len() + 1;
+            if !unlimited && min_bytes + min_cost > budget_chars {
+                if block_lines.is_empty() && kept.is_empty() {
+                    let avail = budget_chars.saturating_sub(min_bytes + 1);
+                    let (clipped, _) = clip_line_to_chars(&text, avail.max(24));
+                    min_bytes += clipped.len() + 1;
+                    text = clipped;
+                    line_trunc = true;
+                    block_lines.push(SliceLine {
+                        line: 0,
+                        text,
+                        truncated: line_trunc,
+                    });
+                    truncated = true;
+                    omitted_lines += computed.lines.len() - i - 1;
+                } else {
+                    truncated = true;
+                    omitted_lines += computed.lines.len() - i;
+                }
                 break;
             }
-            used += cost;
+            min_bytes += min_cost;
             block_lines.push(SliceLine {
                 line: 0,
                 text,
@@ -875,7 +874,64 @@ fn execute_slice_items(items: &[Result<SliceSpec, SliceError>], opts: &SliceOpti
     }
 }
 
+/// `slice`'s Keep policy is **head**: one give-up drops the last line of
+/// the last slice (while it shows more than one), then the last slice.
+fn slice_trim_step(res: &mut SliceResult) -> bool {
+    if let Some(last) = res.slices.last_mut() {
+        if last.lines.len() > 1 {
+            last.lines.pop();
+            res.truncated = true;
+            res.omitted_lines += 1;
+            return true;
+        }
+    }
+    if let Some(dropped) = res.slices.pop() {
+        res.truncated = true;
+        res.omitted_slices += 1;
+        res.omitted_lines += dropped.lines.len();
+        return true;
+    }
+    false
+}
+
+/// The `slice` truncation notice for a (possibly trimmed) result,
+/// without its trailing newline. Wording is unchanged.
+fn slice_notice(res: &SliceResult) -> String {
+    format!(
+        "... (+{} omitted lines across {} additional slices; narrow range or pass --max-tokens)",
+        res.omitted_lines, res.omitted_slices
+    )
+}
+
 pub fn render_slice_text(result: &SliceResult, opts: &SliceOptions) -> String {
+    let messages: Vec<String> = result.errors.iter().map(|e| e.message.clone()).collect();
+    let render_with_errors = |s: &SliceResult| {
+        let mut out = render_slice_text_inner(s, opts);
+        budget::append_error_lines(&mut out, &messages, opts.max_tokens, |msg, avail| {
+            clip_line_to_chars(msg, avail).0
+        });
+        out
+    };
+    if opts.max_tokens == 0 {
+        return render_with_errors(result);
+    }
+    let mut trimmed = result.clone();
+    budget::trim_structured(
+        &mut trimmed,
+        opts.max_tokens,
+        render_with_errors,
+        slice_trim_step,
+    );
+    let out = render_with_errors(&trimmed);
+    let notice = if trimmed.truncated {
+        slice_notice(&trimmed)
+    } else {
+        String::new()
+    };
+    budget::finish_text(out, opts.max_tokens, KeepPolicy::Head, &notice)
+}
+
+fn render_slice_text_inner(result: &SliceResult, opts: &SliceOptions) -> String {
     let mut out = String::new();
     for w in &result.warnings {
         out.push_str(&format!("warning: {w}\n"));
@@ -925,88 +981,19 @@ pub fn render_slice_text(result: &SliceResult, opts: &SliceOptions) -> String {
         }
     }
     if result.truncated {
-        out.push_str(&format!(
-            "... (+{} omitted lines across {} additional slices; narrow range or pass --max-tokens)\n",
-            result.omitted_lines, result.omitted_slices
-        ));
-    }
-    if !result.errors.is_empty() {
-        let budget_chars = if opts.max_tokens == 0 {
-            usize::MAX
-        } else {
-            opts.max_tokens.saturating_mul(4)
-        };
-        if !out.is_empty() && (budget_chars == usize::MAX || out.len() + 1 < budget_chars) {
-            out.push('\n');
-        }
-        const ERR_TAIL_RESERVE: usize = 36;
-        let mut emitted_errors = 0usize;
-        for (idx, err) in result.errors.iter().enumerate() {
-            let line = format!("error: {}\n", err.message);
-            let remaining_after = result.errors.len() - idx - 1;
-            let reserve = if remaining_after > 0 { ERR_TAIL_RESERVE } else { 0 };
-            if budget_chars != usize::MAX && out.len() + line.len() + reserve > budget_chars {
-                if emitted_errors == 0 && out.len() + 16 < budget_chars {
-                    let avail = budget_chars.saturating_sub(out.len() + 8 + reserve);
-                    let (clipped, _) = clip_line_to_chars(&err.message, avail.max(16));
-                    out.push_str(&format!("error: {clipped}\n"));
-                    emitted_errors += 1;
-                }
-                let omitted = result.errors.len().saturating_sub(emitted_errors);
-                if omitted > 0 {
-                    out.push_str(&format!("... (+{omitted} omitted errors)\n"));
-                }
-                break;
-            }
-            out.push_str(&line);
-            emitted_errors += 1;
-        }
+        out.push_str(&slice_notice(result));
+        out.push('\n');
     }
     out
 }
 
-fn cap_slice_errors_for_json(errors: &[SliceError], max_bytes: usize) -> (Vec<SliceError>, bool) {
-    if errors.is_empty() {
-        return (Vec::new(), false);
-    }
-    let full = serde_json::to_string(errors).unwrap_or_default();
-    if full.len() <= max_bytes {
-        return (errors.to_vec(), false);
-    }
-    let mut kept = Vec::new();
-    for (idx, err) in errors.iter().enumerate() {
-        let omitted = errors.len() - idx - 1;
-        let mut candidate = kept.clone();
-        candidate.push(err.clone());
-        if omitted > 0 {
-            candidate.push(SliceError {
-                spec: "...".to_owned(),
-                message: format!("... (+{omitted} omitted errors)"),
-            });
-        }
-        if serde_json::to_string(&candidate).unwrap_or_default().len() <= max_bytes {
-            kept.push(err.clone());
-        } else {
-            break;
-        }
-    }
-    let omitted = errors.len() - kept.len();
-    if omitted > 0 {
-        let summary = SliceError {
-            spec: "...".to_owned(),
-            message: format!("... (+{omitted} omitted errors)"),
-        };
-        kept.push(summary);
-    }
-    while serde_json::to_string(&kept).unwrap_or_default().len() > max_bytes && kept.len() > 1 {
-        kept.pop();
-        let omitted_now = errors.len().saturating_sub(kept.len().saturating_sub(1));
-        if let Some(last) = kept.last_mut() {
-            last.spec = "...".to_owned();
-            last.message = format!("... (+{omitted_now} omitted errors)");
-        }
-    }
-    (kept, true)
+/// The one shared JSON error-list cap (budget module), instantiated
+/// for slice errors.
+fn cap_slice_errors(errors: &[SliceError], max_bytes: usize) -> (Vec<SliceError>, bool) {
+    budget::cap_error_list(errors, max_bytes, |omitted| SliceError {
+        spec: "...".to_owned(),
+        message: format!("... (+{omitted} omitted errors)"),
+    })
 }
 
 pub fn render_slice_json(result: &SliceResult, max_tokens: usize) -> String {
@@ -1014,7 +1001,7 @@ pub fn render_slice_json(result: &SliceResult, max_tokens: usize) -> String {
     if max_tokens == 0 {
         return encoded;
     }
-    let budget_chars = max_tokens.saturating_mul(4);
+    let budget_chars = budget::byte_budget_or_max(max_tokens);
     if encoded.len() <= budget_chars {
         return encoded;
     }
@@ -1026,50 +1013,55 @@ pub fn render_slice_json(result: &SliceResult, max_tokens: usize) -> String {
         } else {
             (budget_chars / 2).max(96)
         };
-        let (capped, dropped) = cap_slice_errors_for_json(&trimmed.errors, err_budget);
+        let (capped, dropped) = cap_slice_errors(&trimmed.errors, err_budget);
         if dropped {
             trimmed.errors = capped;
             trimmed.truncated = true;
         }
     }
-    // Trim trailing lines/slices until compact JSON fits within `budget_chars`.
-    loop {
-        let cur = serde_json::to_string(&trimmed).unwrap_or_else(|_| "{}".to_owned());
-        if cur.len() <= budget_chars {
-            return cur;
-        }
-        if let Some(last) = trimmed.slices.last_mut() {
-            if last.lines.len() > 1 {
-                last.lines.pop();
-                trimmed.truncated = true;
-                trimmed.omitted_lines += 1;
-                continue;
+    // Head policy, measured against the JSON document: trailing lines,
+    // then trailing slices, then the error list capped hard, then the
+    // last slice. The smallest valid document wins over the budget.
+    let original_errors = result.errors.clone();
+    budget::trim_structured(
+        &mut trimmed,
+        max_tokens,
+        |s| serde_json::to_string(s).unwrap_or_else(|_| "{}".to_owned()),
+        |s| {
+            if let Some(last) = s.slices.last_mut() {
+                if last.lines.len() > 1 {
+                    last.lines.pop();
+                    s.truncated = true;
+                    s.omitted_lines += 1;
+                    return true;
+                }
             }
-        }
-        if trimmed.slices.len() > 1 {
-            if let Some(dropped) = trimmed.slices.pop() {
-                trimmed.truncated = true;
-                trimmed.omitted_slices += 1;
-                trimmed.omitted_lines += dropped.lines.len();
-                continue;
+            if s.slices.len() > 1 {
+                if let Some(dropped) = s.slices.pop() {
+                    s.truncated = true;
+                    s.omitted_slices += 1;
+                    s.omitted_lines += dropped.lines.len();
+                    return true;
+                }
             }
-        }
-        if trimmed.errors.len() > 1 {
-            let (capped, _) = cap_slice_errors_for_json(&result.errors, 80);
-            if capped.len() < trimmed.errors.len() {
-                trimmed.errors = capped;
-                trimmed.truncated = true;
-                continue;
+            if s.errors.len() > 1 {
+                let (capped, _) = cap_slice_errors(&original_errors, 80);
+                if capped.len() < s.errors.len() {
+                    s.errors = capped;
+                    s.truncated = true;
+                    return true;
+                }
             }
-        }
-        if let Some(dropped) = trimmed.slices.pop() {
-            trimmed.truncated = true;
-            trimmed.omitted_slices += 1;
-            trimmed.omitted_lines += dropped.lines.len();
-            continue;
-        }
-        return cur;
-    }
+            if let Some(dropped) = s.slices.pop() {
+                s.truncated = true;
+                s.omitted_slices += 1;
+                s.omitted_lines += dropped.lines.len();
+                return true;
+            }
+            false
+        },
+    );
+    serde_json::to_string(&trimmed).unwrap_or_else(|_| "{}".to_owned())
 }
 
 #[cfg(test)]
@@ -1324,6 +1316,145 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
+    fn sample_slice_result() -> (SliceResult, (String, String, String, String, String)) {
+        let texts = (
+            format!("one {}", "x".repeat(36)),
+            format!("two {}", "y".repeat(36)),
+            format!("three {}", "z".repeat(34)),
+            format!("four {}", "w".repeat(35)),
+            format!("five {}", "v".repeat(35)),
+        );
+        let line = |n: usize, text: &String| SliceLine {
+            line: n,
+            text: text.clone(),
+            truncated: false,
+        };
+        let res = SliceResult {
+            slices: vec![
+                SliceBlock {
+                    path: "a.rs".to_owned(),
+                    label: None,
+                    start_line: 1,
+                    end_line: 3,
+                    signature: None,
+                    lines: vec![line(1, &texts.0), line(2, &texts.1), line(3, &texts.2)],
+                },
+                SliceBlock {
+                    path: "b.rs".to_owned(),
+                    label: None,
+                    start_line: 1,
+                    end_line: 2,
+                    signature: None,
+                    lines: vec![line(1, &texts.3), line(2, &texts.4)],
+                },
+            ],
+            truncated: false,
+            omitted_slices: 0,
+            omitted_lines: 0,
+            warnings: vec![],
+            errors: vec![],
+            raw_bytes: 0,
+            signature_clipped: false,
+            succeeded_specs: 2,
+        };
+        (res, texts)
+    }
+
+    // Exact-output budget-edge tests (#100).
+    #[test]
+    fn slice_text_budget_edge_exact_fit_one_token_less_and_below_notice() {
+        let (res, (t1, t2, t3, t4, t5)) = sample_slice_result();
+        let opts0 = SliceOptions::default();
+        let full = render_slice_text(&res, &opts0);
+        assert_eq!(
+            full,
+            format!(
+                "=== a.rs:L1-L3 ===\nL1: {t1}\nL2: {t2}\nL3: {t3}\n\
+                 \n=== b.rs:L1-L2 ===\nL1: {t4}\nL2: {t5}\n"
+            )
+        );
+        let exact = full.len().div_ceil(4);
+        let opts_exact = SliceOptions {
+            max_tokens: exact,
+            ..SliceOptions::default()
+        };
+        assert_eq!(render_slice_text(&res, &opts_exact), full);
+        // One token less: head is kept — all of a.rs — and the notice
+        // survives on its own line.
+        let opts_less = SliceOptions {
+            max_tokens: exact - 1,
+            ..SliceOptions::default()
+        };
+        let less = render_slice_text(&res, &opts_less);
+        assert_eq!(
+            less,
+            format!(
+                "=== a.rs:L1-L3 ===\nL1: {t1}\nL2: {t2}\nL3: {t3}\n\
+                 ... (+2 omitted lines across 1 additional slices; narrow range or pass --max-tokens)\n"
+            )
+        );
+        assert!(less.len() <= (exact - 1) * 4);
+        // Budget smaller than the notice: the notice alone.
+        let opts_tiny = SliceOptions {
+            max_tokens: 10,
+            ..SliceOptions::default()
+        };
+        assert_eq!(
+            render_slice_text(&res, &opts_tiny),
+            "... (+5 omitted lines across 2 additional slices; narrow range or pass --max-tokens)\n"
+        );
+    }
+
+    #[test]
+    fn slice_json_budget_edge_exact_fit_one_token_less_and_below_smallest_valid() {
+        let (res, _) = sample_slice_result();
+        let full = render_slice_json(&res, 0);
+        let exact = full.len().div_ceil(4);
+        assert_eq!(render_slice_json(&res, exact), full);
+        // One token less, measured against the JSON size: only the last
+        // line of the last slice is given up.
+        let less = render_slice_json(&res, exact - 1);
+        let parsed: serde_json::Value = serde_json::from_str(&less).unwrap();
+        assert!(less.len() <= (exact - 1) * 4);
+        assert_eq!(parsed["truncated"], serde_json::Value::Bool(true));
+        assert_eq!(parsed["omitted_lines"], serde_json::Value::from(1));
+        assert_eq!(parsed["slices"][1]["lines"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["slices"][0]["lines"].as_array().unwrap().len(), 3);
+        // Below the smallest valid document: validity wins.
+        let tiny = render_slice_json(&res, 1);
+        assert_eq!(
+            tiny,
+            "{\"slices\":[],\"truncated\":true,\"omitted_slices\":2,\"omitted_lines\":5,\"warnings\":[]}"
+        );
+        let _: serde_json::Value = serde_json::from_str(&tiny).unwrap();
+    }
+
+    #[test]
+    fn slice_json_error_list_is_capped_by_the_shared_routine() {
+        let (mut res, _) = sample_slice_result();
+        res.errors = (0..12)
+            .map(|i| SliceError {
+                spec: format!("spec-{i}"),
+                message: format!("missing file number {i} with a long explanation"),
+            })
+            .collect();
+        let json = render_slice_json(&res, 60);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let errors = parsed["errors"].as_array().unwrap();
+        assert!(
+            errors.len() < 12,
+            "error list must be capped: {}",
+            errors.len()
+        );
+        assert!(
+            errors.last().unwrap()["message"]
+                .as_str()
+                .unwrap()
+                .contains("omitted errors"),
+            "tail is the shared cap's summary entry: {errors:?}"
+        );
+    }
+
     #[test]
     fn rejects_binary_files_cleanly() {
         let p = temp_file("blob.bin", b"\x00\x01\x02\x03");
@@ -1372,6 +1503,70 @@ mod tests {
         let err = execute_slices(&bad_only, &SliceOptions::default()).unwrap_err();
         assert!(err.contains("A.B.Svc.Run"), "{err}");
         assert!(err.contains("missing.cs"), "{err}");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn execute_slices_does_not_pretrim_lines_that_fit_in_json_or_text() {
+        let src = (1..=6)
+            .map(|i| format!("let v{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let p = temp_file("fit.rs", src.as_bytes());
+        let missing = p.parent().unwrap().join("missing.rs");
+        let specs = vec![
+            parse_spec(&format!("{}:1-6", p.display())).unwrap(),
+            parse_spec(&format!("{}:1-2", missing.display())).unwrap(),
+        ];
+        let unbudgeted = execute_slices_partial(
+            &specs,
+            &SliceOptions {
+                max_tokens: 0,
+                ..SliceOptions::default()
+            },
+        );
+        let full_json = render_slice_json(&unbudgeted, 0);
+        let exact_json = full_json.len().div_ceil(4);
+        let budgeted_json_res = execute_slices_partial(
+            &specs,
+            &SliceOptions {
+                max_tokens: exact_json,
+                ..SliceOptions::default()
+            },
+        );
+        assert_eq!(
+            render_slice_json(&budgeted_json_res, exact_json),
+            full_json,
+            "JSON render must keep every line that fits exact_json ({exact_json} tok)"
+        );
+
+        let text_specs = vec![parse_spec(&format!("{}:1-6", p.display())).unwrap()];
+        let unbudgeted_text_res = execute_slices_partial(
+            &text_specs,
+            &SliceOptions {
+                max_tokens: 0,
+                ..SliceOptions::default()
+            },
+        );
+        let full_text = render_slice_text(
+            &unbudgeted_text_res,
+            &SliceOptions {
+                max_tokens: 0,
+                ..SliceOptions::default()
+            },
+        );
+        let exact_text = full_text.len().div_ceil(4);
+        let text_opts = SliceOptions {
+            max_tokens: exact_text,
+            ..SliceOptions::default()
+        };
+        let budgeted_text_res = execute_slices_partial(&text_specs, &text_opts);
+        assert_eq!(
+            render_slice_text(&budgeted_text_res, &text_opts),
+            full_text,
+            "text render must keep every line that fits exact_text ({exact_text} tok)"
+        );
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }

@@ -1,7 +1,8 @@
 //! Compact structural git status, diff, and commit summary (`prometheus-kit diff`).
 
+use crate::budget::{self, KeepPolicy};
 use crate::check::parse_status_z;
-use crate::kit_util::{clip_end, clip_to_byte_budget, is_noise_path};
+use crate::kit_util::{clip_end, is_noise_path};
 use crate::outline::{flatten_items, outline_source, read_text_file, Lang, OutlineItem, OutlineOptions};
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -203,7 +204,7 @@ fn run_status(repo_root: &Path, opts: &DiffOptions) -> Result<DiffOutput, String
         }
     }
 
-    let mut summary = StatusSummary {
+    let summary = StatusSummary {
         branch,
         staged,
         unstaged,
@@ -214,41 +215,28 @@ fn run_status(repo_root: &Path, opts: &DiffOptions) -> Result<DiffOutput, String
         omitted_entries: 0,
         raw_bytes: raw.len(),
     };
-    enforce_status_text_budget(&mut summary, opts.max_tokens);
     Ok(DiffOutput::Status(summary))
 }
 
-fn enforce_status_text_budget(s: &mut StatusSummary, max_tokens: usize) {
-    if max_tokens == 0 {
-        return;
-    }
-    let budget = max_tokens.saturating_mul(4);
-    loop {
-        let out = DiffOutput::Status(s.clone());
-        let txt = render_diff_text(&out, 0);
-        if txt.len() <= budget {
-            break;
-        }
-        if s.excluded_noise.len() > 1 {
-            s.excluded_noise.pop();
-            s.truncated = true;
-            s.omitted_entries += 1;
-        } else if !s.untracked.is_empty() {
-            s.untracked.pop();
-            s.truncated = true;
-            s.omitted_entries += 1;
-        } else if !s.unstaged.is_empty() {
-            s.unstaged.pop();
-            s.truncated = true;
-            s.omitted_entries += 1;
-        } else if !s.staged.is_empty() {
-            s.staged.pop();
-            s.truncated = true;
-            s.omitted_entries += 1;
-        } else {
-            break;
-        }
-    }
+/// `diff --status`'s Keep policy is **head**: one give-up drops the last
+/// entry of the least important list first (excluded noise, then
+/// untracked, unstaged, staged). Shared by the text and `--json` trims.
+fn status_trim_step(s: &mut StatusSummary) -> bool {
+    let list = if !s.excluded_noise.is_empty() {
+        &mut s.excluded_noise
+    } else if !s.untracked.is_empty() {
+        &mut s.untracked
+    } else if !s.unstaged.is_empty() {
+        &mut s.unstaged
+    } else if !s.staged.is_empty() {
+        &mut s.staged
+    } else {
+        return false;
+    };
+    list.pop();
+    s.truncated = true;
+    s.omitted_entries += 1;
+    true
 }
 
 fn strip_ab_prefix(s: &str) -> &str {
@@ -613,7 +601,7 @@ pub fn execute_diff(opts: &DiffOptions) -> Result<DiffOutput, String> {
     let total_added: usize = files.iter().map(|f| f.added).sum();
     let total_deleted: usize = files.iter().map(|f| f.deleted).sum();
 
-    let mut out = DiffOutput::Diff {
+    let out = DiffOutput::Diff {
         raw_bytes: raw_bytes.len(),
         filtered_output,
         commit_header,
@@ -625,7 +613,6 @@ pub fn execute_diff(opts: &DiffOptions) -> Result<DiffOutput, String> {
         truncated: false,
         omitted_files: 0,
     };
-    apply_diff_text_budget(&mut out, opts.max_tokens);
     Ok(out)
 }
 
@@ -693,23 +680,50 @@ fn trim_one_diff_step(out: &mut DiffOutput) -> bool {
     false
 }
 
-fn apply_diff_text_budget(out: &mut DiffOutput, max_tokens: usize) {
-    if max_tokens == 0 {
-        return;
-    }
-    let budget = max_tokens.saturating_mul(4);
-    loop {
-        let txt = render_diff_text(out, 0);
-        if txt.len() <= budget {
-            break;
-        }
-        if !trim_one_diff_step(out) {
-            break;
-        }
+/// One give-up of `diff`'s head Keep policy, shared by both formats.
+/// The give-up order is part of the policy: hunk lines first, then whole
+/// hunks, then symbols, then whole files from the end, then excluded
+/// noise and the commit header.
+fn diff_trim_step(out: &mut DiffOutput) -> bool {
+    match out {
+        DiffOutput::Status(s) => status_trim_step(s),
+        DiffOutput::Diff { .. } => trim_one_diff_step(out),
     }
 }
 
 pub fn render_diff_text(out: &DiffOutput, max_tokens: usize) -> String {
+    if max_tokens == 0 {
+        return render_diff_text_inner(out);
+    }
+    let mut trimmed = out.clone();
+    budget::trim_structured(
+        &mut trimmed,
+        max_tokens,
+        render_diff_text_inner,
+        diff_trim_step,
+    );
+    let notice = match &trimmed {
+        DiffOutput::Status(st) if st.truncated => {
+            format!("... (+{} omitted status entries; pass --max-tokens)", st.omitted_entries)
+        }
+        DiffOutput::Diff {
+            truncated: true,
+            omitted_files,
+            ..
+        } => format!(
+            "... (diff compacted to budget; {omitted_files} files omitted; narrow with paths/--symbol or --max-tokens)"
+        ),
+        _ => String::new(),
+    };
+    budget::finish_text(
+        render_diff_text_inner(&trimmed),
+        max_tokens,
+        KeepPolicy::Head,
+        &notice,
+    )
+}
+
+fn render_diff_text_inner(out: &DiffOutput) -> String {
     let mut s = String::new();
     match out {
         DiffOutput::Status(st) => {
@@ -720,7 +734,23 @@ pub fn render_diff_text(out: &DiffOutput, max_tokens: usize) -> String {
                 && st.unmerged.is_empty()
                 && st.excluded_noise.is_empty()
             {
-                s.push_str("working tree clean\n");
+                if st.truncated {
+                    // Every entry was given up to the budget: the
+                    // tree is NOT known clean — disclose the omission
+                    // instead of claiming a clean tree (Devin Review,
+                    // "False clean status for lockfile changes": the
+                    // trim can pop the last excluded-noise path, and
+                    // this renderer used to check only the displayed
+                    // lists). The omission line is also the notice
+                    // `render_diff_text` computes, so it survives even
+                    // though the trimmed render fits the budget.
+                    s.push_str(&format!(
+                        "... (+{} omitted status entries; pass --max-tokens)\n",
+                        st.omitted_entries
+                    ));
+                } else {
+                    s.push_str("working tree clean\n");
+                }
             } else {
                 if !st.unmerged.is_empty() {
                     s.push_str(&format!("unmerged ({}): {}\n", st.unmerged.len(), st.unmerged.join(", ")));
@@ -821,9 +851,6 @@ pub fn render_diff_text(out: &DiffOutput, max_tokens: usize) -> String {
             }
         }
     }
-    if max_tokens > 0 {
-        return clip_to_byte_budget(&s, max_tokens.saturating_mul(4));
-    }
     s
 }
 
@@ -831,43 +858,16 @@ pub fn render_diff_json(out: &DiffOutput, max_tokens: usize) -> String {
     if max_tokens == 0 {
         return serde_json::to_string(out).unwrap_or_else(|_| "{}".to_owned());
     }
-    let budget = max_tokens.saturating_mul(4);
+    // Same head policy as text, measured against the JSON document; the
+    // smallest valid document is returned even if it exceeds the budget.
     let mut trimmed = out.clone();
-    loop {
-        let encoded = serde_json::to_string(&trimmed).unwrap_or_else(|_| "{}".to_owned());
-        if encoded.len() <= budget {
-            return encoded;
-        }
-        match &mut trimmed {
-            DiffOutput::Status(st) => {
-                if !st.excluded_noise.is_empty() {
-                    st.excluded_noise.pop();
-                } else if !st.untracked.is_empty() {
-                    st.untracked.pop();
-                } else if !st.unstaged.is_empty() {
-                    st.unstaged.pop();
-                } else if !st.staged.is_empty() {
-                    st.staged.pop();
-                } else {
-                    return encoded;
-                }
-                st.truncated = true;
-                st.omitted_entries += 1;
-            }
-            DiffOutput::Diff { .. } => {
-                if !trim_one_diff_step(&mut trimmed) {
-                    if let DiffOutput::Diff { excluded_noise, truncated, .. } = &mut trimmed {
-                        if !excluded_noise.is_empty() {
-                            excluded_noise.pop();
-                            *truncated = true;
-                            continue;
-                        }
-                    }
-                    return encoded;
-                }
-            }
-        }
-    }
+    budget::trim_structured(
+        &mut trimmed,
+        max_tokens,
+        |s| serde_json::to_string(s).unwrap_or_else(|_| "{}".to_owned()),
+        diff_trim_step,
+    );
+    serde_json::to_string(&trimmed).unwrap_or_else(|_| "{}".to_owned())
 }
 
 #[cfg(test)]
@@ -908,6 +908,238 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn sample_diff() -> DiffOutput {
+        fn hunk(
+            header: &str,
+            start: usize,
+            count: usize,
+            symbols: Vec<String>,
+            lines: &[&str],
+        ) -> DiffHunk {
+            DiffHunk {
+                header: header.to_owned(),
+                new_start: start,
+                new_count: count,
+                symbols,
+                lines: lines.iter().map(|s| s.to_string()).collect(),
+                omitted_lines: 0,
+            }
+        }
+        DiffOutput::Diff {
+            raw_bytes: 0,
+            filtered_output: false,
+            commit_header: None,
+            files: vec![
+                DiffFile {
+                    path: "a.rs".to_owned(),
+                    status: "modified".to_owned(),
+                    added: 3,
+                    deleted: 1,
+                    symbols: vec!["Alpha".to_owned()],
+                    summary_note: None,
+                    hunks: vec![hunk(
+                        "@@ -1,3 +1,4 @@",
+                        1,
+                        4,
+                        vec!["Alpha".to_owned()],
+                        &[" ctx", " +one", " +two", " -old"],
+                    )],
+                },
+                DiffFile {
+                    path: "b.rs".to_owned(),
+                    status: "modified".to_owned(),
+                    added: 1,
+                    deleted: 0,
+                    symbols: vec![],
+                    summary_note: None,
+                    hunks: vec![hunk("@@ -5,1 +5,2 @@", 5, 2, vec![], &[" ctx", "+new"])],
+                },
+            ],
+            excluded_noise: vec![],
+            total_files: 2,
+            total_added: 4,
+            total_deleted: 1,
+            truncated: false,
+            omitted_files: 0,
+        }
+    }
+
+    // Exact-output budget-edge tests (#100).
+    #[test]
+    fn diff_text_budget_edge_exact_fit_one_token_less_and_below_notice() {
+        let out = sample_diff();
+        let full = render_diff_text(&out, 0);
+        assert_eq!(
+            full,
+            "summary: 2 files (+4/-1)\n  a.rs (modified, +3/-1) [Alpha]\n  b.rs (modified, +1/-0)\n\
+             \n--- a.rs ---\n@@ -1,3 +1,4 @@ [Alpha]\n ctx\n +one\n +two\n -old\n\
+             \n--- b.rs ---\n@@ -5,1 +5,2 @@\n ctx\n+new\n"
+        );
+        let exact = full.len().div_ceil(4);
+        assert_eq!(render_diff_text(&out, exact), full);
+        // One token less: the head-policy give-ups (hunk lines, hunks,
+        // symbols, in that order) leave both file lines and the notice.
+        let less = render_diff_text(&out, exact - 1);
+        assert_eq!(
+            less,
+            "summary: 2 files (+4/-1)\n  a.rs (modified, +3/-1)\n  b.rs (modified, +1/-0)\n\
+             ... (diff compacted to budget; 0 files omitted; narrow with paths/--symbol or --max-tokens)\n"
+        );
+        assert!(less.len() <= (exact - 1) * 4);
+        // Budget smaller than the notice: the notice alone.
+        let tiny = render_diff_text(&out, 10);
+        assert_eq!(
+            tiny,
+            "... (diff compacted to budget; 2 files omitted; narrow with paths/--symbol or --max-tokens)\n"
+        );
+    }
+
+    #[test]
+    fn diff_json_budget_edge_exact_fit_one_token_less_and_below_smallest_valid() {
+        let out = sample_diff();
+        let full = render_diff_json(&out, 0);
+        let exact = full.len().div_ceil(4);
+        assert_eq!(render_diff_json(&out, exact), full);
+        // One token less, measured against the JSON size: b.rs's hunk is
+        // the first give-up (its lines are already minimal).
+        let less = render_diff_json(&out, exact - 1);
+        let parsed: serde_json::Value = serde_json::from_str(&less).unwrap();
+        assert!(
+            less.len() <= (exact - 1) * 4,
+            "len {} vs budget {}",
+            less.len(),
+            (exact - 1) * 4
+        );
+        assert_eq!(parsed["truncated"], serde_json::Value::Bool(true));
+        assert_eq!(parsed["files"][1]["hunks"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            parsed["files"][1]["summary_note"],
+            serde_json::Value::String("[hunks omitted due to --max-tokens]".to_owned())
+        );
+        assert_eq!(parsed["files"][0]["hunks"].as_array().unwrap().len(), 1);
+        // Below the smallest valid document: validity wins.
+        let tiny = render_diff_json(&out, 1);
+        assert_eq!(
+            tiny,
+            "{\"kind\":\"diff\",\"files\":[],\"excluded_noise\":[],\"total_files\":2,\
+             \"total_added\":4,\"total_deleted\":1,\"truncated\":true,\"omitted_files\":2}"
+        );
+        let _: serde_json::Value = serde_json::from_str(&tiny).unwrap();
+    }
+
+    #[test]
+    fn diff_give_up_order_is_lines_then_hunks_then_symbols_then_files() {
+        let mut out = sample_diff();
+        // Give b.rs a fat hunk and a symbol so every stage is observable.
+        if let DiffOutput::Diff { files, .. } = &mut out {
+            files[1].symbols = vec!["Beta".to_owned()];
+            files[1].hunks[0].lines = vec![
+                " l1".to_owned(),
+                " l2".to_owned(),
+                " l3".to_owned(),
+                " l4".to_owned(),
+                " l5".to_owned(),
+            ];
+            files[1].hunks[0].symbols = vec!["Beta".to_owned()];
+        }
+        let files_of = |o: &DiffOutput| match o {
+            DiffOutput::Diff { files, .. } => files.clone(),
+            _ => unreachable!(),
+        };
+        // Stage 1: hunk lines drop one at a time.
+        assert!(trim_one_diff_step(&mut out));
+        let f = files_of(&out);
+        assert_eq!(f[1].hunks[0].lines.len(), 4);
+        assert_eq!(f[1].hunks[0].omitted_lines, 1);
+        assert_eq!(f[0].hunks[0].lines.len(), 4, "earlier file untouched");
+        while files_of(&out)[1].hunks[0].lines.len() > 2 {
+            assert!(trim_one_diff_step(&mut out));
+        }
+        // Stage 2: the hunk itself goes, replaced by the summary note.
+        assert!(trim_one_diff_step(&mut out));
+        let f = files_of(&out);
+        assert!(f[1].hunks.is_empty());
+        assert_eq!(
+            f[1].summary_note.as_deref(),
+            Some("[hunks omitted due to --max-tokens]")
+        );
+        assert_eq!(
+            f[1].symbols,
+            vec!["Beta".to_owned()],
+            "symbols survive the hunk stage"
+        );
+        // Stage 3: symbols go before the note and before any file.
+        assert!(trim_one_diff_step(&mut out));
+        let f = files_of(&out);
+        assert!(f[1].symbols.is_empty());
+        assert!(f[1].summary_note.is_some());
+        assert!(trim_one_diff_step(&mut out));
+        assert!(files_of(&out)[1].summary_note.is_none());
+        // Stage 4: only now do whole files drop, from the end — a.rs's
+        // stages run first because the step walks files in reverse.
+        let mut guard = 0;
+        loop {
+            let f = files_of(&out);
+            if f.len() < 2 {
+                break;
+            }
+            assert!(trim_one_diff_step(&mut out));
+            guard += 1;
+            assert!(guard < 40, "files must eventually drop");
+        }
+        let f = files_of(&out);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].path, "a.rs", "the last file drops first");
+    }
+
+    #[test]
+    fn status_with_only_a_long_lockfile_path_never_renders_clean() {
+        // Regression (Devin Review, "False clean status for lockfile
+        // changes"): the only change is an excluded-noise lockfile
+        // whose path alone exceeds the budget. The trim pops it, and
+        // the renderer must disclose the omission — never report a
+        // clean working tree.
+        let long_path = format!(
+            "nested/{}/Cargo.lock",
+            "very-long-directory-name/".repeat(5)
+        );
+        assert!(long_path.len() > 120, "{}", long_path.len());
+        let out = DiffOutput::Status(StatusSummary {
+            branch: "main".to_owned(),
+            staged: vec![],
+            unstaged: vec![],
+            untracked: vec![],
+            unmerged: vec![],
+            excluded_noise: vec![long_path],
+            truncated: false,
+            omitted_entries: 0,
+            raw_bytes: 0,
+        });
+        let text = render_diff_text(&out, 30);
+        assert!(
+            !text.contains("working tree clean"),
+            "must not claim clean: {text}"
+        );
+        assert!(
+            text.contains("omitted status entries"),
+            "must disclose the omission: {text}"
+        );
+        assert!(text.len() <= 30 * 4, "len {} vs budget", text.len());
+        // A genuinely clean status at the same budget still says so.
+        let clean = DiffOutput::Status(StatusSummary {
+            branch: "main".to_owned(),
+            staged: vec![],
+            unstaged: vec![],
+            untracked: vec![],
+            unmerged: vec![],
+            excluded_noise: vec![],
+            truncated: false,
+            omitted_entries: 0,
+            raw_bytes: 0,
+        });
+        assert!(render_diff_text(&clean, 30).contains("working tree clean"));
     }
 
     #[test]

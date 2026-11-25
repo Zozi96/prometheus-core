@@ -1,10 +1,9 @@
 //! Deterministic CLI, build, test, and log output compactor (`prometheus-kit compact`).
 
-use crate::check::{counts_of, Counts};
-use crate::kit_util::{
-    approx_tokens, clip_end, clip_to_byte_budget, strip_ansi_and_cr, write_spillover_log,
-};
-use crate::logs::parse_document;
+use crate::budget::{self, KeepPolicy};
+use crate::check::Counts;
+use crate::kit_util::{approx_tokens, clip_end, strip_ansi_and_cr, write_spillover_log};
+use crate::logs::parse_log;
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -518,19 +517,13 @@ pub fn compact_text(raw: &str, exit_code: Option<i32>, opts: &CompactOptions) ->
 
     let (test_counts, mut failing_lines) = if matches!(opts.mode, CompactMode::Auto | CompactMode::Test)
     {
-        let doc = parse_document(&normalized, exit_code.map(i64::from));
-        let counts = counts_of(&doc);
-        let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap_or(serde_json::Value::Null);
+        let parsed = parse_log(&normalized, exit_code.map(i64::from));
         let fl: Vec<String> = parsed
-            .get("failing_lines")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| clip_end(s.trim(), MAX_LINE_CHARS).0))
-                    .collect()
-            })
-            .unwrap_or_default();
-        (counts, fl)
+            .failing_lines
+            .iter()
+            .map(|line| clip_end(line.trim(), MAX_LINE_CHARS).0)
+            .collect();
+        (parsed.counts, fl)
     } else {
         (None, Vec::new())
     };
@@ -611,9 +604,9 @@ pub fn compact_text(raw: &str, exit_code: Option<i32>, opts: &CompactOptions) ->
         }
     }
 
-    // Apply budget to text view metadata cleanly
-    apply_compact_budget(&mut result, opts.max_tokens);
-    let final_text = render_compact_text_inner(&result, true);
+    // The stored result stays untrimmed; both renders apply the tail
+    // Keep policy through the budget module, measured per format.
+    let final_text = render_compact_text(&result, opts.max_tokens);
     result.out_tokens = approx_tokens(&final_text);
     result.saved_pct = if raw_tokens > 0 {
         ((1.0 - (result.out_tokens as f64 / raw_tokens as f64)) * 100.0).max(-999.9)
@@ -623,48 +616,53 @@ pub fn compact_text(raw: &str, exit_code: Option<i32>, opts: &CompactOptions) ->
     result
 }
 
-fn apply_compact_budget(res: &mut CompactResult, max_tokens: usize) {
-    if max_tokens == 0 {
-        return;
+/// `compact`'s Keep policy is **tail**, by the rule its text output has
+/// always followed: the oldest lines are dropped first, then failing
+/// lines from the end, then diagnostics from the end — but at least one
+/// diagnostic is always kept, its locations and message trimmed last.
+/// One give-up, shared by the text and `--json` trims so both formats
+/// keep the same parts of the same input.
+fn compact_trim_step(res: &mut CompactResult) -> bool {
+    if !res.lines.is_empty() {
+        res.lines.remove(0);
+        res.truncated = true;
+        res.omitted_items += 1;
+        return true;
     }
-    let budget_chars = max_tokens.saturating_mul(4);
-    loop {
-        let text = render_compact_text_inner(res, true);
-        if text.len() <= budget_chars {
-            break;
-        }
-        if !res.lines.is_empty() {
-            res.lines.remove(0);
-            res.truncated = true;
-            res.omitted_items += 1;
-            continue;
-        }
-        if !res.failing_lines.is_empty() {
-            res.failing_lines.pop();
-            res.truncated = true;
-            res.omitted_items += 1;
-            continue;
-        }
-        if res.diagnostics.len() > 1 {
-            res.diagnostics.pop();
-            res.truncated = true;
-            res.omitted_items += 1;
-            continue;
-        }
-        if let Some(first) = res.diagnostics.first_mut() {
-            if first.locations.len() > 1 {
-                first.locations.pop();
-                res.truncated = true;
-                continue;
-            }
-            if first.message.chars().count() > 40 {
-                first.message = clip_end(&first.message, 40).0;
-                res.truncated = true;
-                continue;
-            }
-        }
-        break;
+    if !res.failing_lines.is_empty() {
+        res.failing_lines.pop();
+        res.truncated = true;
+        res.omitted_items += 1;
+        return true;
     }
+    if res.diagnostics.len() > 1 {
+        res.diagnostics.pop();
+        res.truncated = true;
+        res.omitted_items += 1;
+        return true;
+    }
+    if let Some(first) = res.diagnostics.first_mut() {
+        if first.locations.len() > 1 {
+            first.locations.pop();
+            res.truncated = true;
+            return true;
+        }
+        if first.message.chars().count() > 40 {
+            first.message = clip_end(&first.message, 40).0;
+            res.truncated = true;
+            return true;
+        }
+    }
+    false
+}
+
+/// The `compact` truncation notice for a (possibly trimmed) result,
+/// without its trailing newline. Wording is unchanged.
+fn compact_notice(res: &CompactResult) -> String {
+    format!(
+        "... (+{} omitted lines/diagnostics; see full log or --max-tokens)",
+        res.omitted_items
+    )
 }
 
 fn render_compact_text_inner(res: &CompactResult, with_footer: bool) -> String {
@@ -696,10 +694,8 @@ fn render_compact_text_inner(res: &CompactResult, with_footer: bool) -> String {
         out.push('\n');
     }
     if res.truncated && res.omitted_items > 0 {
-        out.push_str(&format!(
-            "... (+{} omitted lines/diagnostics; see full log or --max-tokens)\n",
-            res.omitted_items
-        ));
+        out.push_str(&compact_notice(res));
+        out.push('\n');
     }
     if with_footer {
         let cur_tok = approx_tokens(&out);
@@ -722,44 +718,50 @@ fn render_compact_text_inner(res: &CompactResult, with_footer: bool) -> String {
 }
 
 pub fn render_compact_text(res: &CompactResult, max_tokens: usize) -> String {
-    let out = render_compact_text_inner(res, true);
-    if max_tokens > 0 {
-        return clip_to_byte_budget(&out, max_tokens.saturating_mul(4));
+    let Some(budget) = budget::tokens_to_bytes(max_tokens) else {
+        return render_compact_text_inner(res, true);
+    };
+    let mut trimmed = res.clone();
+    budget::trim_structured(
+        &mut trimmed,
+        max_tokens,
+        |s| render_compact_text_inner(s, true),
+        compact_trim_step,
+    );
+    let rendered = render_compact_text_inner(&trimmed, true);
+    if rendered.len() <= budget {
+        return rendered;
     }
-    out
+    // Structured trimming is exhausted (lines/failing_lines empty, at
+    // most one diagnostic left) and the output still exceeds the
+    // budget. Drop the savings footer first so metadata never crowds
+    // out the surviving diagnostic or header.
+    let rendered_no_footer = render_compact_text_inner(&trimmed, false);
+    if rendered_no_footer.len() <= budget {
+        return rendered_no_footer;
+    }
+    let notice = if trimmed.truncated && trimmed.omitted_items > 0 {
+        compact_notice(&trimmed)
+    } else {
+        "... (truncated; see full log or --max-tokens)".to_owned()
+    };
+    budget::finish_text(rendered_no_footer, max_tokens, KeepPolicy::Tail, &notice)
 }
 
 pub fn render_compact_json(res: &CompactResult, max_tokens: usize) -> String {
     if max_tokens == 0 {
         return serde_json::to_string(res).unwrap_or_else(|_| "{}".to_owned());
     }
-    let budget_chars = max_tokens.saturating_mul(4);
+    // Same tail policy as text, measured against the JSON document;
+    // the smallest valid document wins over the budget.
     let mut trimmed = res.clone();
-    loop {
-        let encoded = serde_json::to_string(&trimmed).unwrap_or_else(|_| "{}".to_owned());
-        if encoded.len() <= budget_chars {
-            return encoded;
-        }
-        if !trimmed.lines.is_empty() {
-            trimmed.lines.remove(0);
-            trimmed.truncated = true;
-            trimmed.omitted_items += 1;
-            continue;
-        }
-        if !trimmed.failing_lines.is_empty() {
-            trimmed.failing_lines.pop();
-            trimmed.truncated = true;
-            trimmed.omitted_items += 1;
-            continue;
-        }
-        if !trimmed.diagnostics.is_empty() {
-            trimmed.diagnostics.pop();
-            trimmed.truncated = true;
-            trimmed.omitted_items += 1;
-            continue;
-        }
-        return encoded;
-    }
+    budget::trim_structured(
+        &mut trimmed,
+        max_tokens,
+        |s| serde_json::to_string(s).unwrap_or_else(|_| "{}".to_owned()),
+        compact_trim_step,
+    );
+    serde_json::to_string(&trimmed).unwrap_or_else(|_| "{}".to_owned())
 }
 
 #[cfg(test)]
@@ -822,6 +824,200 @@ src/C.cs(7,1): warning CS0168: Unused variable 'x' [/tmp/App.csproj]\n\
         assert!(json.len() <= 120 * 4);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["truncated"], serde_json::Value::Bool(true));
+    }
+
+    fn generic_lines_result() -> CompactResult {
+        let raw: String = (1..=12).map(|i| format!("line-{i:02}\n")).collect();
+        let opts = CompactOptions {
+            mode: CompactMode::Generic,
+            max_tokens: 0,
+            allow_spillover: false,
+            ..CompactOptions::default()
+        };
+        compact_text(&raw, None, &opts)
+    }
+
+    // Exact-output budget-edge tests (#101).
+    #[test]
+    fn compact_text_budget_edge_exact_fit_one_token_less_and_below_notice() {
+        let res = generic_lines_result();
+        assert_eq!(res.lines.len(), 12);
+        let full = render_compact_text(&res, 0);
+        assert_eq!(
+            full,
+            "line-01\nline-02\nline-03\nline-04\nline-05\nline-06\nline-07\nline-08\n\
+             line-09\nline-10\nline-11\nline-12\n\
+             raw: 12L (~24 tok) -> ~24 tok (0.0% saved)\n"
+        );
+        let exact = full.len().div_ceil(4);
+        assert_eq!(render_compact_text(&res, exact), full);
+        // One token less: the tail survives — the oldest lines are
+        // dropped first, the cut lands on a line end, and the compact
+        // notice survives.
+        let less = render_compact_text(&res, exact - 1);
+        assert_eq!(
+            less,
+            "line-10\nline-11\nline-12\n\
+             ... (+9 omitted lines/diagnostics; see full log or --max-tokens)\n\
+             raw: 12L (~24 tok) -> ~22 tok (8.3% saved)\n"
+        );
+        assert!(less.len() <= (exact - 1) * 4);
+        // Budget smaller than the notice: the notice alone.
+        assert_eq!(
+            render_compact_text(&res, 5),
+            "... (+12 omitted lines/diagnostics; see full log or --max-tokens)\n"
+        );
+    }
+
+    #[test]
+    fn compact_json_budget_edge_exact_fit_one_token_less_and_below_smallest_valid() {
+        let res = generic_lines_result();
+        let full = render_compact_json(&res, 0);
+        let exact = full.len().div_ceil(4);
+        assert_eq!(render_compact_json(&res, exact), full);
+        // One token less, measured against the JSON size: only the
+        // oldest line is given up — the same tail rule as text.
+        let less = render_compact_json(&res, exact - 1);
+        let parsed: serde_json::Value = serde_json::from_str(&less).unwrap();
+        assert!(less.len() <= (exact - 1) * 4);
+        assert_eq!(parsed["truncated"], serde_json::Value::Bool(true));
+        assert_eq!(parsed["omitted_items"], serde_json::Value::from(1));
+        let lines: Vec<&str> = parsed["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l.as_str().unwrap())
+            .collect();
+        assert_eq!(lines.len(), 11);
+        assert_eq!(lines[0], "line-02");
+        assert_eq!(lines[10], "line-12");
+        // Below the smallest valid document: validity wins.
+        let tiny = render_compact_json(&res, 1);
+        let parsed: serde_json::Value = serde_json::from_str(&tiny).unwrap();
+        assert_eq!(parsed["lines"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["truncated"], serde_json::Value::Bool(true));
+        assert!(tiny.len() > 4);
+    }
+
+    #[test]
+    fn compact_text_and_json_keep_the_same_parts_at_the_same_budget() {
+        // Long lines: one line costs more than the JSON overhead, so a
+        // budget exists where both formats give up exactly the oldest
+        // line and keep the same remaining parts.
+        let raw: String = (1..=10)
+            .map(|i| format!("line-{i:02} {}\n", "x".repeat(190)))
+            .collect();
+        let opts = CompactOptions {
+            mode: CompactMode::Generic,
+            max_tokens: 0,
+            allow_spillover: false,
+            ..CompactOptions::default()
+        };
+        let res = compact_text(&raw, None, &opts);
+        assert_eq!(res.lines.len(), 10);
+        let text = render_compact_text(&res, 500);
+        let json = render_compact_json(&res, 500);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let json_lines: Vec<String> = parsed["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l.as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            json_lines.len(),
+            9,
+            "json drops exactly the oldest line: {json_lines:?}"
+        );
+        assert!(!json_lines.iter().any(|l| l.starts_with("line-01")));
+        for line in &json_lines {
+            assert!(text.contains(line), "text keeps the same line: {line}");
+        }
+        assert!(!text.contains("line-01"), "text drops the oldest line too");
+        assert!(text.contains("omitted lines/diagnostics"));
+    }
+
+    #[test]
+    fn compact_keeps_at_least_one_diagnostic_in_both_formats() {
+        let mut raw = String::new();
+        for i in 0..6 {
+            raw.push_str(&format!(
+                "src/f{i}.rs:10:5: error: problem number {i} with a fairly long explanation text\n"
+            ));
+        }
+        let opts = CompactOptions {
+            mode: CompactMode::Build,
+            max_tokens: 0,
+            allow_spillover: false,
+            ..CompactOptions::default()
+        };
+        let res = compact_text(&raw, Some(1), &opts);
+        assert_eq!(res.diagnostics.len(), 6);
+        let text = render_compact_text(&res, 100);
+        let json = render_compact_json(&res, 100);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let diags = parsed["diagnostics"].as_array().unwrap();
+        assert_eq!(
+            diags.len(),
+            1,
+            "json keeps exactly one diagnostic: {diags:?}"
+        );
+        assert!(
+            diags[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("problem number 0"),
+            "the first diagnostic group survives in json"
+        );
+        assert!(
+            text.contains("problem number 0"),
+            "the same first diagnostic survives in text: {text}"
+        );
+        assert!(
+            !text.contains("problem number 5"),
+            "later diagnostics are given up in text"
+        );
+    }
+
+    #[test]
+    fn compact_text_tight_budget_keeps_only_diagnostic_over_savings_footer() {
+        let raw = "src/main.rs:10:5: error: type mismatch on return value\n";
+        let opts = CompactOptions {
+            mode: CompactMode::Build,
+            max_tokens: 0,
+            allow_spillover: false,
+            ..CompactOptions::default()
+        };
+        let res = compact_text(raw, Some(1), &opts);
+        assert_eq!(res.diagnostics.len(), 1);
+        let without_footer = render_compact_text_inner(&res, false);
+        let with_footer = render_compact_text_inner(&res, true);
+        // Budget fits header + diagnostic, but cannot fit the savings footer.
+        let tight_tokens = without_footer.len().div_ceil(4);
+        assert!(with_footer.len() > tight_tokens * 4);
+        let out = render_compact_text(&res, tight_tokens);
+        assert!(out.len() <= tight_tokens * 4, "over budget: {out:?}");
+        assert!(out.contains("type mismatch on return value"), "{out}");
+        assert!(!out.contains("raw:"), "footer must be dropped first: {out}");
+    }
+
+    #[test]
+    fn compact_text_ultra_tight_budget_emits_notice_instead_of_dropping_diagnostic_silently() {
+        let raw = "src/main.rs:10:5: error: type mismatch on return value\n";
+        let opts = CompactOptions {
+            mode: CompactMode::Build,
+            max_tokens: 0,
+            allow_spillover: false,
+            ..CompactOptions::default()
+        };
+        let res = compact_text(raw, Some(1), &opts);
+        // Budget too small even for the diagnostic line alone.
+        let out = render_compact_text(&res, 5);
+        assert!(!out.contains("raw:"), "footer must not displace notice: {out}");
+        assert!(
+            out.contains("truncated; see full log or --max-tokens"),
+            "must emit truncation notice: {out}"
+        );
     }
 
     #[test]

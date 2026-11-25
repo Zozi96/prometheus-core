@@ -31,24 +31,6 @@ pub enum Host {
     Standalone,
 }
 
-impl Host {
-    /// Map a `prometheus-kit hook` host name; other hosts have no metrics identity.
-    pub fn from_hook(host: &str) -> Option<Self> {
-        match host {
-            "antigravity" => Some(Self::Antigravity),
-            "claude" => Some(Self::Claude),
-            "cursor" => Some(Self::Cursor),
-            "devin" => Some(Self::Devin),
-            "droid" => Some(Self::Droid),
-            "grok" => Some(Self::Grok),
-            "muse" => Some(Self::Muse),
-            "omp" => Some(Self::Omp),
-            "opencode" => Some(Self::Opencode),
-            _ => None,
-        }
-    }
-}
-
 /// Host for CLI (non-hook) metric rows, detected only from fixed, known
 /// nonempty environment markers. Marker values are never read beyond
 /// emptiness and never serialized; zero or multiple distinct markers are
@@ -117,6 +99,20 @@ struct Total {
 struct Totals {
     by_host: BTreeMap<Host, Total>,
     by_rule: BTreeMap<Rule, Total>,
+}
+
+/// One hook-rule outcome, carried as data from the hook decision to the
+/// single recording site at the entry point (ADR-0017, #103).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetricRecord {
+    pub rule: Rule,
+    pub raw_bytes: usize,
+    pub emitted_bytes: usize,
+}
+
+/// Record one metric carried as data from a hook decision.
+pub fn record_metric(host: Host, metric: MetricRecord) {
+    record(host, metric.rule, metric.raw_bytes, metric.emitted_bytes);
 }
 
 /// Metrics writes are on unless compiled as a unit test or
@@ -296,4 +292,41 @@ fn open_metrics(write: bool) -> Option<File> {
 #[cfg(not(any(unix, windows)))]
 fn open_metrics(_write: bool) -> Option<File> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A metrics log written by the current release still reads (#106):
+    /// every rule id in the current format — including the retired ones
+    /// (ADR-0016) — parses, so older logs keep aggregating.
+    #[test]
+    fn current_release_metrics_log_format_still_parses_including_retired_rules() {
+        for rule in [
+            "shell-rewrite",
+            "shell-denial",
+            "inline-dump-denial",
+            "large-read-advisory",
+            "first-read-denial",
+            "reread-warning",
+            "reread-denial",
+            "allowed-retry",
+            "use-time-hint",
+            "outline",
+            "slice",
+            "search",
+            "diff",
+            "map",
+            "compact",
+        ] {
+            let line = format!(
+                r#"{{"timestamp":1760000000,"host":"claude","rule_id":"{rule}","raw_bytes":10,"emitted_bytes":4}}"#
+            );
+            let row: Row = serde_json::from_slice(line.as_bytes())
+                .unwrap_or_else(|e| panic!("rule {rule} no longer parses: {e}"));
+            assert_eq!(10, row.raw_bytes);
+            assert_eq!(4, row.emitted_bytes);
+        }
+    }
 }

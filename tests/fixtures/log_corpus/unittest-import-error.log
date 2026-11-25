@@ -1,0 +1,19 @@
+test_broken (unittest.loader._FailedTest.test_broken) ... ERROR
+
+======================================================================
+ERROR: test_broken (unittest.loader._FailedTest.test_broken)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_broken
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/unittest/loader.py", line 137, in loadTestsFromName
+    module = __import__(module_name)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "test_broken.py", line 1, in <module>
+    import missing_dep_prometheus_fix_d
+ModuleNotFoundError: No module named 'missing_dep_prometheus_fix_d'
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)

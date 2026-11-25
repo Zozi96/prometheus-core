@@ -1,0 +1,7 @@
+{
+  "exit": 0,
+  "counts": null,
+  "error": "dotnet-duplicate-project",
+  "failing_lines": [],
+  "failed_tests": []
+}

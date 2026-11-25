@@ -1,0 +1,7 @@
+{
+  "exit": 0,
+  "counts": null,
+  "error": "vstest-malformed-line",
+  "failing_lines": [],
+  "failed_tests": []
+}

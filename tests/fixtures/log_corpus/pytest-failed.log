@@ -1,0 +1,8 @@
+tests/test_x.py::T::test_a FAILED                                 [ 50%]
+tests/test_x.py::test_b PASSED                                    [100%]
+
+=========================== short test summary info ============================
+FAILED tests/test_x.py::T::test_a - AssertionError: boom
+FAILED tests/test_x.py::test_c[param] - ValueError: bad
+ERROR tests/test_y.py
+========================= 2 failed, 1 passed in 0.12s =========================

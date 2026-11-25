@@ -1,0 +1,7 @@
+{
+  "exit": 0,
+  "counts": null,
+  "error": "dotnet-not-a-count",
+  "failing_lines": [],
+  "failed_tests": []
+}

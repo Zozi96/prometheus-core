@@ -1,0 +1,14 @@
+{
+  "exit": 1,
+  "counts": {
+    "passed": 3,
+    "failed": 1,
+    "skipped": 0,
+    "total": 4
+  },
+  "error": null,
+  "failing_lines": [],
+  "failed_tests": [
+    "dotnet test --filter FullyQualifiedName=Foo.Tests.UnitTest1.TestMethod1"
+  ]
+}

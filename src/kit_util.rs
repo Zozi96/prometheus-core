@@ -5,7 +5,6 @@ use crate::store::ensure_private_dir;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn approx_tokens(s: &str) -> usize {
     s.len() / 4
@@ -207,26 +206,6 @@ pub fn clip_centered(
     (out, true)
 }
 
-/// Enforce an exact byte budget (`max_bytes`) at a UTF-8 char boundary.
-pub fn clip_to_byte_budget(text: &str, max_bytes: usize) -> String {
-    if max_bytes == 0 || text.len() <= max_bytes {
-        return text.to_owned();
-    }
-    let suffix = "\n... (truncated to --max-tokens)\n";
-    if max_bytes <= suffix.len() {
-        let mut end = max_bytes;
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        return text[..end].to_owned();
-    }
-    let mut end = max_bytes - suffix.len();
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{suffix}", text[..end].trim_end_matches('\n'))
-}
-
 /// Clip `line` from the end cleanly at a UTF-8 char boundary.
 pub fn clip_end(line: &str, max_chars: usize) -> (String, bool) {
     if max_chars == 0 {
@@ -340,22 +319,19 @@ pub fn write_private_spillover(raw: &[u8]) -> Option<PathBuf> {
     }
 }
 
-/// Unique create-new claim inside `dir` using the shared
-/// `{prefix}-{millis}-{pid}-{attempt}.log` naming; `open` supplies the
-/// platform-private create for each candidate.
+/// Unique create-new claim inside `dir` using the ADR-0017 D4 naming
+/// `{prefix}-{sha256 of content}-{ordinal}.log`, where the ordinal is the
+/// first free one; `open` supplies the platform-private create for each
+/// candidate.
 pub(crate) fn claim_named_log(
     dir: &Path,
     prefix: &str,
     raw: &[u8],
     open: impl Fn(&Path) -> Option<std::fs::File>,
 ) -> Option<PathBuf> {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    for attempt in 0u32..16 {
-        let candidate = dir.join(format!("{prefix}-{stamp}-{pid}-{attempt}.log"));
+    let hash = crate::store::sha256_hex(raw);
+    for ordinal in 0u32..10_000 {
+        let candidate = dir.join(format!("{prefix}-{hash}-{ordinal}.log"));
         let Some(mut file) = open(&candidate) else {
             continue;
         };
@@ -366,6 +342,32 @@ pub(crate) fn claim_named_log(
         return None;
     }
     None
+}
+
+/// Claim a new empty log file in `dir` named
+/// `{prefix}-{hash}-{ordinal}.log` (ADR-0017 D4): the ordinal is the first
+/// free one, claimed by exclusive create, so an existing log is never
+/// overwritten or reopened and concurrent claims never share a file.
+/// Returns the claimed path and its open handle.
+pub fn claim_created_log(dir: &Path, prefix: &str, hash: &str) -> Option<(PathBuf, std::fs::File)> {
+    for ordinal in 0u32..10_000 {
+        let candidate = dir.join(format!("{prefix}-{hash}-{ordinal}.log"));
+        if let Some(file) = open_log_new(&candidate, false) {
+            return Some((candidate, file));
+        }
+    }
+    None
+}
+
+/// Hash of declared inputs for a created log's name (ADR-0017 D4): each
+/// part is length-prefixed so part boundaries cannot be smuggled.
+pub fn declared_inputs_hash(parts: &[&[u8]]) -> String {
+    let mut bytes = Vec::new();
+    for part in parts {
+        bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(part);
+    }
+    crate::store::sha256_hex(&bytes)
 }
 
 fn claim_temp_log(dir: &Path, prefix: &str, raw: &[u8], private: bool) -> Option<PathBuf> {
@@ -441,14 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn clip_to_byte_budget_enforces_multibyte_bytes() {
-        let multi = "あ".repeat(200);
-        let clipped = clip_to_byte_budget(&multi, 120);
-        assert!(clipped.len() <= 120);
-        assert!(clipped.contains("truncated to --max-tokens"));
-    }
-
-    #[test]
     fn noise_path_filters_lockfiles_minified_and_dotnet_bin_but_keeps_src_bin() {
         assert!(is_noise_path("Cargo.lock"));
         assert!(is_noise_path("web/package-lock.json"));
@@ -471,6 +465,38 @@ mod tests {
         assert!(did);
         assert!(clipped.contains("TARGET_MATCH"));
         assert!(clipped.chars().count() <= 80);
+    }
+
+    #[test]
+    fn claimed_logs_use_content_hash_and_first_free_ordinal() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("prom_kit_claim_{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hash = crate::store::sha256_hex(b"hello raw log\n");
+        let first = claim_named_log(&dir, "compact", b"hello raw log\n", |p| open_log_new(p, false)).unwrap();
+        assert_eq!(first.file_name().unwrap().to_string_lossy(), format!("compact-{hash}-0.log"));
+        let second = claim_named_log(&dir, "compact", b"hello raw log\n", |p| open_log_new(p, false)).unwrap();
+        assert_eq!(second.file_name().unwrap().to_string_lossy(), format!("compact-{hash}-1.log"));
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "hello raw log\n");
+        // Concurrent claims for the same hash get different files.
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    claim_named_log(&dir, "compact", b"hello raw log\n", |p| open_log_new(p, false)).unwrap()
+                })
+            })
+            .collect();
+        let mut paths: Vec<PathBuf> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        paths.push(first);
+        paths.push(second);
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), 6);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

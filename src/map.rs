@@ -1,6 +1,7 @@
 //! Deterministic repository map with line counts and optional top-level symbols (`prometheus-kit map`).
 
-use crate::kit_util::{clip_to_byte_budget, is_noise_path};
+use crate::budget::{self, KeepPolicy};
+use crate::kit_util::is_noise_path;
 use crate::outline::{outline_source, Lang, OutlineOptions};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
@@ -340,7 +341,51 @@ pub fn execute_map(opts: &MapOptions) -> Result<MapResult, MapError> {
     })
 }
 
+/// `map`'s Keep policy is **upper levels**: one give-up collapses the
+/// deepest directory the shared step reaches (children before their
+/// parents), then drops root entries. Shared by text and `--json`, so
+/// both formats collapse the same directories in the same order.
+fn map_trim_step(res: &mut MapResult) -> bool {
+    let dropped = collapse_deepest_or_trim(&mut res.tree);
+    if dropped == 0 {
+        return false;
+    }
+    res.truncated = true;
+    res.omitted_entries += dropped;
+    true
+}
+
+/// The `map` truncation notice, without its trailing newline. Wording
+/// is unchanged.
+fn map_notice(omitted_entries: usize) -> String {
+    format!("... (+{omitted_entries} omitted entries; narrow with --depth/--glob or --max-tokens)")
+}
+
 pub fn render_map_text(res: &MapResult, max_tokens: usize) -> String {
+    if max_tokens == 0 {
+        return render_map_text_inner(res);
+    }
+    let mut trimmed = res.clone();
+    budget::trim_structured(
+        &mut trimmed,
+        max_tokens,
+        render_map_text_inner,
+        map_trim_step,
+    );
+    let notice = if trimmed.truncated {
+        map_notice(trimmed.omitted_entries)
+    } else {
+        String::new()
+    };
+    budget::finish_text(
+        render_map_text_inner(&trimmed),
+        max_tokens,
+        KeepPolicy::UpperLevels,
+        &notice,
+    )
+}
+
+fn render_map_text_inner(res: &MapResult) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
         "{}/ [{} files, {} lines]",
@@ -386,49 +431,59 @@ pub fn render_map_text(res: &MapResult, max_tokens: usize) -> String {
 
     collect_lines(&res.tree, 1, &mut lines);
 
-    if max_tokens == 0 {
-        return format!("{}\n", lines.join("\n"));
+    if res.truncated {
+        lines.push(map_notice(res.omitted_entries));
     }
+    format!("{}\n", lines.join("\n"))
+}
 
-    let budget = max_tokens.saturating_mul(4);
-    const RESERVE: usize = 80;
-    let mut out = String::new();
-    let mut omitted = 0usize;
-    for (idx, line) in lines.iter().enumerate() {
-        let add = line.len() + 1;
-        if idx > 0 && out.len() + add + RESERVE > budget {
-            omitted = lines.len() - idx;
-            break;
+/// Find the deepest collapsible directory under `dir`: a directory
+/// that is not collapsed and still has children. Depth is compared
+/// across the WHOLE tree, not just along the last branch, so a
+/// shallow directory never collapses while a deeper one stays
+/// expanded (the upper-levels Keep policy, ADR-0017). Ties go to the
+/// last candidate in sibling order, preserving the previous
+/// behaviour among equals. Returns the index path from `dir` to the
+/// chosen directory.
+fn deepest_collapsible_path(
+    dir: &MapDirEntry,
+    depth: usize,
+    path: &mut Vec<usize>,
+    best: &mut Option<(usize, Vec<usize>)>,
+) {
+    for (idx, sub) in dir.dirs.iter().enumerate() {
+        if sub.collapsed || (sub.dirs.is_empty() && sub.files.is_empty()) {
+            continue;
         }
-        out.push_str(line);
-        out.push('\n');
+        path.push(idx);
+        let candidate_depth = depth + 1;
+        let is_better = match best {
+            None => true,
+            Some((best_depth, _)) => candidate_depth >= *best_depth,
+        };
+        if is_better {
+            *best = Some((candidate_depth, path.clone()));
+        }
+        deepest_collapsible_path(sub, candidate_depth, path, best);
+        path.pop();
     }
-    if omitted > 0 {
-        out.push_str(&format!(
-            "... (+{omitted} omitted entries; narrow with --depth/--glob or --max-tokens)\n"
-        ));
-    }
-    if out.len() > budget {
-        return clip_to_byte_budget(&out, budget);
-    }
-    out
 }
 
 fn collapse_deepest_dir(dir: &mut MapDirEntry) -> usize {
-    for sub in dir.dirs.iter_mut().rev() {
-        if !sub.collapsed && (!sub.dirs.is_empty() || !sub.files.is_empty()) {
-            let deeper = collapse_deepest_dir(sub);
-            if deeper > 0 {
-                return deeper;
-            }
-            let dropped = sub.dirs.len() + sub.files.len();
-            sub.dirs.clear();
-            sub.files.clear();
-            sub.collapsed = true;
-            return dropped.max(1);
-        }
+    let mut best = None;
+    deepest_collapsible_path(dir, 0, &mut Vec::new(), &mut best);
+    let Some((_, path)) = best else {
+        return 0;
+    };
+    let mut node = dir;
+    for idx in &path {
+        node = &mut node.dirs[*idx];
     }
-    0
+    let dropped = node.dirs.len() + node.files.len();
+    node.dirs.clear();
+    node.files.clear();
+    node.collapsed = true;
+    dropped.max(1)
 }
 
 fn collapse_deepest_or_trim(dir: &mut MapDirEntry) -> usize {
@@ -451,20 +506,16 @@ pub fn render_map_json(res: &MapResult, max_tokens: usize) -> String {
     if max_tokens == 0 {
         return serde_json::to_string(res).unwrap_or_else(|_| "{}".to_owned());
     }
-    let budget = max_tokens.saturating_mul(4);
+    // Same upper-levels policy as text, measured against the JSON
+    // document; the smallest valid document wins over the budget.
     let mut trimmed = res.clone();
-    loop {
-        let encoded = serde_json::to_string(&trimmed).unwrap_or_else(|_| "{}".to_owned());
-        if encoded.len() <= budget {
-            return encoded;
-        }
-        let dropped = collapse_deepest_or_trim(&mut trimmed.tree);
-        if dropped == 0 {
-            return encoded;
-        }
-        trimmed.truncated = true;
-        trimmed.omitted_entries += dropped;
-    }
+    budget::trim_structured(
+        &mut trimmed,
+        max_tokens,
+        |s| serde_json::to_string(s).unwrap_or_else(|_| "{}".to_owned()),
+        map_trim_step,
+    );
+    serde_json::to_string(&trimmed).unwrap_or_else(|_| "{}".to_owned())
 }
 
 #[cfg(test)]
@@ -492,6 +543,235 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn sample_map() -> MapResult {
+        let file = |name: &str| MapFileEntry {
+            name: name.to_owned(),
+            lines: 10,
+            binary: false,
+            symbols: vec![],
+            extra_symbols: 0,
+        };
+        fn dir(
+            name: &str,
+            total_files: usize,
+            total_lines: usize,
+            dirs: Vec<MapDirEntry>,
+            files: Vec<MapFileEntry>,
+        ) -> MapDirEntry {
+            MapDirEntry {
+                name: name.to_owned(),
+                total_files,
+                total_lines,
+                collapsed: false,
+                dirs,
+                files,
+            }
+        }
+        MapResult {
+            root: "r".to_owned(),
+            total_files: 10,
+            total_lines: 100,
+            tree: dir(
+                "r",
+                10,
+                100,
+                vec![
+                    dir(
+                        "a",
+                        5,
+                        50,
+                        vec![dir(
+                            "b",
+                            4,
+                            40,
+                            vec![],
+                            vec![file("b1.rs"), file("b2.rs"), file("b3.rs"), file("b4.rs")],
+                        )],
+                        vec![file("a1.rs")],
+                    ),
+                    dir(
+                        "c",
+                        4,
+                        40,
+                        vec![],
+                        vec![file("c1.rs"), file("c2.rs"), file("c3.rs"), file("c4.rs")],
+                    ),
+                ],
+                vec![file("top.rs")],
+            ),
+            truncated: false,
+            omitted_entries: 0,
+        }
+    }
+
+    // Exact-output budget-edge tests (#101).
+    #[test]
+    fn map_text_budget_edge_exact_fit_one_token_less_and_below_notice() {
+        let res = sample_map();
+        let full = render_map_text(&res, 0);
+        assert_eq!(
+            full,
+            "r/ [10 files, 100 lines]\n  a/ (5 files, 50L)\n    b/ (4 files, 40L)\n\
+             \u{20}     b1.rs (10L)\n      b2.rs (10L)\n      b3.rs (10L)\n      b4.rs (10L)\n\
+             \u{20}   a1.rs (10L)\n  c/ (4 files, 40L)\n\
+             \u{20}   c1.rs (10L)\n    c2.rs (10L)\n    c3.rs (10L)\n    c4.rs (10L)\n  top.rs (10L)\n"
+        );
+        let exact = full.len().div_ceil(4);
+        assert_eq!(render_map_text(&res, exact), full);
+        // One token less: upper levels survive, a and the root
+        // entries stay, and the notice survives on its own line.
+        // UPDATED for the Devin Review finding "Shallow map entries
+        // trimmed first": with depth compared across the whole tree,
+        // b (depth 2) collapses first and that alone fits — its file
+        // lines are the longest — so c stays expanded and only 4
+        // entries are omitted. The old order collapsed c first, which
+        // did not fit, and ended with both collapsed (+8).
+        let less = render_map_text(&res, exact - 1);
+        assert_eq!(
+            less,
+            "r/ [10 files, 100 lines]\n  a/ (5 files, 50L)\n    b/ (4 files, 40L)\n\
+             \u{20}   a1.rs (10L)\n  c/ (4 files, 40L)\n\
+             \u{20}   c1.rs (10L)\n    c2.rs (10L)\n    c3.rs (10L)\n    c4.rs (10L)\n  top.rs (10L)\n\
+             ... (+4 omitted entries; narrow with --depth/--glob or --max-tokens)\n"
+        );
+        assert!(less.len() <= (exact - 1) * 4);
+        // Budget smaller than the notice: the notice alone.
+        assert_eq!(
+            render_map_text(&res, 10),
+            "... (+13 omitted entries; narrow with --depth/--glob or --max-tokens)\n"
+        );
+    }
+
+    #[test]
+    fn map_json_budget_edge_exact_fit_one_token_less_and_below_smallest_valid() {
+        let res = sample_map();
+        let full = render_map_json(&res, 0);
+        let exact = full.len().div_ceil(4);
+        assert_eq!(render_map_json(&res, exact), full);
+        // One token less, measured against the JSON size: only the
+        // first collapse is given up. UPDATED for the Devin Review
+        // finding "Shallow map entries trimmed first": the first
+        // collapse is now b (depth 2, the deepest directory in the
+        // whole tree), not c (depth 1, last branch) as the previous
+        // last-branch search picked.
+        let less = render_map_json(&res, exact - 1);
+        let parsed: serde_json::Value = serde_json::from_str(&less).unwrap();
+        assert!(less.len() <= (exact - 1) * 4);
+        assert_eq!(parsed["truncated"], serde_json::Value::Bool(true));
+        assert_eq!(parsed["omitted_entries"], serde_json::Value::from(4));
+        let dirs = parsed["tree"]["dirs"].as_array().unwrap();
+        assert_eq!(dirs[1]["name"], serde_json::Value::String("c".to_owned()));
+        assert_eq!(dirs[1]["collapsed"], serde_json::Value::Bool(false));
+        assert_eq!(dirs[0]["collapsed"], serde_json::Value::Bool(false));
+        assert_eq!(
+            dirs[0]["dirs"][0]["collapsed"],
+            serde_json::Value::Bool(true)
+        );
+        // Below the smallest valid document: validity wins.
+        let tiny = render_map_json(&res, 1);
+        assert_eq!(
+            tiny,
+            "{\"root\":\"r\",\"total_files\":10,\"total_lines\":100,\
+             \"tree\":{\"name\":\"r\",\"total_files\":10,\"total_lines\":100,\"collapsed\":false},\
+             \"truncated\":true,\"omitted_entries\":13}"
+        );
+        let _: serde_json::Value = serde_json::from_str(&tiny).unwrap();
+    }
+
+    #[test]
+    fn map_collapse_order_is_shared_and_deepest_first() {
+        // The step both formats use. UPDATED for the Devin Review
+        // finding "Shallow map entries trimmed first": the previous
+        // order collapsed c (depth 1, last branch) before b (depth 2)
+        // because the search only walked the last branch; depth is
+        // now compared across the whole tree, so b collapses first,
+        // then c (last among the depth-1 ties), then a.
+        let mut res = sample_map();
+        assert!(map_trim_step(&mut res));
+        assert!(
+            res.tree.dirs[0].dirs[0].collapsed,
+            "b (deepest) collapses first"
+        );
+        assert!(!res.tree.dirs[1].collapsed);
+        assert!(map_trim_step(&mut res));
+        assert!(res.tree.dirs[1].collapsed, "c collapses second");
+        assert!(!res.tree.dirs[0].collapsed);
+        assert!(map_trim_step(&mut res));
+        assert!(res.tree.dirs[0].collapsed, "a collapses after its child");
+        // And the JSON at a budget that forces exactly two collapses
+        // keeps the same directories collapsed as the text does at its
+        // own two-collapse budget (each format measured against
+        // itself, per ADR-0017 D5).
+        let res = sample_map();
+        let parsed: serde_json::Value = serde_json::from_str(&render_map_json(&res, 120)).unwrap();
+        let dirs = parsed["tree"]["dirs"].as_array().unwrap();
+        assert_eq!(dirs[1]["collapsed"], serde_json::Value::Bool(true), "c collapsed in json");
+        assert_eq!(
+            dirs[0]["dirs"][0]["collapsed"],
+            serde_json::Value::Bool(true),
+            "b collapsed in json"
+        );
+        assert_eq!(
+            dirs[0]["collapsed"],
+            serde_json::Value::Bool(false),
+            "a still expanded"
+        );
+    }
+
+    #[test]
+    fn map_collapse_prefers_deepest_across_branches() {
+        // Regression (Devin Review, "Shallow map entries trimmed
+        // first"): with uneven sibling depths — a/b nested in the
+        // FIRST branch, a shallow z in the last — the first collapse
+        // must be the deepest directory (a/b), not the shallow last
+        // branch (z) the old last-branch search reached first.
+        let file = |name: &str| MapFileEntry {
+            name: name.to_owned(),
+            lines: 1,
+            binary: false,
+            symbols: vec![],
+            extra_symbols: 0,
+        };
+        let dir = |name: &str, dirs: Vec<MapDirEntry>, files: Vec<MapFileEntry>| {
+            let total_files = files.len()
+                + dirs
+                    .iter()
+                    .map(|d: &MapDirEntry| d.total_files)
+                    .sum::<usize>();
+            MapDirEntry {
+                name: name.to_owned(),
+                total_files,
+                total_lines: total_files,
+                collapsed: false,
+                dirs,
+                files,
+            }
+        };
+        let mut res = MapResult {
+            root: "repo".to_owned(),
+            total_files: 2,
+            total_lines: 2,
+            tree: dir(
+                "repo",
+                vec![
+                    dir("a", vec![dir("b", vec![], vec![file("item.rs")])], vec![]),
+                    dir("z", vec![], vec![file("some_file.rs")]),
+                ],
+                vec![],
+            ),
+            truncated: false,
+            omitted_entries: 0,
+        };
+        assert!(map_trim_step(&mut res));
+        assert!(
+            res.tree.dirs[0].dirs[0].collapsed,
+            "a/b (depth 2) collapses first"
+        );
+        assert!(!res.tree.dirs[1].collapsed, "z (depth 1) stays expanded");
+        assert!(map_trim_step(&mut res));
+        assert!(res.tree.dirs[1].collapsed, "z collapses second");
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! changing `permissionDecision`.
 
 use crate::outline::Lang;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -19,9 +19,9 @@ struct ShellToken {
     has_expansion: bool,
 }
 
-/// Returns `true` when `PROMETHEUS_KIT_NO_REWRITE=1` is set.
-fn rewrite_disabled() -> bool {
-    std::env::var_os("PROMETHEUS_KIT_NO_REWRITE").as_deref() == Some(OsStr::new("1"))
+/// `PROMETHEUS_KIT_NO_REWRITE=1` in a raw env value (read once at the edge).
+pub(crate) fn rewrite_disabled_from(value: Option<&OsStr>) -> bool {
+    value == Some(OsStr::new("1"))
 }
 
 fn read_config_bounded(path: &Path) -> Option<Vec<u8>> {
@@ -52,19 +52,20 @@ fn read_config_bounded(path: &Path) -> Option<Vec<u8>> {
     }
 }
 
-/// Returns `true` when RTK's hook is active for `host` (env override or hook config).
-pub fn rtk_hook_active(host: &str) -> bool {
-    if let Ok(val) = std::env::var("PROMETHEUS_KIT_RTK_COEXIST") {
-        match val.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" => return true,
-            "0" | "false" | "no" => return false,
-            _ => {}
-        }
+/// RTK-hook presence for `host` from host configuration files only, given
+/// the home / XDG / Antigravity config dirs as values. Called once while the
+/// ambient facts are built at the hook edge (#102); the decision itself never
+/// reads a host configuration file.
+pub(crate) fn rtk_config_active_in(
+    host: crate::hook_decide::Host,
+    home: Option<&Path>,
+    xdg: Option<&Path>,
+    agy: Option<&Path>,
+) -> bool {
+    if host == crate::hook_decide::Host::Grok {
+        return grok_dir_has_rtk_hook_in(home);
     }
-    if host == "grok" {
-        return grok_dir_has_rtk_hook();
-    }
-    let Some(config_path) = host_hooks_config_path(host) else {
+    let Some(config_path) = host_hooks_config_path_in(host, home, xdg, agy) else {
         return false;
     };
     json_file_has_rtk_hook(&config_path)
@@ -78,19 +79,6 @@ fn json_file_has_rtk_hook(config_path: &Path) -> bool {
         return false;
     };
     json_has_rtk_hook(&parsed)
-}
-
-fn abs_env_dir(var: &str) -> Option<PathBuf> {
-    std::env::var_os(var)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-}
-
-fn abs_home_dir() -> Option<PathBuf> {
-    crate::droid_mode::default_home()
-        .ok()
-        .filter(|p| p.is_absolute())
 }
 
 fn grok_dir_has_rtk_hook_in(home: Option<&Path>) -> bool {
@@ -111,12 +99,8 @@ fn grok_dir_has_rtk_hook_in(home: Option<&Path>) -> bool {
     false
 }
 
-fn grok_dir_has_rtk_hook() -> bool {
-    grok_dir_has_rtk_hook_in(abs_home_dir().as_deref())
-}
-
 fn host_hooks_config_path_in(
-    host: &str,
+    host: crate::hook_decide::Host,
     home: Option<&Path>,
     xdg: Option<&Path>,
     agy: Option<&Path>,
@@ -125,24 +109,24 @@ fn host_hooks_config_path_in(
     let abs_xdg = xdg.filter(|p| p.is_absolute());
     let abs_agy = agy.filter(|p| p.is_absolute());
     match host {
-        "droid" => Some(abs_home?.join(".factory").join("hooks.json")),
-        "claude" => Some(abs_home?.join(".claude").join("settings.json")),
-        "cursor" => Some(abs_home?.join(".cursor").join("hooks.json")),
-        "devin" => {
+        crate::hook_decide::Host::Droid => Some(abs_home?.join(".factory").join("hooks.json")),
+        crate::hook_decide::Host::Claude => Some(abs_home?.join(".claude").join("settings.json")),
+        crate::hook_decide::Host::Cursor => Some(abs_home?.join(".cursor").join("hooks.json")),
+        crate::hook_decide::Host::Devin => {
             let base = match abs_xdg {
                 Some(dir) => dir.to_path_buf(),
                 None => abs_home?.join(".config"),
             };
             Some(base.join("devin").join("config.json"))
         }
-        "antigravity" => {
+        crate::hook_decide::Host::Antigravity => {
             let base = match abs_agy {
                 Some(dir) => dir.to_path_buf(),
                 None => abs_home?.join(".gemini").join("config"),
             };
             Some(base.join("hooks.json"))
         }
-        "muse" => {
+        crate::hook_decide::Host::Muse => {
             let base = match abs_xdg {
                 Some(dir) => dir.to_path_buf(),
                 None => abs_home?.join(".config"),
@@ -151,13 +135,6 @@ fn host_hooks_config_path_in(
         }
         _ => None,
     }
-}
-
-fn host_hooks_config_path(host: &str) -> Option<PathBuf> {
-    let xdg = abs_env_dir("XDG_CONFIG_HOME");
-    let agy = abs_env_dir("AGY_CONFIG_DIR");
-    let home = abs_home_dir();
-    host_hooks_config_path_in(host, home.as_deref(), xdg.as_deref(), agy.as_deref())
 }
 
 fn json_has_rtk_hook(value: &Value) -> bool {
@@ -202,9 +179,8 @@ pub(crate) fn is_shell_tool(tool_name: &str) -> bool {
     )
 }
 
-fn kit_bin_quoted() -> Option<String> {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("prometheus-kit"));
-    try_shell_quote(&exe.to_string_lossy())
+fn kit_bin_quoted(ambient: &crate::hook::AmbientFacts) -> Option<String> {
+    try_shell_quote(&ambient.exe_path.to_string_lossy())
 }
 
 pub fn quote_posix(arg: &str) -> Option<String> {
@@ -1522,15 +1498,20 @@ pub enum ShellPolicyTier {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellAction {
     Pass,
+    /// Pass, but the attempt produced metrics (a Guided deny-once retry
+    /// records AllowedRetry even though the command runs).
+    PassWithMetrics(Vec<crate::metrics::MetricRecord>),
     Rewrite {
         command_key: String,
         rewritten: String,
         raw_bytes: usize,
+        metrics: Vec<crate::metrics::MetricRecord>,
     },
     DenyOnce {
         reason: String,
         suggested: String,
         raw_bytes: usize,
+        metrics: Vec<crate::metrics::MetricRecord>,
     },
 }
 
@@ -1551,154 +1532,80 @@ pub(crate) fn extract_shell_command(
 
 /// Shared Tier-1 / Tier-2 shell evaluation helper honoring `rtk` deferral (ADR-0013 D7).
 pub fn evaluate_shell_policy(
-    host: &str,
+    ambient: &crate::hook::AmbientFacts,
+    rtk_active: bool,
     tier: ShellPolicyTier,
     tool_name: &str,
     tool_input: &Map<String, Value>,
     session_id: &str,
     event_cwd: Option<&Path>,
 ) -> ShellAction {
-    if rewrite_disabled() || !is_shell_tool(tool_name) {
+    if ambient.rewrite_disabled || !is_shell_tool(tool_name) {
         return ShellAction::Pass;
     }
     let Some((command_key, command)) = extract_shell_command(tool_input) else {
         return ShellAction::Pass;
     };
-    let rtk_active = rtk_hook_active(host);
-    let Some(kit_bin) = kit_bin_quoted() else {
+    let Some(kit_bin) = kit_bin_quoted(ambient) else {
         return ShellAction::Pass;
     };
     let Some(rewritten) = rewrite_command_str(command, &kit_bin, rtk_active, event_cwd) else {
         return ShellAction::Pass;
     };
+    let rewritten_len = rewritten.len();
     match tier {
-        ShellPolicyTier::Rewrite => {
-            if let Some(metrics_host) = crate::metrics::Host::from_hook(host) {
-                crate::metrics::record(
-                    metrics_host,
-                    crate::metrics::Rule::ShellRewrite,
-                    command.len(),
-                    rewritten.len(),
-                );
-            }
-            ShellAction::Rewrite {
-                command_key: command_key.to_owned(),
-                rewritten,
+        ShellPolicyTier::Rewrite => ShellAction::Rewrite {
+            command_key: command_key.to_owned(),
+            rewritten,
+            raw_bytes: command.len(),
+            metrics: vec![crate::metrics::MetricRecord {
+                rule: crate::metrics::Rule::ShellRewrite,
                 raw_bytes: command.len(),
-            }
-        }
+                emitted_bytes: rewritten_len,
+            }],
+        },
         ShellPolicyTier::DenyOnce => {
-            match crate::hook::shell_deny_once_decision(host, session_id, event_cwd, command, &rewritten) {
-                Some(reason) => ShellAction::DenyOnce {
+            match crate::hook::shell_deny_once_decision(session_id, event_cwd, command, &rewritten, ambient) {
+                (Some(reason), metrics) => ShellAction::DenyOnce {
                     reason,
                     suggested: rewritten,
                     raw_bytes: command.len(),
+                    metrics,
                 },
-                None => ShellAction::Pass,
+                (None, metrics) if metrics.is_empty() => ShellAction::Pass,
+                (None, metrics) => ShellAction::PassWithMetrics(metrics),
             }
         }
-    }
-}
-
-/// Evaluate a `PreToolUse` event for shell command auto-rewrite (Claude/Devin/Droid/Muse envelope).
-/// Returns `None` when the command should pass through unchanged.
-pub fn rewrite_command_reply(host: &str, event: &Value) -> Option<Value> {
-    let event_cwd = event
-        .get("cwd")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(Path::new);
-    rewrite_command_reply_with_cwd(host, event, event_cwd)
-}
-
-pub fn rewrite_command_reply_with_cwd(
-    host: &str,
-    event: &Value,
-    event_cwd: Option<&Path>,
-) -> Option<Value> {
-    if !matches!(host, "claude" | "devin" | "droid" | "muse") {
-        return None;
-    }
-    let tool = event
-        .get("tool_name")
-        .or_else(|| event.get("toolName"))
-        .and_then(Value::as_str)?;
-    let tool_input = event
-        .get("tool_input")
-        .or_else(|| event.get("input"))
-        .and_then(Value::as_object)?;
-    let session_id = event
-        .get("session_id")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    match evaluate_shell_policy(
-        host,
-        ShellPolicyTier::Rewrite,
-        tool,
-        tool_input,
-        session_id,
-        event_cwd,
-    ) {
-        ShellAction::Rewrite {
-            command_key,
-            rewritten,
-            ..
-        } => {
-            let mut updated: Map<String, Value> = tool_input.clone();
-            updated.insert(command_key, Value::String(rewritten));
-            Some(json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecisionReason": "prometheus-kit auto-rewrite",
-                    "updatedInput": Value::Object(updated),
-                }
-            }))
-        }
-        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    fn base_amb() -> crate::hook::AmbientFacts {
+        let mut a = crate::hook::AmbientFacts {
+            other_host_markers_present: false,
+            devin_project_dir: None,
+            rewrite_disabled: false,
+            rtk_coexist: None,
+            rtk_config_active: std::collections::BTreeMap::new(),
+            xdg_runtime_dir: None,
+            temp_dir: std::env::temp_dir(),
+            session_parent: PathBuf::new(),
+            process_cwd: std::env::current_dir().ok(),
+            home_dir: None,
+            xdg_config_home: None,
+            agy_config_dir: None,
+            exe_path: std::env::current_exe()
+                .unwrap_or_else(|_| PathBuf::from("prometheus-kit")),
+        };
+        a.recompute_derived();
+        a
+    }
     use super::*;
+    use serde_json::json;
     use std::fs;
-    use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn env_guard() -> MutexGuard<'static, ()> {
-        crate::hook::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-    }
-
-    struct EnvOverride {
-        saved: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvOverride {
-        fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
-            let mut saved = Vec::new();
-            for &(k, v) in pairs {
-                saved.push((k, std::env::var(k).ok()));
-                match v {
-                    Some(val) => unsafe { std::env::set_var(k, val) },
-                    None => unsafe { std::env::remove_var(k) },
-                }
-            }
-            Self { saved }
-        }
-    }
-
-    impl Drop for EnvOverride {
-        fn drop(&mut self) {
-            for (k, v) in self.saved.drain(..).rev() {
-                match v {
-                    Some(val) => unsafe { std::env::set_var(k, val) },
-                    None => unsafe { std::env::remove_var(k) },
-                }
-            }
-        }
-    }
 
     const KIT: &str = "'/opt/prometheus-kit'";
 
@@ -2116,7 +2023,6 @@ mod tests {
 
     #[test]
     fn host_envelope_and_rtk_config_detection() {
-        let _g = env_guard();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2131,63 +2037,64 @@ mod tests {
         .unwrap();
 
         {
-            let _env = EnvOverride::set(&[
-                ("HOME", Some(tmp.to_str().unwrap())),
-                ("USERPROFILE", Some(tmp.to_str().unwrap())),
-                ("PROMETHEUS_KIT_RTK_COEXIST", None),
-                ("PROMETHEUS_KIT_NO_REWRITE", None),
-            ]);
-            assert!(rtk_hook_active("droid"));
-            assert!(!rtk_hook_active("claude"));
+            let amb = {
+                let mut a = base_amb();
+                a.home_dir = Some(PathBuf::from(tmp.to_str().unwrap()));
+                a.home_dir = Some(PathBuf::from(tmp.to_str().unwrap()));
+                a.rtk_coexist = None;
+                a.rewrite_disabled = false;
+                a.recompute_derived();
+                a
+            };
+            assert!(amb.rtk_active(crate::hook_decide::Host::Droid));
+            assert!(!amb.rtk_active(crate::hook_decide::Host::Claude));
 
-            // With RTK active on droid: git diff passes through, dotnet test rewrites & preserves metadata.
+            // With RTK active on droid: git diff passes through, dotnet test
+            // rewrites. (The reply-envelope assertions that used the deleted
+            // rewrite_command_reply helper are covered at the entry point by
+            // hook::tests::direct_checks_and_edits_pass_across_hosts and the
+            // adapter reply tests in hook_decide.)
             let git_ev = json!({
                 "hook_event_name": "PreToolUse",
                 "tool_name": "Execute",
                 "tool_input": {"command": "git status", "summary": "s", "riskLevel": "low"}
             });
-            assert_eq!(None, rewrite_command_reply("droid", &git_ev));
+            assert!(matches!(
+                evaluate_shell_policy(&amb, amb.rtk_active(crate::hook_decide::Host::Droid), ShellPolicyTier::Rewrite, "Execute", git_ev["tool_input"].as_object().unwrap(), "", None),
+                ShellAction::Pass | ShellAction::PassWithMetrics(_)
+            ));
 
             let dotnet_ev = json!({
                 "hook_event_name": "PreToolUse",
                 "tool_name": "Execute",
                 "tool_input": {"command": "dotnet test App.csproj", "summary": "run tests", "riskLevel": "medium", "timeout": 120}
             });
-            let reply = rewrite_command_reply("droid", &dotnet_ev).unwrap();
-            let out = &reply["hookSpecificOutput"];
-            assert_eq!("PreToolUse", out["hookEventName"]);
-            assert!(out.get("permissionDecision").is_none());
-            assert_eq!("run tests", out["updatedInput"]["summary"]);
-            assert_eq!("medium", out["updatedInput"]["riskLevel"]);
-            assert_eq!(120, out["updatedInput"]["timeout"]);
-            assert!(out["updatedInput"]["command"]
-                .as_str()
-                .unwrap()
-                .contains("compact --mode test -- dotnet test App.csproj"));
-
-            // Cursor uses its own flat `updated_input` envelope in `handle_cursor`,
-            // while Devin uses the shared `hookSpecificOutput.updatedInput` envelope.
-            assert_eq!(None, rewrite_command_reply("cursor", &dotnet_ev));
-            let devin_reply = rewrite_command_reply("devin", &dotnet_ev).unwrap();
-            assert!(devin_reply["hookSpecificOutput"]["updatedInput"]["command"]
-                .as_str()
-                .unwrap()
-                .contains("compact --mode test -- dotnet test App.csproj"));
+            match evaluate_shell_policy(&amb, amb.rtk_active(crate::hook_decide::Host::Droid), ShellPolicyTier::Rewrite, "Execute", dotnet_ev["tool_input"].as_object().unwrap(), "", None) {
+                ShellAction::Rewrite { rewritten, .. } => {
+                    assert!(rewritten.contains("compact --mode test -- dotnet test App.csproj"), "{rewritten}");
+                }
+                other => panic!("expected Rewrite, got {other:?}"),
+            }
         }
 
         {
-            let _env = EnvOverride::set(&[
-                ("HOME", Some(tmp.to_str().unwrap())),
-                ("USERPROFILE", Some(tmp.to_str().unwrap())),
-                ("PROMETHEUS_KIT_RTK_COEXIST", None),
-                ("PROMETHEUS_KIT_NO_REWRITE", Some("1")),
-            ]);
-            let dotnet_ev = json!({
-                "hook_event_name": "PreToolUse",
-                "tool_name": "Bash",
-                "tool_input": {"command": "dotnet test"}
-            });
-            assert_eq!(None, rewrite_command_reply("claude", &dotnet_ev));
+            let amb = {
+                let mut a = base_amb();
+                a.home_dir = Some(PathBuf::from(tmp.to_str().unwrap()));
+                a.rtk_coexist = None;
+                a.rewrite_disabled = true;
+                a.recompute_derived();
+                a
+            };
+            let dotnet_inp = {
+                let mut m = Map::new();
+                m.insert("command".into(), json!("dotnet test"));
+                m
+            };
+            assert!(matches!(
+                evaluate_shell_policy(&amb, amb.rtk_active(crate::hook_decide::Host::Claude), ShellPolicyTier::Rewrite, "Bash", &dotnet_inp, "", None),
+                ShellAction::Pass
+            ));
         }
 
         #[cfg(unix)]
@@ -2200,11 +2107,14 @@ mod tests {
             unsafe {
                 libc::mkfifo(c_path.as_ptr(), 0o600);
             }
-            let _env = EnvOverride::set(&[
-                ("HOME", Some(fifo_home.to_str().unwrap())),
-                ("PROMETHEUS_KIT_RTK_COEXIST", None),
-            ]);
-            assert!(!rtk_hook_active("droid"));
+            let amb = {
+                let mut a = base_amb();
+                a.home_dir = Some(PathBuf::from(fifo_home.to_str().unwrap()));
+                a.rtk_coexist = None;
+                a.recompute_derived();
+                a
+            };
+            assert!(!amb.rtk_active(crate::hook_decide::Host::Droid));
         }
 
         let _ = fs::remove_dir_all(&tmp);
@@ -2611,7 +2521,6 @@ mod tests {
 
     #[test]
     fn shared_shell_policy_supports_tier1_rewrite_tier2_deny_once_and_rtk_deferral() {
-        let _g = env_guard();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2626,17 +2535,20 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let _env = EnvOverride::set(&[
-            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
-            ("PROMETHEUS_KIT_NO_REWRITE", None),
-            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.xdg_runtime_dir = Some(PathBuf::from(rt.to_str().unwrap()));
+            a.rewrite_disabled = false;
+            a.rtk_coexist = Some("0".to_string());
+            a.recompute_derived();
+            a
+        };
         let mut inp = Map::new();
         inp.insert("command".into(), json!("git status"));
         let sid = format!("s-tier2-{nanos}");
 
         // Tier 1 rewrites directly.
-        match evaluate_shell_policy("claude", ShellPolicyTier::Rewrite, "Bash", &inp, &sid, Some(&repo)) {
+        match evaluate_shell_policy(&amb, amb.rtk_active(crate::hook_decide::Host::Claude), ShellPolicyTier::Rewrite, "Bash", &inp, &sid, Some(&repo)) {
             ShellAction::Rewrite { command_key, rewritten, .. } => {
                 assert_eq!(command_key, "command");
                 assert!(rewritten.contains("diff --status"), "{rewritten}");
@@ -2646,45 +2558,56 @@ mod tests {
 
         // Tier 2 denies once naming the exact kit command, allows immediate retry,
         // and denies again on a later repeat.
-        match evaluate_shell_policy("grok", ShellPolicyTier::DenyOnce, "bash", &inp, &sid, Some(&repo)) {
+        match evaluate_shell_policy(&amb, amb.rtk_active(crate::hook_decide::Host::Grok), ShellPolicyTier::DenyOnce, "bash", &inp, &sid, Some(&repo)) {
             ShellAction::DenyOnce { reason, suggested, .. } => {
                 assert!(suggested.contains("diff --status"), "{suggested}");
                 assert!(reason.contains(&suggested), "{reason}");
             }
             other => panic!("expected DenyOnce, got {other:?}"),
         }
-        assert_eq!(
-            ShellAction::Pass,
-            evaluate_shell_policy("grok", ShellPolicyTier::DenyOnce, "bash", &inp, &sid, Some(&repo))
-        );
+        // The retry passes, carrying the AllowedRetry metric as data (#103;
+        // the same behaviour is asserted at the decide interface in
+        // hook_decide::tests::decide_table_secret_rewrite_deny_once_advisory_hint_pass).
+        match evaluate_shell_policy(&amb, amb.rtk_active(crate::hook_decide::Host::Grok), ShellPolicyTier::DenyOnce, "bash", &inp, &sid, Some(&repo)) {
+            ShellAction::PassWithMetrics(metrics) => {
+                assert_eq!(1, metrics.len());
+                assert_eq!(crate::metrics::Rule::AllowedRetry, metrics[0].rule);
+            }
+            other => panic!("expected PassWithMetrics, got {other:?}"),
+        }
         assert!(matches!(
-            evaluate_shell_policy("grok", ShellPolicyTier::DenyOnce, "bash", &inp, &sid, Some(&repo)),
+            evaluate_shell_policy(&amb, amb.rtk_active(crate::hook_decide::Host::Grok), ShellPolicyTier::DenyOnce, "bash", &inp, &sid, Some(&repo)),
             ShellAction::DenyOnce { .. }
         ));
 
         // With RTK active, RTK-owned commands defer in BOTH Tier 1 and Tier 2,
         // while RTK-gap commands (`dotnet test`) still apply in both tiers.
-        let _rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("1"))]);
+        let amb = {
+            let mut a = amb.clone();
+            a.rtk_coexist = Some("1".to_string());
+            a.recompute_derived();
+            a
+        };
         assert_eq!(
             ShellAction::Pass,
-            evaluate_shell_policy("claude", ShellPolicyTier::Rewrite, "Bash", &inp, &sid, Some(&repo))
+            evaluate_shell_policy(&amb, amb.rtk_active(crate::hook_decide::Host::Claude), ShellPolicyTier::Rewrite, "Bash", &inp, &sid, Some(&repo))
         );
         assert_eq!(
             ShellAction::Pass,
-            evaluate_shell_policy("grok", ShellPolicyTier::DenyOnce, "bash", &inp, &sid, Some(&repo))
+            evaluate_shell_policy(&amb, amb.rtk_active(crate::hook_decide::Host::Grok), ShellPolicyTier::DenyOnce, "bash", &inp, &sid, Some(&repo))
         );
 
         let mut dt_inp = Map::new();
         dt_inp.insert("command".into(), json!("dotnet test"));
         assert!(matches!(
-            evaluate_shell_policy("grok", ShellPolicyTier::DenyOnce, "bash", &dt_inp, &sid, Some(&repo)),
+            evaluate_shell_policy(&amb, amb.rtk_active(crate::hook_decide::Host::Grok), ShellPolicyTier::DenyOnce, "bash", &dt_inp, &sid, Some(&repo)),
             ShellAction::DenyOnce { .. }
         ));
 
         // Antigravity CommandLine key is also supported by the shared helper.
         let mut agy_inp = Map::new();
         agy_inp.insert("CommandLine".into(), json!("dotnet test"));
-        match evaluate_shell_policy("antigravity", ShellPolicyTier::Rewrite, "run_command", &agy_inp, &sid, Some(&repo)) {
+        match evaluate_shell_policy(&amb, amb.rtk_active(crate::hook_decide::Host::Antigravity), ShellPolicyTier::Rewrite, "run_command", &agy_inp, &sid, Some(&repo)) {
             ShellAction::Rewrite { command_key, rewritten, .. } => {
                 assert_eq!(command_key, "CommandLine");
                 assert!(rewritten.contains("compact --mode test"), "{rewritten}");
@@ -2697,7 +2620,12 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             if unsafe { libc::getuid() } != 0 {
-                let _no_rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("0"))]);
+                let amb = {
+                    let mut a = amb.clone();
+                    a.rtk_coexist = Some("0".to_string());
+                    a.recompute_derived();
+                    a
+                };
                 let ro_sid = format!("s-ro-{nanos}");
                 let parent = rt.join("prometheus");
                 let ro_dir = parent.join(&ro_sid);
@@ -2706,7 +2634,7 @@ mod tests {
                 fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o500)).unwrap();
                 assert_eq!(
                     ShellAction::Pass,
-                    evaluate_shell_policy("grok", ShellPolicyTier::DenyOnce, "bash", &inp, &ro_sid, Some(&repo))
+                    evaluate_shell_policy(&amb, amb.rtk_active(crate::hook_decide::Host::Grok), ShellPolicyTier::DenyOnce, "bash", &inp, &ro_sid, Some(&repo))
                 );
                 fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o700)).unwrap();
             }
@@ -2717,7 +2645,6 @@ mod tests {
 
     #[test]
     fn rtk_hook_active_detects_all_host_configs_and_rejects_relative_env_dirs() {
-        let _g = env_guard();
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let tmp = std::env::temp_dir().join(format!("prom_rtk_cfg_{}_{nanos}", std::process::id()));
         let home = tmp.join("home");
@@ -2741,25 +2668,25 @@ mod tests {
 
         assert_eq!(
             Some(home.join(".cursor/hooks.json")),
-            host_hooks_config_path_in("cursor", Some(&home), Some(&xdg), Some(&agy))
+            host_hooks_config_path_in(crate::hook_decide::Host::Cursor, Some(&home), Some(&xdg), Some(&agy))
         );
         assert!(json_file_has_rtk_hook(
-            &host_hooks_config_path_in("cursor", Some(&home), None, None).unwrap()
+            &host_hooks_config_path_in(crate::hook_decide::Host::Cursor, Some(&home), None, None).unwrap()
         ));
         // Env overrides (XDG_CONFIG_HOME / AGY_CONFIG_DIR) resolve even when home is None.
         assert_eq!(
             Some(xdg.join("devin/config.json")),
-            host_hooks_config_path_in("devin", None, Some(&xdg), None)
+            host_hooks_config_path_in(crate::hook_decide::Host::Devin, None, Some(&xdg), None)
         );
         assert_eq!(
             Some(agy.join("hooks.json")),
-            host_hooks_config_path_in("antigravity", None, None, Some(&agy))
+            host_hooks_config_path_in(crate::hook_decide::Host::Antigravity, None, None, Some(&agy))
         );
         // Relative dirs are rejected (defense-in-depth).
         assert_eq!(
             None,
             host_hooks_config_path_in(
-                "cursor",
+                crate::hook_decide::Host::Cursor,
                 Some(Path::new("relative/home")),
                 Some(Path::new("relative/xdg")),
                 Some(Path::new("relative/agy")),
@@ -2767,31 +2694,39 @@ mod tests {
         );
         assert_eq!(
             None,
-            host_hooks_config_path_in("devin", None, Some(Path::new("relative/xdg")), None)
+            host_hooks_config_path_in(crate::hook_decide::Host::Devin, None, Some(Path::new("relative/xdg")), None)
         );
         assert_eq!(
             None,
-            host_hooks_config_path_in("antigravity", None, None, Some(Path::new("relative/agy")))
+            host_hooks_config_path_in(crate::hook_decide::Host::Antigravity, None, None, Some(Path::new("relative/agy")))
         );
 
         // Live env resolution for XDG_CONFIG_HOME and AGY_CONFIG_DIR (no HOME mutation).
         {
-            let _env = EnvOverride::set(&[
-                ("PROMETHEUS_KIT_RTK_COEXIST", None),
-                ("XDG_CONFIG_HOME", Some(xdg.to_str().unwrap())),
-                ("AGY_CONFIG_DIR", Some(agy.to_str().unwrap())),
-            ]);
-            assert!(rtk_hook_active("devin"));
-            assert!(rtk_hook_active("antigravity"));
+            let amb = {
+                let mut a = base_amb();
+                a.rtk_coexist = None;
+                a.xdg_config_home = Some(PathBuf::from(xdg.to_str().unwrap()));
+                a.agy_config_dir = Some(PathBuf::from(agy.to_str().unwrap()));
+                a.recompute_derived();
+                a
+            };
+            assert!(amb.rtk_active(crate::hook_decide::Host::Devin));
+            assert!(amb.rtk_active(crate::hook_decide::Host::Antigravity));
         }
         {
-            let _env = EnvOverride::set(&[
-                ("PROMETHEUS_KIT_RTK_COEXIST", None),
-                ("XDG_CONFIG_HOME", Some("relative/xdg")),
-                ("AGY_CONFIG_DIR", Some("relative/agy")),
-            ]);
-            assert_eq!(None, abs_env_dir("XDG_CONFIG_HOME"));
-            assert_eq!(None, abs_env_dir("AGY_CONFIG_DIR"));
+            let amb = {
+                let mut a = base_amb();
+                a.rtk_coexist = None;
+                a.xdg_config_home = Some(PathBuf::from("relative/xdg"));
+                a.agy_config_dir = Some(PathBuf::from("relative/agy"));
+                a.recompute_derived();
+                a
+            };
+            // Relative config dirs are rejected when the ambient facts are
+            // built, so neither host reports an RTK hook.
+            assert!(!amb.rtk_active(crate::hook_decide::Host::Devin));
+            assert!(!amb.rtk_active(crate::hook_decide::Host::Antigravity));
         }
         let _ = fs::remove_dir_all(&tmp);
     }
