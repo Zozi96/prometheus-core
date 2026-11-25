@@ -162,8 +162,14 @@ fn print_outcome(outcome: &prometheus_core::check_run::CheckOutcome) -> i32 {
                     );
                 }
                 PendingReason::RunnerUnavailable { program } => {
-                    println!("runner not available: {program}");
-                    println!("validation pending: ask for the test_command");
+                    if program.chars().any(char::is_control) {
+                        println!("runner not available: {}", program.escape_debug());
+                    } else {
+                        println!("runner not available: {program}");
+                    }
+                    println!(
+                        "validation pending: verify the configured executable path before retrying"
+                    );
                 }
                 PendingReason::SpawnFailed { message } => {
                     eprintln!("prometheus-check: {message}");

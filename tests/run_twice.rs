@@ -325,3 +325,165 @@ fn hook_runs_twice_byte_identical_for_each_of_the_nine_hosts_through_the_binary(
         );
     }
 }
+
+#[test]
+fn kit_subcommands_outline_slice_search_diff_map_run_twice_byte_identical_text_and_json() {
+    let tmp = TempDir::new("kit_five");
+    let repo = tmp.0.join("repo");
+    let src = repo.join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success());
+
+    fs::write(
+        src.join("lib.rs"),
+        "pub struct Widget {\n    pub count: usize,\n}\n\nimpl Widget {\n    pub fn compute(&self) -> usize {\n        let needle_val = self.count + 1;\n        needle_val\n    }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("extra.rs"),
+        "pub fn helper_fn(x: usize) -> usize {\n    x * 2\n}\n",
+    )
+    .unwrap();
+
+    assert!(Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success());
+
+    // Unstaged modification for deterministic diff output against the index.
+    fs::write(
+        src.join("lib.rs"),
+        "pub struct Widget {\n    pub count: usize,\n}\n\nimpl Widget {\n    pub fn compute(&self) -> usize {\n        let needle_val = self.count + 42;\n        needle_val\n    }\n}\n",
+    )
+    .unwrap();
+
+    let run_twice = |args: &[&str]| -> String {
+        let exec = || {
+            Command::new(kit_bin())
+                .args(args)
+                .current_dir(&repo)
+                .env("PROMETHEUS_KIT_NO_METRICS", "1")
+                .output()
+                .unwrap()
+        };
+        let first = exec();
+        let second = exec();
+        assert_eq!(
+            first.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(second.status.code(), first.status.code(), "{args:?}");
+        assert_eq!(first.stdout, second.stdout, "{args:?} stdout must repeat byte-identical");
+        assert_eq!(first.stderr, second.stderr, "{args:?} stderr must repeat byte-identical");
+        String::from_utf8(first.stdout).unwrap()
+    };
+
+    // 1. outline (text + JSON)
+    let out_txt = run_twice(&["outline", "src/lib.rs"]);
+    assert!(out_txt.contains("Widget"), "{out_txt}");
+    assert!(out_txt.contains("compute"), "{out_txt}");
+    let out_json_s = run_twice(&["outline", "--json", "src/lib.rs"]);
+    let out_json: serde_json::Value = serde_json::from_str(&out_json_s).unwrap();
+    assert!(!out_json["docs"][0]["items"].as_array().unwrap().is_empty());
+
+    // 2. slice (text + JSON)
+    let sl_txt = run_twice(&["slice", "src/lib.rs::Widget::compute"]);
+    assert!(sl_txt.contains("needle_val"), "{sl_txt}");
+    let sl_json_s = run_twice(&["slice", "--json", "src/lib.rs::Widget::compute"]);
+    let sl_json: serde_json::Value = serde_json::from_str(&sl_json_s).unwrap();
+    assert!(!sl_json["slices"][0]["lines"].as_array().unwrap().is_empty());
+    assert!(sl_json_s.contains("needle_val"), "{sl_json_s}");
+
+    // 3. search (text + JSON)
+    let sr_txt = run_twice(&["search", "--symbols", "needle_val", "."]);
+    assert!(sr_txt.contains("src/lib.rs"), "{sr_txt}");
+    assert!(sr_txt.contains("2 examined, 1 matched"), "{sr_txt}");
+    let sr_json_s = run_twice(&["search", "--symbols", "--json", "needle_val", "."]);
+    let sr_json: serde_json::Value = serde_json::from_str(&sr_json_s).unwrap();
+    assert_eq!(sr_json["examined_files"], 2);
+    assert_eq!(sr_json["total_files"], 1);
+
+    // 4. diff (text + JSON)
+    let df_txt = run_twice(&["diff", "--root", "."]);
+    assert!(df_txt.contains("src/lib.rs"), "{df_txt}");
+    assert!(df_txt.contains("self.count + 42"), "{df_txt}");
+    let df_json_s = run_twice(&["diff", "--json", "--root", "."]);
+    let df_json: serde_json::Value = serde_json::from_str(&df_json_s).unwrap();
+    assert_eq!(df_json["files"][0]["path"], "src/lib.rs");
+
+    // 5. map (text + JSON)
+    let mp_txt = run_twice(&["map", "--symbols", "."]);
+    assert!(mp_txt.contains("lib.rs"), "{mp_txt}");
+    assert!(mp_txt.contains("Widget"), "{mp_txt}");
+    let mp_json_s = run_twice(&["map", "--symbols", "--json", "."]);
+    let mp_json: serde_json::Value = serde_json::from_str(&mp_json_s).unwrap();
+    assert_eq!(mp_json["total_files"], 2);
+    assert!(mp_json_s.contains("Widget"), "{mp_json_s}");
+}
+
+#[test]
+fn check_unavailable_known_runner_reports_guidance_without_asking_for_command() {
+    let tmp = TempDir::new("check_runner_missing");
+    let root = tmp.0.join("root");
+    let store = tmp.0.join("store");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.txt"), "hello\n").unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .status()
+        .unwrap()
+        .success());
+
+    let missing = Command::new(check_bin())
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--store",
+            store.to_str().unwrap(),
+            "--",
+            "nonexistent-runner-xyz",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    let missing_out = String::from_utf8_lossy(&missing.stdout);
+    assert!(
+        missing_out.contains("runner not available: nonexistent-runner-xyz"),
+        "{missing_out}"
+    );
+    assert!(missing_out.contains("verify the configured executable path"), "{missing_out}");
+    assert!(!missing_out.contains("install"), "{missing_out}");
+    assert!(
+        !missing_out.contains("ask for the test_command"),
+        "{missing_out}"
+    );
+
+    // Unknown command still asks for test_command.
+    let unknown = Command::new(check_bin())
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--store",
+            store.to_str().unwrap(),
+            "--changed",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(unknown.status.code(), Some(1));
+    let unknown_out = String::from_utf8_lossy(&unknown.stdout);
+    assert!(
+        unknown_out.contains("validation pending: ask for the test_command"),
+        "{unknown_out}"
+    );
+}

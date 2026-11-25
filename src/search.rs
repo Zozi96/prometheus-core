@@ -104,16 +104,37 @@ pub struct SearchFileGroup {
     pub matches: Vec<SearchMatch>,
 }
 
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct SearchFilters {
+    pub hidden: bool,
+    pub no_ignore: bool,
+    pub include_noise: bool,
+    pub globs: Vec<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub omitted_globs: usize,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     pub files: Vec<SearchFileGroup>,
     pub total_matches: usize,
     pub total_files: usize,
+    pub examined_files: usize,
     pub shown_matches: usize,
     pub shown_files: usize,
     pub omitted_matches: usize,
     pub omitted_files: usize,
     pub truncated: bool,
+    pub roots: Vec<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub omitted_roots: usize,
+    pub filters: SearchFilters,
     /// Byte length of matching raw lines (or displayed paths for --files-only);
     /// metrics-only, never serialized.
     #[serde(skip)]
@@ -151,13 +172,11 @@ fn display_rel(path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn collect_candidate_files(opts: &SearchOptions) -> Result<Vec<(PathBuf, String)>, SearchError> {
-    let roots = if opts.paths.is_empty() {
-        vec![PathBuf::from(".")]
-    } else {
-        opts.paths.clone()
-    };
-    for p in &roots {
+fn collect_candidate_files(
+    opts: &SearchOptions,
+    roots: &[PathBuf],
+) -> Result<Vec<(PathBuf, String)>, SearchError> {
+    for p in roots {
         if !p.exists() {
             return Err(SearchError::Io(format!(
                 "{}: No such file or directory",
@@ -169,7 +188,7 @@ fn collect_candidate_files(opts: &SearchOptions) -> Result<Vec<(PathBuf, String)
     let mut seen = BTreeSet::new();
     let mut candidates = Vec::new();
 
-    for root in &roots {
+    for root in roots {
         if root.is_file() {
             let disp = display_rel(root);
             if let Some(wanted) = opts.lang_type {
@@ -269,16 +288,24 @@ pub fn execute_search(opts: &SearchOptions) -> Result<SearchResult, SearchError>
         .build()
         .map_err(|e| SearchError::Usage(format!("invalid regex `{}`: {e}", opts.pattern)))?;
 
-    let candidates = collect_candidate_files(opts)?;
+    let roots = if opts.paths.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        opts.paths.clone()
+    };
+    let effective_roots: Vec<String> = roots.iter().map(|p| display_rel(p)).collect();
+    let candidates = collect_candidate_files(opts, &roots)?;
     let mut files = Vec::new();
     let mut total_matches = 0usize;
     let mut total_files = 0usize;
+    let mut examined_files = 0usize;
     let mut raw_bytes = 0usize;
 
     for (path, disp) in candidates {
         let Some(text) = read_searchable_text(&path) else {
             continue;
         };
+        examined_files += 1;
         let mut file_matches = 0usize;
         let mut kept: Vec<(usize, String, bool)> = Vec::new();
 
@@ -368,7 +395,23 @@ pub fn execute_search(opts: &SearchOptions) -> Result<SearchResult, SearchError>
         });
     }
 
-    let mut res = build_search_result(files, total_matches, total_files, opts.files_only);
+    let filters = SearchFilters {
+        hidden: opts.hidden,
+        no_ignore: opts.no_ignore,
+        include_noise: opts.include_noise,
+        globs: opts.globs.clone(),
+        omitted_globs: 0,
+        file_type: opts.lang_type.map(|l| l.as_str().to_owned()),
+    };
+    let mut res = build_search_result(
+        files,
+        total_matches,
+        total_files,
+        examined_files,
+        effective_roots,
+        filters,
+        opts.files_only,
+    );
     res.raw_bytes = raw_bytes;
     Ok(res)
 }
@@ -377,6 +420,9 @@ fn build_search_result(
     files: Vec<SearchFileGroup>,
     total_matches: usize,
     total_files: usize,
+    examined_files: usize,
+    roots: Vec<String>,
+    filters: SearchFilters,
     files_only: bool,
 ) -> SearchResult {
     let shown_files = files.len();
@@ -392,11 +438,15 @@ fn build_search_result(
         files,
         total_matches,
         total_files,
+        examined_files,
         shown_matches,
         shown_files,
         omitted_matches,
         omitted_files,
         truncated,
+        roots,
+        omitted_roots: 0,
+        filters,
         raw_bytes: 0,
     }
 }
@@ -434,6 +484,99 @@ fn search_trim_step(res: &mut SearchResult, files_only: bool) -> bool {
     true
 }
 
+fn try_shrink_scope_vec(
+    res: &mut SearchResult,
+    mut can_pop: impl FnMut(&SearchResult) -> bool,
+    mut pop_one: impl FnMut(&mut SearchResult) -> bool,
+) -> bool {
+    let before_len = serde_json::to_string(res)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX);
+    let snapshot = res.clone();
+    while can_pop(res) && pop_one(res) {
+        let after_len = serde_json::to_string(res)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
+        if after_len < before_len {
+            return true;
+        }
+    }
+    *res = snapshot;
+    false
+}
+
+fn search_json_trim_step(res: &mut SearchResult, files_only: bool) -> bool {
+    const PATHOLOGICAL_SCOPE_ITEM_LEN: usize = 256;
+    if try_shrink_scope_vec(
+        res,
+        |r| {
+            r.filters.globs.len() > 1
+                || r.filters
+                    .globs
+                    .iter()
+                    .any(|g| g.len() > PATHOLOGICAL_SCOPE_ITEM_LEN)
+        },
+        |r| {
+            if r.filters.globs.pop().is_some() {
+                r.filters.omitted_globs += 1;
+                true
+            } else {
+                false
+            }
+        },
+    ) {
+        return true;
+    }
+    if try_shrink_scope_vec(
+        res,
+        |r| {
+            r.roots.len() > 1
+                || r.roots
+                    .iter()
+                    .any(|root| root.len() > PATHOLOGICAL_SCOPE_ITEM_LEN)
+        },
+        |r| {
+            if r.roots.pop().is_some() {
+                r.omitted_roots += 1;
+                true
+            } else {
+                false
+            }
+        },
+    ) {
+        return true;
+    }
+    if search_trim_step(res, files_only) {
+        return true;
+    }
+    if try_shrink_scope_vec(
+        res,
+        |r| !r.filters.globs.is_empty(),
+        |r| {
+            if r.filters.globs.pop().is_some() {
+                r.filters.omitted_globs += 1;
+                true
+            } else {
+                false
+            }
+        },
+    ) {
+        return true;
+    }
+    try_shrink_scope_vec(
+        res,
+        |r| !r.roots.is_empty(),
+        |r| {
+            if r.roots.pop().is_some() {
+                r.omitted_roots += 1;
+                true
+            } else {
+                false
+            }
+        },
+    )
+}
+
 /// The `search` truncation notice for a (possibly trimmed) result,
 /// without its trailing newline. Wording is unchanged.
 fn search_notice(res: &SearchResult) -> String {
@@ -445,31 +588,143 @@ fn search_notice(res: &SearchResult) -> String {
 
 pub fn render_search_text(res: &SearchResult, opts: &SearchOptions) -> String {
     if opts.max_tokens == 0 {
-        return render_search_text_inner(res, opts);
+        return render_search_text_inner(res, opts, true);
     }
-    let mut trimmed = res.clone();
+    let Some(byte_budget) = budget::tokens_to_bytes(opts.max_tokens) else {
+        return render_search_text_inner(res, opts, true);
+    };
+    if res.total_matches == 0 {
+        let full = render_search_text_inner(res, opts, true);
+        if full.len() <= byte_budget {
+            return full;
+        }
+        let headline = format!("0 matches ({} examined)\n", res.examined_files);
+        if headline.len() <= byte_budget {
+            return headline;
+        }
+        return "0 matches\n".to_owned();
+    }
+
+    let mut with_scope = res.clone();
     budget::trim_structured(
-        &mut trimmed,
+        &mut with_scope,
         opts.max_tokens,
-        |s| render_search_text_inner(s, opts),
+        |s| render_search_text_inner(s, opts, true),
         |s| search_trim_step(s, opts.files_only),
     );
+    let (trimmed, include_scope) = if with_scope.files.is_empty() && !res.files.is_empty() {
+        let mut without_scope = res.clone();
+        budget::trim_structured(
+            &mut without_scope,
+            opts.max_tokens,
+            |s| render_search_text_inner(s, opts, false),
+            |s| search_trim_step(s, opts.files_only),
+        );
+        if !without_scope.files.is_empty() {
+            (without_scope, false)
+        } else {
+            (with_scope, true)
+        }
+    } else {
+        (with_scope, true)
+    };
     let notice = if trimmed.truncated {
         search_notice(&trimmed)
     } else {
         String::new()
     };
     budget::finish_text(
-        render_search_text_inner(&trimmed, opts),
+        render_search_text_inner(&trimmed, opts, include_scope),
         opts.max_tokens,
         KeepPolicy::Head,
         &notice,
     )
 }
 
-fn render_search_text_inner(res: &SearchResult, opts: &SearchOptions) -> String {
+fn sanitize_inline_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                for esc in c.escape_default() {
+                    out.push(esc);
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn format_bounded_list(items: &[String], max_chars: usize) -> String {
+    if items.is_empty() {
+        return "[]".to_owned();
+    }
+    let mut out = String::new();
+    for (idx, item) in items.iter().enumerate() {
+        let safe = sanitize_inline_value(item);
+        let sep = if idx == 0 { "" } else { ", " };
+        if !out.is_empty() && out.len() + sep.len() + safe.len() > max_chars {
+            let rem = items.len() - idx;
+            out.push_str(&format!(", +{rem} more"));
+            return out;
+        }
+        if out.is_empty() && safe.len() > max_chars {
+            let mut end = max_chars.saturating_sub(3);
+            while end > 0 && !safe.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.push_str(&safe[..end]);
+            out.push_str("...");
+            if items.len() > 1 {
+                out.push_str(&format!(" (+{} more)", items.len() - 1));
+            }
+            return out;
+        }
+        out.push_str(sep);
+        out.push_str(&safe);
+    }
+    out
+}
+
+fn format_scope_line(res: &SearchResult) -> String {
+    let roots = format_bounded_list(&res.roots, 120);
+    let mut line = format!(
+        "scope: {} examined, {} matched, roots={}, hidden={}, no_ignore={}, include_noise={}",
+        res.examined_files,
+        res.total_files,
+        roots,
+        res.filters.hidden,
+        res.filters.no_ignore,
+        res.filters.include_noise,
+    );
+    if !res.filters.globs.is_empty() {
+        let globs = format_bounded_list(&res.filters.globs, 120);
+        line.push_str(&format!(", globs=[{globs}]"));
+    }
+    if let Some(ft) = &res.filters.file_type {
+        line.push_str(&format!(", type={}", sanitize_inline_value(ft)));
+    }
+    line
+}
+
+fn render_search_text_inner(
+    res: &SearchResult,
+    opts: &SearchOptions,
+    include_scope: bool,
+) -> String {
     if res.total_matches == 0 {
-        return "0 matches\n".to_owned();
+        if include_scope {
+            return format!(
+                "0 matches ({} examined)\n{}\n",
+                res.examined_files,
+                format_scope_line(res)
+            );
+        }
+        return format!("0 matches ({} examined)\n", res.examined_files);
     }
     let mut out = String::new();
     for fg in &res.files {
@@ -493,6 +748,10 @@ fn render_search_text_inner(res: &SearchResult, opts: &SearchOptions) -> String 
             }
         }
     }
+    if include_scope {
+        out.push_str(&format_scope_line(res));
+        out.push('\n');
+    }
     if res.truncated {
         out.push_str(&search_notice(res));
         out.push('\n');
@@ -513,7 +772,7 @@ pub fn render_search_json(res: &SearchResult, opts: &SearchOptions) -> String {
         &mut trimmed,
         opts.max_tokens,
         |s| serde_json::to_string(s).unwrap_or_else(|_| "{}".to_owned()),
-        |s| search_trim_step(s, opts.files_only),
+        |s| search_json_trim_step(s, opts.files_only),
     );
     serde_json::to_string(&trimmed).unwrap_or_else(|_| "{}".to_owned())
 }
@@ -608,11 +867,15 @@ mod tests {
             ],
             total_matches: 4,
             total_files: 2,
+            examined_files: 2,
             shown_matches: 4,
             shown_files: 2,
             omitted_matches: 0,
             omitted_files: 0,
             truncated: false,
+            roots: vec![".".to_owned()],
+            omitted_roots: 0,
+            filters: SearchFilters::default(),
             raw_bytes: 0,
         }
     }
@@ -631,12 +894,13 @@ mod tests {
     fn search_text_budget_edge_exact_fit_one_token_less_and_below_notice() {
         let (t1, t2, t3, t4) = sample_texts();
         let res = sample_result();
+        let scope = "scope: 2 examined, 2 matched, roots=., hidden=false, no_ignore=false, include_noise=false\n";
         let full = render_search_text(&res, &budgeted_opts(0));
         assert_eq!(
             full,
             format!(
                 "a.rs (2 matches)\n  L1: {t1}\n  L2: {t2}\n\
-                 b.rs (2 matches)\n  L3: {t3}\n  L4: {t4}\n"
+                 b.rs (2 matches)\n  L3: {t3}\n  L4: {t4}\n{scope}"
             )
         );
         let exact = full.len().div_ceil(4);
@@ -649,7 +913,7 @@ mod tests {
         assert_eq!(
             less,
             format!(
-                "a.rs (2 matches)\n  L1: {t1}\n  L2: {t2}\n\
+                "a.rs (2 matches)\n  L1: {t1}\n  L2: {t2}\n{scope}\
                  ... (+2 omitted matches across 1 files; narrow with --glob/--type or --max-tokens)\n"
             )
         );
@@ -666,6 +930,8 @@ mod tests {
     fn search_json_budget_edge_exact_fit_one_token_less_and_below_smallest_valid() {
         let (t1, t2, t3, t4) = sample_texts();
         let res = sample_result();
+        let meta = "\"total_matches\":4,\"total_files\":2,\"examined_files\":2";
+        let tail = "\"roots\":[\".\"],\"filters\":{\"hidden\":false,\"no_ignore\":false,\"include_noise\":false,\"globs\":[]}";
         let full = render_search_json(&res, &budgeted_opts(0));
         assert_eq!(
             full,
@@ -674,8 +940,8 @@ mod tests {
                  {{\"line\":1,\"text\":\"{t1}\"}},{{\"line\":2,\"text\":\"{t2}\"}}]}},\
                  {{\"path\":\"b.rs\",\"total_matches\":2,\"matches\":[\
                  {{\"line\":3,\"text\":\"{t3}\"}},{{\"line\":4,\"text\":\"{t4}\"}}]}}],\
-                 \"total_matches\":4,\"total_files\":2,\"shown_matches\":4,\"shown_files\":2,\
-                 \"omitted_matches\":0,\"omitted_files\":0,\"truncated\":false}}"
+                 {meta},\"shown_matches\":4,\"shown_files\":2,\
+                 \"omitted_matches\":0,\"omitted_files\":0,\"truncated\":false,{tail}}}"
             )
         );
         let exact = full.len().div_ceil(4);
@@ -691,8 +957,8 @@ mod tests {
                  {{\"line\":1,\"text\":\"{t1}\"}},{{\"line\":2,\"text\":\"{t2}\"}}]}},\
                  {{\"path\":\"b.rs\",\"total_matches\":2,\"matches\":[\
                  {{\"line\":3,\"text\":\"{t3}\"}}]}}],\
-                 \"total_matches\":4,\"total_files\":2,\"shown_matches\":3,\"shown_files\":2,\
-                 \"omitted_matches\":1,\"omitted_files\":0,\"truncated\":true}}"
+                 {meta},\"shown_matches\":3,\"shown_files\":2,\
+                 \"omitted_matches\":1,\"omitted_files\":0,\"truncated\":true,{tail}}}"
             )
         );
         assert!(less.len() <= (exact - 1) * 4);
@@ -701,8 +967,10 @@ mod tests {
         let tiny = render_search_json(&res, &budgeted_opts(1));
         assert_eq!(
             tiny,
-            "{\"files\":[],\"total_matches\":4,\"total_files\":2,\"shown_matches\":0,\
-             \"shown_files\":0,\"omitted_matches\":4,\"omitted_files\":2,\"truncated\":true}"
+            format!(
+                "{{\"files\":[],{meta},\"shown_matches\":0,\
+                 \"shown_files\":0,\"omitted_matches\":4,\"omitted_files\":2,\"truncated\":true,{tail}}}"
+            )
         );
         assert!(tiny.len() > 4);
         let _: serde_json::Value = serde_json::from_str(&tiny).unwrap();
@@ -752,5 +1020,258 @@ mod tests {
         };
         let err = execute_search(&opts).unwrap_err();
         assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn workflow_acceptance_and_examined_vs_matched_counts() {
+        let tmp = Tmp::new("workflow");
+        tmp.write(
+            ".github/workflows/ci.yml",
+            b"jobs:\n  core-native:\n    runs-on: ubuntu-latest\n",
+        );
+        let wf_root = tmp.0.join(".github/workflows");
+
+        // 1. Duplicate root-relative workflow glob excludes all -> 0 examined, 0 matched.
+        let dup_glob_opts = SearchOptions {
+            pattern: "core-native".to_owned(),
+            paths: vec![wf_root.clone()],
+            globs: vec![".github/workflows/*.yml".to_owned()],
+            ..SearchOptions::default()
+        };
+        let dup_res = execute_search(&dup_glob_opts).unwrap();
+        assert_eq!(dup_res.examined_files, 0);
+        assert_eq!(dup_res.total_files, 0);
+        assert_eq!(dup_res.total_matches, 0);
+        let dup_txt = render_search_text(&dup_res, &dup_glob_opts);
+        assert!(dup_txt.contains("0 matches"), "{dup_txt}");
+        assert!(dup_txt.contains("0 examined"), "{dup_txt}");
+        assert!(dup_txt.contains("globs=[.github/workflows/*.yml]"), "{dup_txt}");
+        let dup_json: serde_json::Value =
+            serde_json::from_str(&render_search_json(&dup_res, &dup_glob_opts)).unwrap();
+        assert_eq!(dup_json["examined_files"], 0);
+        assert_eq!(dup_json["total_files"], 0);
+        assert_eq!(dup_json["filters"]["globs"][0], ".github/workflows/*.yml");
+
+        // 2. Targeted .github/workflows finds core-native -> 1 examined, 1 matched.
+        let hit_opts = SearchOptions {
+            pattern: "core-native".to_owned(),
+            paths: vec![wf_root.clone()],
+            ..SearchOptions::default()
+        };
+        let hit_res = execute_search(&hit_opts).unwrap();
+        assert_eq!(hit_res.examined_files, 1);
+        assert_eq!(hit_res.total_files, 1);
+        assert_eq!(hit_res.total_matches, 1);
+        let hit_txt = render_search_text(&hit_res, &hit_opts);
+        assert!(hit_txt.contains("1 examined, 1 matched"), "{hit_txt}");
+        assert!(hit_txt.contains("core-native"), "{hit_txt}");
+
+        // 3. Absent core-native-macos in that same eligible file -> 1 examined, 0 matched.
+        let miss_opts = SearchOptions {
+            pattern: "core-native-macos".to_owned(),
+            paths: vec![wf_root],
+            ..SearchOptions::default()
+        };
+        let miss_res = execute_search(&miss_opts).unwrap();
+        assert_eq!(miss_res.examined_files, 1);
+        assert_eq!(miss_res.total_files, 0);
+        assert_eq!(miss_res.total_matches, 0);
+        let miss_txt = render_search_text(&miss_res, &miss_opts);
+        assert!(miss_txt.contains("0 matches"), "{miss_txt}");
+        assert!(miss_txt.contains("1 examined, 0 matched"), "{miss_txt}");
+        let miss_json: serde_json::Value =
+            serde_json::from_str(&render_search_json(&miss_res, &miss_opts)).unwrap();
+        assert_eq!(miss_json["examined_files"], 1);
+        assert_eq!(miss_json["total_files"], 0);
+    }
+
+    #[test]
+    fn skips_binaries_and_duplicates_in_examined_count_and_sanitizes_scope() {
+        let tmp = Tmp::new("bin_dup");
+        tmp.write("a.rs", b"fn alpha() {}\n");
+        tmp.write("b.rs", b"fn beta() {}\n");
+        // Eligible .rs file containing NUL bytes so binary exclusion in read_searchable_text is exercised.
+        tmp.write("bin.rs", b"\x00\x01\x02fn alpha() {}\x00");
+        let a_dup = tmp.0.join("a.rs");
+        let opts = SearchOptions {
+            pattern: "alpha".to_owned(),
+            paths: vec![tmp.0.clone(), a_dup],
+            globs: vec!["*.rs".to_owned(), "bad\ninjected_line".to_owned()],
+            lang_type: Some(Lang::Rust),
+            hidden: true,
+            no_ignore: true,
+            include_noise: true,
+            ..SearchOptions::default()
+        };
+        let res = execute_search(&opts).unwrap();
+        assert_eq!(res.examined_files, 2); // a.rs + b.rs; duplicate a.rs and binary bin.rs skipped
+        assert_eq!(res.total_files, 1);
+        let txt = render_search_text(&res, &opts);
+        assert!(!txt.contains("\ninjected_line"), "{txt}");
+        assert!(txt.contains("bad\\ninjected_line"), "{txt}");
+        assert!(txt.contains("hidden=true, no_ignore=true, include_noise=true"), "{txt}");
+        assert!(txt.contains("type=rust"), "{txt}");
+        let json: serde_json::Value =
+            serde_json::from_str(&render_search_json(&res, &opts)).unwrap();
+        assert_eq!(json["examined_files"], 2);
+        assert_eq!(json["filters"]["hidden"], true);
+        assert_eq!(json["filters"]["no_ignore"], true);
+        assert_eq!(json["filters"]["include_noise"], true);
+        assert_eq!(json["filters"]["type"], "rust");
+    }
+
+    #[test]
+    fn long_scope_roots_and_globs_are_bounded_without_hiding_matches_or_losing_negative_examined_count() {
+        let tmp = Tmp::new("long_scope");
+        tmp.write("a.rs", b"fn needle() {}\n");
+        let mut paths = vec![tmp.0.join("a.rs")];
+        for i in 0..40 {
+            let p = tmp.0.join(format!("extra_{i:02}.rs"));
+            std::fs::write(&p, b"fn other() {}\n").unwrap();
+            paths.push(p);
+        }
+        let mut globs = vec!["*.rs".to_owned()];
+        for i in 0..40 {
+            globs.push(format!("!ignored_pattern_{i:02}_*"));
+        }
+
+        // 1. Positive result with many roots & globs under a moderate JSON budget:
+        //    scope lists are omitted before cutting the matching file.
+        let hit_opts = SearchOptions {
+            pattern: "needle".to_owned(),
+            paths: paths.clone(),
+            globs: globs.clone(),
+            max_tokens: 220,
+            ..SearchOptions::default()
+        };
+        let hit_res = execute_search(&hit_opts).unwrap();
+        assert_eq!(hit_res.examined_files, 41);
+        assert_eq!(hit_res.total_files, 1);
+        let hit_json_s = render_search_json(&hit_res, &hit_opts);
+        assert!(hit_json_s.len() <= 220 * 4, "len={}", hit_json_s.len());
+        let hit_json: serde_json::Value = serde_json::from_str(&hit_json_s).unwrap();
+        assert_eq!(hit_json["files"].as_array().unwrap().len(), 1);
+        assert!(hit_json["omitted_roots"].as_u64().unwrap() > 0);
+        assert!(hit_json["filters"]["omitted_globs"].as_u64().unwrap() > 0);
+
+        // 2. Smallest budgeted JSON document remains bounded even with 41 roots and 41 globs.
+        let tiny_json_opts = SearchOptions {
+            max_tokens: 20,
+            ..hit_opts.clone()
+        };
+        let tiny_json_s = render_search_json(&hit_res, &tiny_json_opts);
+        let tiny_json: serde_json::Value = serde_json::from_str(&tiny_json_s).unwrap();
+        assert!(tiny_json["files"].as_array().unwrap().is_empty());
+        let tiny_roots_len = tiny_json["roots"].as_array().unwrap().len();
+        assert!(tiny_roots_len <= 1);
+        assert_eq!(tiny_roots_len + tiny_json["omitted_roots"].as_u64().unwrap() as usize, 41);
+        assert!(tiny_json["filters"]["globs"].as_array().unwrap().is_empty());
+        assert_eq!(tiny_json["filters"]["omitted_globs"], 41);
+
+        // 3. Negative-result text budget: `0 matches (41 examined)` survives where it fits.
+        let miss_opts = SearchOptions {
+            pattern: "absent_symbol".to_owned(),
+            paths,
+            globs,
+            max_tokens: 10,
+            ..SearchOptions::default()
+        };
+        let miss_res = execute_search(&miss_opts).unwrap();
+        assert_eq!(miss_res.examined_files, 41);
+        let miss_txt = render_search_text(&miss_res, &miss_opts);
+        assert!(miss_txt.len() <= 10 * 4, "{miss_txt}");
+        assert!(miss_txt.contains("0 matches (41 examined)"), "{miss_txt}");
+    }
+
+    #[test]
+    fn text_tight_budget_preserves_head_matches_and_zero_match_one_token_never_empty() {
+        let mut res = sample_result();
+        res.files[0].matches.truncate(1);
+        res.files[0].matches[0].text = "alpha needle one".to_owned();
+        res.files[0].total_matches = 1;
+        res.files[1].matches.truncate(1);
+        res.files[1].matches[0].text = format!("beta needle two {}", "z".repeat(110));
+        res.files[1].total_matches = 1;
+        res.total_matches = 2;
+        res.shown_matches = 2;
+
+        // 42 tokens = 168 bytes: `a.rs` + `notice` (~125 bytes) fits, whereas
+        // `a.rs` + `scope:` + `notice` (~210 bytes) does not, and `a.rs` + `b.rs` > 168 bytes.
+        // Head match + notice must survive.
+        let txt = render_search_text(&res, &budgeted_opts(42));
+        assert!(txt.len() <= 42 * 4, "len={}: {txt}", txt.len());
+        assert!(txt.contains("a.rs (1 matches)"), "{txt}");
+        assert!(txt.contains("L1: alpha needle one"), "{txt}");
+        assert!(txt.contains("omitted matches"), "{txt}");
+
+        // 1-token zero-match text budget must never be empty (ADR-0017 D6).
+        let zero = SearchResult {
+            files: Vec::new(),
+            total_matches: 0,
+            total_files: 0,
+            examined_files: 3,
+            shown_matches: 0,
+            shown_files: 0,
+            omitted_matches: 0,
+            omitted_files: 0,
+            truncated: false,
+            roots: vec![".".to_owned()],
+            omitted_roots: 0,
+            filters: SearchFilters::default(),
+            raw_bytes: 0,
+        };
+        let zero_tiny = render_search_text(&zero, &budgeted_opts(1));
+        assert!(!zero_tiny.is_empty());
+        assert!(zero_tiny.contains("0 matches"), "{zero_tiny}");
+    }
+
+    #[test]
+    fn json_just_below_full_with_short_multiple_roots_globs_and_sole_90_char_root() {
+        // 1. Short multiple roots/globs: just below full must trim tail match,
+        //    not drop short roots/globs (which would grow JSON via omitted_* counters).
+        let mut short_multi = sample_result();
+        short_multi.roots = vec!["a".to_owned(), "b".to_owned()];
+        short_multi.filters.globs = vec!["*.rs".to_owned(), "*.ts".to_owned()];
+        let full_multi = render_search_json(&short_multi, &budgeted_opts(0));
+        let exact_multi = full_multi.len().div_ceil(4);
+        let less_multi = render_search_json(&short_multi, &budgeted_opts(exact_multi - 1));
+        assert!(less_multi.len() <= (exact_multi - 1) * 4, "len={}", less_multi.len());
+        let v_multi: serde_json::Value = serde_json::from_str(&less_multi).unwrap();
+        assert_eq!(v_multi["roots"], serde_json::json!(["a", "b"]));
+        assert_eq!(v_multi["filters"]["globs"], serde_json::json!(["*.rs", "*.ts"]));
+        assert!(v_multi.get("omitted_roots").is_none());
+        assert!(v_multi["filters"].get("omitted_globs").is_none());
+        assert_eq!(v_multi["shown_matches"], 3);
+
+        // 2. Sole ordinary ~90-char root: just below full must keep the sole root
+        //    and trim tail match instead of dropping the root first.
+        let sole_90 = "/var/folders/1q/f0jgmfv97bndz3vndb642m880000gn/T/prom_search_ordinary_90_char_root_dir_x";
+        assert!(sole_90.len() >= 85 && sole_90.len() <= 95);
+        let mut res_90 = sample_result();
+        res_90.roots = vec![sole_90.to_owned()];
+        let full_90 = render_search_json(&res_90, &budgeted_opts(0));
+        let exact_90 = full_90.len().div_ceil(4);
+        let less_90 = render_search_json(&res_90, &budgeted_opts(exact_90 - 1));
+        assert!(less_90.len() <= (exact_90 - 1) * 4, "len={}", less_90.len());
+        let v_90: serde_json::Value = serde_json::from_str(&less_90).unwrap();
+        assert_eq!(v_90["roots"], serde_json::json!([sole_90]));
+        assert!(v_90.get("omitted_roots").is_none());
+        assert_eq!(v_90["shown_matches"], 3);
+
+        // 3. Pathological single >256-char root: compacted before trimming matches.
+        let mut res_path = sample_result();
+        res_path.roots = vec!["x".repeat(500)];
+        let mut expected_compacted = sample_result();
+        expected_compacted.roots.clear();
+        expected_compacted.omitted_roots = 1;
+        let budget_tokens = render_search_json(&expected_compacted, &budgeted_opts(0))
+            .len()
+            .div_ceil(4);
+        let path_json = render_search_json(&res_path, &budgeted_opts(budget_tokens));
+        assert!(path_json.len() <= budget_tokens * 4, "len={}", path_json.len());
+        let v_path: serde_json::Value = serde_json::from_str(&path_json).unwrap();
+        assert_eq!(v_path["shown_matches"], 4);
+        assert_eq!(v_path["roots"], serde_json::json!([]));
+        assert_eq!(v_path["omitted_roots"], 1);
     }
 }
