@@ -1,21 +1,18 @@
-//! Test-log parsing (spec #43, ticket #50): streaming parsers that turn
-//! check output into the normalized receipt, failure selectors included.
+//! Test-log parsing: streaming parsers that turn check output into a
+//! typed result — counts or a named error, failing lines, and failed-test
+//! selectors.
 //!
-//! One deep operation at the engine seam: `parse_check_log` takes the log
-//! text (the gate runtime already holds it) and returns the receipt
-//! document as JSON — `{schema, counts, error, failing_lines, failed_tests}`.
-//! Inside, the parse is line-incremental: each family keeps only the small
-//! state its summary needs, so a log's size costs time, not memory. The
-//! Python parser in `sureforge_hook` is the parity oracle (ADR-0007 D5):
-//! counts, strictness, and error identity mirror `parse_test_log` and
-//! `_failing_lines`; the failure selectors are the shapes `_repair_command`
-//! turns into a targeted rerun for the next repair round's Write brief
-//! (ADR-0003). Malformed input is data, never a crash: every failure is a
-//! named `error` code in the document.
+//! One deep operation at the engine seam: `parse_log` takes the log text
+//! and returns a [`ParsedLog`]. Inside, the parse is line-incremental:
+//! each family keeps only the small state its summary needs, so a log's
+//! size costs time, not memory. The golden corpus under
+//! `tests/fixtures/log_corpus/` is the parser's oracle. Malformed input is
+//! data, never a crash: every failure is a named `error` code in the
+//! result, and a parser panic yields the `no-summary` error instead of
+//! reaching the caller.
 
 use std::collections::{HashMap, HashSet};
 
-const SCHEMA: u32 = 1;
 const FAILING_LINE_LIMIT: usize = 50;
 const SELECTOR_LIMIT: usize = 50;
 
@@ -48,7 +45,7 @@ fn utf8_len(first: u8) -> usize {
     }
 }
 
-/// The Python oracle's preprocessing: ANSI escapes out, line endings to `\n`.
+/// Preprocessing: ANSI escapes out, line endings to `\n`.
 fn normalize(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let bytes = text.as_bytes();
@@ -72,7 +69,7 @@ fn normalize(text: &str) -> String {
     out.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-/// Python's `str.splitlines` for the boundary set a log can contain
+/// Split lines on the boundary set a log can contain
 /// (`\n`, `\r`, `\r\n`, `\x0b`, `\x0c`).
 fn split_lines(text: &str) -> Vec<&str> {
     let mut lines = Vec::new();
@@ -98,9 +95,9 @@ fn split_lines(text: &str) -> Vec<&str> {
     lines
 }
 
-/// Python's `int()` for the strings these parsers feed it: surrounding
+/// An integer for the strings these parsers feed it: surrounding
 /// whitespace, an optional sign, then ASCII digits. Anything else is not a
-/// count (the oracle raises there; the receipt reports `bad-count` instead).
+/// count and reports `bad-count` instead.
 fn parse_int(raw: &str) -> Option<i128> {
     let text = raw.trim();
     if text.is_empty() {
@@ -120,8 +117,7 @@ fn parse_int(raw: &str) -> Option<i128> {
     Some(sign * value)
 }
 
-/// A strict count field: ASCII digits only, as the oracle's
-/// `value.isascii() and value.isdigit()` requires.
+/// A strict count field: ASCII digits only.
 fn is_count(raw: &str) -> Option<i128> {
     if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -170,7 +166,7 @@ fn take_digits(text: &str) -> Option<(i128, &str)> {
 }
 
 // ---------------------------------------------------------------------------
-// Failing lines: `_failing_lines` on the oracle side (raw text, first 50).
+// Failing lines (raw text, first 50).
 
 fn is_failing_line(line: &str) -> bool {
     if line.starts_with("FAIL:") || line.starts_with("ERROR:") || line.starts_with("failures:") {
@@ -305,29 +301,6 @@ fn mtp_failure(line: &str) -> Option<&str> {
     Some(name)
 }
 
-fn failed_selectors(lines: &[&str]) -> Vec<String> {
-    let mut selectors: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for line in lines {
-        let selector = if let Some((name, qualifier)) = unittest_failure(line) {
-            Some(unittest_selector(name, qualifier))
-        } else if line.starts_with("FAILED ") || line.starts_with("ERROR ") {
-            pytest_failure(line).map(str::to_string)
-        } else if let Some(name) = cargo_failure(line) {
-            Some(format!("cargo test -- --exact {name}"))
-        } else {
-            vstest_failure(line).or_else(|| mtp_failure(line))
-                .map(|name| format!("dotnet test --filter FullyQualifiedName={name}"))
-        };
-        if let Some(selector) = selector {
-            if selectors.len() < SELECTOR_LIMIT && seen.insert(selector.clone()) {
-                selectors.push(selector);
-            }
-        }
-    }
-    selectors
-}
-
 // ---------------------------------------------------------------------------
 // unittest summaries.
 
@@ -453,7 +426,7 @@ fn pytest_group(line: &str) -> Option<&str> {
     let rest = line.trim_start_matches('=').trim_start_matches([' ', '\t']);
     let bytes = rest.as_bytes();
     // Item boundaries: the end offset after each `\d+ [a-z]+` item. Items
-    // are separated by ", ", or by nothing (the oracle's regex allows the
+    // are separated by ", ", or by nothing (the summary grammar allows the
     // separator group to match empty, gluing the counts together).
     let mut ends: Vec<usize> = Vec::new();
     let mut pos = 0;
@@ -618,8 +591,8 @@ fn mtp_field(line: &str) -> Option<(&str, &str)> {
 }
 
 /// The verdict phrase at the end of an MTP assembly line's head zone,
-/// returning what precedes it. Phrases (ASCII case-insensitive, as the
-/// oracle's pattern is): `passed`, `skipped`, `zero tests ran`, `failed`,
+/// returning what precedes it. Phrases (ASCII case-insensitive):
+/// `passed`, `skipped`, `zero tests ran`, `failed`,
 /// `failed with N error(s)`, optionally `and M warning(s)`, or
 /// `failed with N warning(s)`.
 fn assembly_head(zone: &str) -> Option<&str> {
@@ -743,7 +716,7 @@ fn vstest_parse(line: &str) -> Option<(Verdict, DotnetValues, String)> {
     let total = take_count(&mut tail, "Total:")?;
     tail = tail.strip_prefix(',')?.trim_start_matches([' ', '\t']);
     let duration = tail.strip_prefix("Duration:")?;
-    // Duration is lazy in the oracle's pattern: the first [ \t]+-[ \t]*
+    // Duration is lazy: the first [ \t]+-[ \t]*
     // split whose project side is non-blank wins.
     let bytes = duration.as_bytes();
     let mut i = 0;
@@ -825,7 +798,8 @@ fn vstest_detailed_parse(lines: &[&str], known_failure: bool) -> Result<DotnetVa
 fn resolve_dotnet(
     blocks: &[MtpBlock],
     vstest_lines: &[&str],
-    vstest_detailed: &[&[&str]],
+    detailed_lines: &[&str],
+    detailed_starts: &[usize],
     known_failure: bool,
 ) -> Result<(Counts, bool), &'static str> {
     let mut details: Vec<(String, DotnetValues)> = Vec::new();
@@ -904,8 +878,11 @@ fn resolve_dotnet(
         details.push((project, values));
     }
     let mut detailed_values: Vec<DotnetValues> = Vec::new();
-    for lines in vstest_detailed {
-        detailed_values.push(vstest_detailed_parse(lines, known_failure)?);
+    for &start in detailed_starts {
+        detailed_values.push(vstest_detailed_parse(
+            &detailed_lines[start..],
+            known_failure,
+        )?);
     }
     if detailed_values.len() == 1 {
         if aggregate.replace(detailed_values.pop().unwrap()).is_some() {
@@ -967,58 +944,272 @@ fn resolve_dotnet(
 }
 
 // ---------------------------------------------------------------------------
-// The receipt document.
+// The typed result.
 
-fn json_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => out.push(ch),
+/// The typed result of parsing a test log (ticket #94): counts or a
+/// named error, the failing lines, and the failed-test selectors.
+/// Serializes as `{counts, error, failing_lines, failed_tests}` — the
+/// shape the golden corpus compares.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ParsedLog {
+    pub counts: Option<crate::check::Counts>,
+    pub error: Option<String>,
+    pub failing_lines: Vec<String>,
+    pub failed_tests: Vec<String>,
+}
+
+impl ParsedLog {
+    fn no_summary() -> Self {
+        ParsedLog {
+            counts: None,
+            error: Some("no-summary".to_string()),
+            failing_lines: Vec::new(),
+            failed_tests: Vec::new(),
         }
     }
-    out
 }
 
-fn json_string_list(items: &[String]) -> String {
-    let parts: Vec<String> =
-        items.iter().map(|item| format!("\"{}\"", json_escape(item))).collect();
-    format!("[{}]", parts.join(", "))
+fn to_check_counts(counts: &Counts) -> Option<crate::check::Counts> {
+    Some(crate::check::Counts {
+        passed: i64::try_from(counts.passed).ok()?,
+        failed: i64::try_from(counts.failed).ok()?,
+        skipped: i64::try_from(counts.skipped).ok()?,
+        total: i64::try_from(counts.total).ok()?,
+    })
 }
 
-fn receipt_json(
-    counts: Option<&Counts>,
-    error: Option<&str>,
-    failing_lines: &[String],
-    failed_tests: &[String],
-) -> String {
-    let counts_json = match counts {
-        Some(c) => format!(
-            "{{\"passed\": {}, \"failed\": {}, \"skipped\": {}, \"total\": {}}}",
-            c.passed, c.failed, c.skipped, c.total
-        ),
-        None => "null".to_string(),
-    };
-    let error_json = match error {
-        Some(code) => format!("\"{}\"", json_escape(code)),
-        None => "null".to_string(),
-    };
-    format!(
-        "{{\"schema\": {SCHEMA}, \"counts\": {counts_json}, \"error\": {error_json}, \
-         \"failing_lines\": {}, \"failed_tests\": {}}}",
-        json_string_list(failing_lines),
-        json_string_list(failed_tests)
-    )
+// ---------------------------------------------------------------------------
+// Framework adapters (ticket #95).
+//
+// One adapter per framework family behind one interface: an adapter
+// receives every (normalized) line and, at the end, gives counts or a
+// named error, plus its failed-test selectors. VSTest and MTP share the
+// dotnet adapter because they share one resolution step.
+//
+// Combination is fixed: the first error in registry order wins (unittest
+// before dotnet; pytest and cargo never error); otherwise the counts of
+// every family that found a summary are summed; when no family found one,
+// the result is `no-summary`. The combining step holds no
+// framework-specific state.
+
+struct AdapterOutcome {
+    result: Result<(Counts, bool), &'static str>,
+    selectors: Vec<(usize, String)>,
 }
 
-fn parse_impl(text: &str, exit_code: Option<i64>) -> String {
+trait LogAdapter {
+    fn feed(&mut self, line: &str);
+    fn finish(self: Box<Self>, known_failure: bool) -> AdapterOutcome;
+}
+
+/// The single place a framework is registered. Registry order is also the
+/// error precedence order and the selector precedence order for lines
+/// several families could claim. Adding a framework takes one new adapter
+/// and one entry here, with no edit to the combining step.
+fn adapter_registry() -> Vec<Box<dyn LogAdapter>> {
+    vec![
+        Box::new(UnittestAdapter::default()),
+        Box::new(PytestAdapter::default()),
+        Box::new(CargoAdapter::default()),
+        Box::new(DotnetAdapter::default()),
+    ]
+}
+
+#[derive(Default)]
+struct UnittestAdapter {
+    line_no: usize,
+    rans: Vec<(usize, i128)>,
+    ends: Vec<(usize, Option<String>)>,
+    no_tests_ran: Vec<usize>,
+    selectors: Vec<(usize, String)>,
+}
+
+impl LogAdapter for UnittestAdapter {
+    fn feed(&mut self, line: &str) {
+        let index = self.line_no;
+        self.line_no += 1;
+        if let Some((name, qualifier)) = unittest_failure(line) {
+            self.selectors
+                .push((index, unittest_selector(name, qualifier)));
+        }
+        if let Some(total) = unittest_ran(line) {
+            self.rans.push((index, total));
+        }
+        if let Some(parts) = unittest_end(line) {
+            self.ends.push((index, parts.map(str::to_string)));
+        }
+        if is_no_tests_ran(line) {
+            self.no_tests_ran.push(index);
+        }
+    }
+
+    fn finish(self: Box<Self>, _known_failure: bool) -> AdapterOutcome {
+        AdapterOutcome {
+            result: resolve_unittest(&self.rans, &self.ends, &self.no_tests_ran),
+            selectors: self.selectors,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PytestAdapter {
+    line_no: usize,
+    counts: Counts,
+    found: bool,
+    selectors: Vec<(usize, String)>,
+}
+
+impl LogAdapter for PytestAdapter {
+    fn feed(&mut self, line: &str) {
+        let index = self.line_no;
+        self.line_no += 1;
+        if line.starts_with("FAILED ") || line.starts_with("ERROR ") {
+            if let Some(nodeid) = pytest_failure(line) {
+                self.selectors.push((index, nodeid.to_string()));
+            }
+        }
+        if let Some(group) = pytest_group(line) {
+            self.counts.add(&pytest_counts(group));
+            self.found = true;
+        }
+    }
+
+    fn finish(self: Box<Self>, _known_failure: bool) -> AdapterOutcome {
+        AdapterOutcome {
+            result: Ok((self.counts, self.found)),
+            selectors: self.selectors,
+        }
+    }
+}
+
+#[derive(Default)]
+struct CargoAdapter {
+    line_no: usize,
+    counts: Counts,
+    found: bool,
+    selectors: Vec<(usize, String)>,
+}
+
+impl LogAdapter for CargoAdapter {
+    fn feed(&mut self, line: &str) {
+        let index = self.line_no;
+        self.line_no += 1;
+        if let Some(name) = cargo_failure(line) {
+            self.selectors
+                .push((index, format!("cargo test -- --exact {name}")));
+        }
+        if let Some(found) = cargo_counts(line) {
+            self.counts.add(&found);
+            self.found = true;
+        }
+    }
+
+    fn finish(self: Box<Self>, _known_failure: bool) -> AdapterOutcome {
+        AdapterOutcome {
+            result: Ok((self.counts, self.found)),
+            selectors: self.selectors,
+        }
+    }
+}
+
+#[derive(Default)]
+struct DotnetAdapter {
+    line_no: usize,
+    blocks: Vec<MtpBlock>,
+    collecting: Option<usize>,
+    vstest_lines: Vec<String>,
+    /// Detailed VSTest groups, stored without per-line cloning: an
+    /// open group runs to the end of the log, so a group is fully
+    /// described by the index of its header line in `detailed_lines`,
+    /// the one shared store every later line is appended to exactly
+    /// once. (Previously each open group cloned every later line,
+    /// giving O(projects × lines) copies on detailed .NET logs.)
+    detailed_lines: Vec<String>,
+    detailed_starts: Vec<usize>,
+    selectors: Vec<(usize, String)>,
+}
+
+impl LogAdapter for DotnetAdapter {
+    fn feed(&mut self, line: &str) {
+        let index = self.line_no;
+        self.line_no += 1;
+        if let Some(name) = vstest_failure(line).or_else(|| mtp_failure(line)) {
+            self.selectors.push((
+                index,
+                format!("dotnet test --filter FullyQualifiedName={name}"),
+            ));
+        }
+        // An open detailed group runs to the end of the log: store
+        // the line once, here — before the MTP block below can
+        // return early — and record a new group's start when this
+        // line is a detailed header. Every open group is the suffix
+        // of the shared store from its start, so it sees this line
+        // (and the header line starts its own group) with no cloning.
+        {
+            let trimmed = line.trim_matches([' ', '\t']);
+            let is_detailed_header = matches!(
+                trimmed,
+                "Test Run Successful."
+                    | "Test Run Failed."
+                    | "Test Run Aborted."
+                    | "Test Run Canceled."
+            ) || trimmed.starts_with("Test Run Aborted with error ");
+            if is_detailed_header || !self.detailed_starts.is_empty() {
+                if is_detailed_header {
+                    self.detailed_starts.push(self.detailed_lines.len());
+                }
+                self.detailed_lines.push(line.to_string());
+            }
+        }
+        // An open MTP block consumes field, assembly, and blank lines; any
+        // other line closes it and is processed on its own merits. (The
+        // families' scans are independent, and a consumed line matches no
+        // other family's pattern: each is anchored at column 0 or carries
+        // the block's own shape.)
+        if let Some(open) = self.collecting {
+            if let Some((name, value)) = mtp_field(line) {
+                self.blocks[open]
+                    .fields
+                    .push((name.to_string(), value.to_string()));
+                if name == "duration" {
+                    self.collecting = None;
+                }
+                return;
+            }
+            if line.trim().is_empty() || mtp_assembly(line) {
+                return;
+            }
+            self.collecting = None;
+        }
+        if let Some(status) = mtp_header(line) {
+            self.blocks.push(MtpBlock {
+                status: status.to_string(),
+                fields: Vec::new(),
+            });
+            self.collecting = Some(self.blocks.len() - 1);
+        }
+        if vstest_candidate(line) {
+            self.vstest_lines.push(line.to_string());
+        }
+    }
+
+    fn finish(self: Box<Self>, known_failure: bool) -> AdapterOutcome {
+        let vstest_lines: Vec<&str> = self.vstest_lines.iter().map(String::as_str).collect();
+        let detailed_lines: Vec<&str> = self.detailed_lines.iter().map(String::as_str).collect();
+        AdapterOutcome {
+            result: resolve_dotnet(
+                &self.blocks,
+                &vstest_lines,
+                &detailed_lines,
+                &self.detailed_starts,
+                known_failure,
+            ),
+            selectors: self.selectors,
+        }
+    }
+}
+
+fn parse_impl(text: &str, exit_code: Option<i64>) -> ParsedLog {
     let known_failure = exit_code.is_some_and(|code| code != 0);
     let failing_lines: Vec<String> = split_lines(text)
         .into_iter()
@@ -1028,156 +1219,110 @@ fn parse_impl(text: &str, exit_code: Option<i64>) -> String {
         .collect();
     let normalized = normalize(text);
     let lines: Vec<&str> = normalized.split('\n').collect();
-    let failed_tests = failed_selectors(&lines);
 
-    let mut rans: Vec<(usize, i128)> = Vec::new();
-    let mut ends: Vec<(usize, Option<String>)> = Vec::new();
-    let mut no_tests_ran: Vec<usize> = Vec::new();
-    let mut pytest = Counts::default();
-    let mut pytest_found = false;
-    let mut cargo = Counts::default();
-    let mut cargo_found = false;
-    let mut blocks: Vec<MtpBlock> = Vec::new();
-    let mut collecting: Option<usize> = None;
-    let mut vstest_lines: Vec<&str> = Vec::new();
-    let mut vstest_detailed = Vec::new();
+    let mut adapters = adapter_registry();
+    for line in &lines {
+        for adapter in &mut adapters {
+            adapter.feed(line);
+        }
+    }
+    let outcomes: Vec<AdapterOutcome> = adapters
+        .into_iter()
+        .map(|adapter| adapter.finish(known_failure))
+        .collect();
 
-    for (index, line) in lines.iter().enumerate() {
-        // An open MTP block consumes field, assembly, and blank lines; any
-        // other line closes it and is processed on its own merits. (The
-        // oracle's scans are independent, and a consumed line matches no
-        // other family's pattern: each is anchored at column 0 or carries
-        // the block's own shape.)
-        if let Some(open) = collecting {
-            if let Some((name, value)) = mtp_field(line) {
-                blocks[open].fields.push((name.to_string(), value.to_string()));
-                if name == "duration" {
-                    collecting = None;
-                }
-                continue;
-            }
-            if line.trim().is_empty() || mtp_assembly(line) {
-                continue;
-            }
-            collecting = None;
-        }
-        if let Some(status) = mtp_header(line) {
-            blocks.push(MtpBlock { status: status.to_string(), fields: Vec::new() });
-            collecting = Some(blocks.len() - 1);
-        }
-        if let Some(total) = unittest_ran(line) {
-            rans.push((index, total));
-        }
-        if let Some(parts) = unittest_end(line) {
-            ends.push((index, parts.map(str::to_string)));
-        }
-        if is_no_tests_ran(line) {
-            no_tests_ran.push(index);
-        }
-        if let Some(group) = pytest_group(line) {
-            pytest.add(&pytest_counts(group));
-            pytest_found = true;
-        }
-        if let Some(found) = cargo_counts(line) {
-            cargo.add(&found);
-            cargo_found = true;
-        }
-        if vstest_candidate(line) {
-            vstest_lines.push(line);
-        }
-        let trimmed = line.trim_matches([' ', '\t']);
-        if matches!(
-            trimmed,
-            "Test Run Successful." | "Test Run Failed." | "Test Run Aborted." | "Test Run Canceled."
-        ) || trimmed.starts_with("Test Run Aborted with error ")
-        {
-            vstest_detailed.push(&lines[index..]);
+    // Selectors merge back into log order (stable, so registry order breaks
+    // ties on a shared line), deduplicated, capped like the families' own.
+    let mut all_selectors: Vec<(usize, String)> = outcomes
+        .iter()
+        .flat_map(|o| o.selectors.iter().cloned())
+        .collect();
+    all_selectors.sort_by_key(|(index, _)| *index);
+    let mut failed_tests: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (_, selector) in all_selectors {
+        if failed_tests.len() < SELECTOR_LIMIT && seen.insert(selector.clone()) {
+            failed_tests.push(selector);
         }
     }
 
-    let (counts, error) = match resolve_unittest(&rans, &ends, &no_tests_ran) {
-        Err(code) => (None, Some(code)),
-        Ok((unittest, unittest_found)) => {
-            match resolve_dotnet(&blocks, &vstest_lines, &vstest_detailed, known_failure) {
-                Err(code) => (None, Some(code)),
-                Ok((dotnet, dotnet_found)) => {
-                    if unittest_found || pytest_found || cargo_found || dotnet_found {
-                        let mut total = unittest;
-                        total.add(&pytest);
-                        total.add(&cargo);
-                        total.add(&dotnet);
-                        (Some(total), None)
-                    } else {
-                        (None, Some("no-summary"))
-                    }
+    // Fixed combination: first error in registry order wins; otherwise sum
+    // the counts of every family that found a summary; none found is
+    // `no-summary`.
+    let mut total = Counts::default();
+    let mut any_found = false;
+    let mut error: Option<&'static str> = None;
+    for outcome in &outcomes {
+        match &outcome.result {
+            Err(code) => {
+                error = Some(code);
+                break;
+            }
+            Ok((counts, found)) => {
+                if *found {
+                    total.add(counts);
+                    any_found = true;
                 }
             }
         }
+    }
+    let (counts, error) = if let Some(code) = error {
+        (None, Some(code))
+    } else if any_found {
+        (Some(total), None)
+    } else {
+        (None, Some("no-summary"))
     };
-    receipt_json(counts.as_ref(), error, &failing_lines, &failed_tests)
+    ParsedLog {
+        counts: counts.as_ref().and_then(to_check_counts),
+        error: error.map(str::to_string),
+        failing_lines,
+        failed_tests,
+    }
 }
 
-/// The parsed check-log document for the standalone `prometheus-check`
-/// runner (ADR-0010).
-pub fn parse_document(text: &str, exit_code: Option<i64>) -> String {
+/// Parse a test log into its typed result. A parser panic still yields
+/// the `no-summary` error instead of reaching the caller.
+pub fn parse_log(text: &str, exit_code: Option<i64>) -> ParsedLog {
     match std::panic::catch_unwind(|| parse_impl(text, exit_code)) {
-        Ok(document) => document,
-        Err(_) => receipt_json(None, Some("no-summary"), &[], &[]),
+        Ok(parsed) => parsed,
+        Err(_) => ParsedLog::no_summary(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_document;
-    use serde_json::{json, Value};
+    use super::parse_log;
+    use crate::check::Counts;
 
-    const DETAILED_PASS: &str = "Test Run Successful.\nTotal tests: 63\n     Passed: 63\n Total time: 19.6319 Seconds\n";
-    const TERSE_PASS: &str = "Passed! - Failed: 0, Passed: 63, Skipped: 0, Total: 63, Duration: 19 s - Sample.dll\n";
-
-    fn parse(log: &str, exit: i64) -> Value {
-        serde_json::from_str(&parse_document(log, Some(exit))).unwrap()
-    }
+    // The two VSTest detailed unit tests that used to live here
+    // (`vstest_detailed_counts`,
+    // `vstest_detailed_rejects_ambiguous_or_invalid_summary`) are replaced
+    // by the golden-corpus cases vstest-detailed-pass, vstest-terse-pass-63,
+    // vstest-detailed-and-terse-pass, vstest-detailed-indented,
+    // vstest-detailed-two-projects, vstest-detailed-failed,
+    // vstest-detailed-skipped-only, vstest-detailed-no-header,
+    // vstest-detailed-missing-total, vstest-detailed-counts-mismatch,
+    // vstest-detailed-duplicate-field, vstest-detailed-not-a-count,
+    // vstest-detailed-passed-contradiction,
+    // vstest-detailed-failed-contradiction, vstest-detailed-aborted,
+    // vstest-detailed-duplicate-aggregate, vstest-detailed-aggregate-disagrees
+    // and vstest-detailed-aggregate-disagrees-multi in
+    // tests/fixtures/log_corpus/ (walked by tests/log_corpus.rs).
 
     #[test]
-    fn vstest_detailed_counts() {
-        let expected = json!({"passed": 63, "failed": 0, "skipped": 0, "total": 63});
-        assert_eq!(parse(DETAILED_PASS, 0)["counts"], expected);
-        assert_eq!(parse(TERSE_PASS, 0)["counts"], expected);
-        assert_eq!(parse(&format!("{TERSE_PASS}{DETAILED_PASS}"), 0)["counts"], expected);
-        let indented = "  Test Run Successful.\n  Total tests: 63\n     Passed: 63\n";
-        assert_eq!(parse(indented, 0)["counts"], expected);
-        let terse_b = "Passed! - Failed: 0, Passed: 12, Skipped: 0, Total: 12, Duration: 2 s - Other.dll\n";
-        let detailed_b = "Test Run Successful.\nTotal tests: 12\n     Passed: 12\n";
+    fn typed_result_carries_counts_error_and_selectors() {
+        let parsed = parse_log("Ran 2 tests in 0.1s\n\nOK\n", Some(0));
         assert_eq!(
-            parse(&format!("{TERSE_PASS}{DETAILED_PASS}{terse_b}{detailed_b}"), 0)["counts"],
-            json!({"passed": 75, "failed": 0, "skipped": 0, "total": 75})
+            parsed.counts,
+            Some(Counts { passed: 2, failed: 0, skipped: 0, total: 2 })
         );
-        let failed = "Test Run Failed.\nTotal tests: 5\n     Passed: 2\n     Failed: 1\n    Skipped: 2\n";
-        assert_eq!(parse(failed, 1)["counts"], json!({"passed": 2, "failed": 1, "skipped": 2, "total": 5}));
-        let skipped = "Test Run Successful.\nTotal tests: 2\n    Skipped: 2\n";
-        assert_eq!(parse(skipped, 0)["counts"], json!({"passed": 0, "failed": 0, "skipped": 2, "total": 2}));
-    }
+        assert_eq!(parsed.error, None);
+        assert!(parsed.failing_lines.is_empty());
+        assert!(parsed.failed_tests.is_empty());
 
-    #[test]
-    fn vstest_detailed_rejects_ambiguous_or_invalid_summary() {
-        let terse_b = "Passed! - Failed: 0, Passed: 12, Skipped: 0, Total: 12, Duration: 2 s - Other.dll\n";
-        let wrong_b = "Test Run Successful.\nTotal tests: 1\n     Passed: 1\n";
-        for (log, error) in [
-            ("Total tests: 1\n     Passed: 1\n".into(), "no-summary"),
-            ("Test Run Successful.\n".into(), "dotnet-missing-field"),
-            ("Test Run Successful.\nTotal tests: 1\n".into(), "dotnet-counts-mismatch"),
-            ("Test Run Successful.\nTotal tests: 2\n     Passed: 1\n     Passed: 1\n".into(), "dotnet-duplicate-field"),
-            ("Test Run Successful.\nTotal tests: 1\n     Passed: 1 junk\n".into(), "dotnet-not-a-count"),
-            ("Test Run Successful.\nTotal tests: 1\n     Failed: 1\n".into(), "vstest-passed-contradiction"),
-            ("Test Run Failed.\nTotal tests: 1\n     Passed: 1\n".into(), "vstest-failed-contradiction"),
-            (format!("{TERSE_PASS}Test Run Aborted.\nTotal tests: Unknown\n"), "vstest-incomplete-run"),
-            (format!("{DETAILED_PASS}{DETAILED_PASS}"), "dotnet-duplicate-aggregate"),
-            (format!("{TERSE_PASS}Test Run Successful.\nTotal tests: 1\n     Passed: 1\n"), "dotnet-aggregate-disagrees"),
-            (format!("{TERSE_PASS}{DETAILED_PASS}{terse_b}{wrong_b}"), "dotnet-aggregate-disagrees"),
-        ] {
-            let parsed = parse(&log, 0);
-            assert!(parsed["counts"].is_null(), "{parsed}: {log}");
-            assert_eq!(parsed["error"], error, "{log}");
-        }
+        let parsed = parse_log("nothing recognizable\n", Some(0));
+        assert_eq!(parsed.counts, None);
+        assert_eq!(parsed.error.as_deref(), Some("no-summary"));
     }
 }

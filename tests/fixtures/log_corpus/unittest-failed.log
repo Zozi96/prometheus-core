@@ -1,0 +1,20 @@
+======================================================================
+FAIL: test_value (tests.test_app.T.test_value)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "tests/test_app.py", line 9, in test_value
+    self.assertEqual(1, 2)
+AssertionError: 1 != 2
+
+======================================================================
+ERROR: test_load (tests.test_app.T)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "tests/test_app.py", line 12, in test_load
+    raise RuntimeError("boom")
+RuntimeError: boom
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.01s
+
+FAILED (failures=1, errors=1)

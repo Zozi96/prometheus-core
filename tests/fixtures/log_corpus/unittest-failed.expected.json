@@ -1,0 +1,19 @@
+{
+  "exit": 1,
+  "counts": {
+    "passed": 2,
+    "failed": 2,
+    "skipped": 0,
+    "total": 4
+  },
+  "error": null,
+  "failing_lines": [
+    "FAIL: test_value (tests.test_app.T.test_value)",
+    "ERROR: test_load (tests.test_app.T)",
+    "FAILED (failures=1, errors=1)"
+  ],
+  "failed_tests": [
+    "tests/test_app.py:T.test_value",
+    "tests/test_app.py:T.test_load"
+  ]
+}

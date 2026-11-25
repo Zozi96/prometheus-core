@@ -1,0 +1,9 @@
+Running tests from Foo/bin/Foo.dll (net10.0|arm64)
+  failed Foo.Tests.UnitTest1.TestMethod1 (12ms)
+    Assert.AreEqual failed.
+Test run summary: Failed!
+  total: 4
+  failed: 1
+  succeeded: 3
+  skipped: 0
+  duration: 40ms

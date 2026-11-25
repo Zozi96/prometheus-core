@@ -1,5 +1,6 @@
 //! Budgeted, grouped, line-clipped, optionally symbol-annotated search (`prometheus-kit search`).
 
+use crate::budget::{self, KeepPolicy};
 use crate::kit_util::{clip_centered, is_noise_path};
 use crate::outline::{flatten_items, outline_source, Lang, OutlineOptions};
 use ignore::overrides::OverrideBuilder;
@@ -369,7 +370,6 @@ pub fn execute_search(opts: &SearchOptions) -> Result<SearchResult, SearchError>
 
     let mut res = build_search_result(files, total_matches, total_files, opts.files_only);
     res.raw_bytes = raw_bytes;
-    apply_search_text_budget(&mut res, opts);
     Ok(res)
 }
 
@@ -413,31 +413,61 @@ fn recompute_search_counts(res: &mut SearchResult, files_only: bool) {
     res.truncated = res.omitted_files > 0 || res.omitted_matches > 0;
 }
 
-fn apply_search_text_budget(res: &mut SearchResult, opts: &SearchOptions) {
-    if opts.max_tokens == 0 {
-        return;
+/// `search`'s Keep policy is **head**: one give-up drops the last shown
+/// match of the last file (while it still shows more than one), then the
+/// last file itself. The budget module owns the loop and the conversion.
+fn search_trim_step(res: &mut SearchResult, files_only: bool) -> bool {
+    if res.files.is_empty() {
+        return false;
     }
-    let budget_chars = opts.max_tokens.saturating_mul(4);
-    loop {
-        let rendered = render_search_text(res, opts);
-        if rendered.len() <= budget_chars || res.files.is_empty() {
-            break;
-        }
-        if !opts.files_only {
-            if let Some(last) = res.files.last_mut() {
-                if last.matches.len() > 1 {
-                    last.matches.pop();
-                    recompute_search_counts(res, opts.files_only);
-                    continue;
-                }
+    if !files_only {
+        if let Some(last) = res.files.last_mut() {
+            if last.matches.len() > 1 {
+                last.matches.pop();
+                recompute_search_counts(res, files_only);
+                return true;
             }
         }
-        res.files.pop();
-        recompute_search_counts(res, opts.files_only);
     }
+    res.files.pop();
+    recompute_search_counts(res, files_only);
+    true
+}
+
+/// The `search` truncation notice for a (possibly trimmed) result,
+/// without its trailing newline. Wording is unchanged.
+fn search_notice(res: &SearchResult) -> String {
+    format!(
+        "... (+{} omitted matches across {} files; narrow with --glob/--type or --max-tokens)",
+        res.omitted_matches, res.omitted_files
+    )
 }
 
 pub fn render_search_text(res: &SearchResult, opts: &SearchOptions) -> String {
+    if opts.max_tokens == 0 {
+        return render_search_text_inner(res, opts);
+    }
+    let mut trimmed = res.clone();
+    budget::trim_structured(
+        &mut trimmed,
+        opts.max_tokens,
+        |s| render_search_text_inner(s, opts),
+        |s| search_trim_step(s, opts.files_only),
+    );
+    let notice = if trimmed.truncated {
+        search_notice(&trimmed)
+    } else {
+        String::new()
+    };
+    budget::finish_text(
+        render_search_text_inner(&trimmed, opts),
+        opts.max_tokens,
+        KeepPolicy::Head,
+        &notice,
+    )
+}
+
+fn render_search_text_inner(res: &SearchResult, opts: &SearchOptions) -> String {
     if res.total_matches == 0 {
         return "0 matches\n".to_owned();
     }
@@ -464,13 +494,8 @@ pub fn render_search_text(res: &SearchResult, opts: &SearchOptions) -> String {
         }
     }
     if res.truncated {
-        out.push_str(&format!(
-            "... (+{} omitted matches across {} files; narrow with --glob/--type or --max-tokens)\n",
-            res.omitted_matches, res.omitted_files
-        ));
-    }
-    if opts.max_tokens > 0 {
-        return crate::kit_util::clip_to_byte_budget(&out, opts.max_tokens.saturating_mul(4));
+        out.push_str(&search_notice(res));
+        out.push('\n');
     }
     out
 }
@@ -479,25 +504,18 @@ pub fn render_search_json(res: &SearchResult, opts: &SearchOptions) -> String {
     if opts.max_tokens == 0 {
         return serde_json::to_string(res).unwrap_or_else(|_| "{}".to_owned());
     }
-    let budget_chars = opts.max_tokens.saturating_mul(4);
+    // Trimmed against the JSON size, never the text rendering: the same
+    // head step, measured by the budget module on the encoded document.
+    // The smallest valid document (no files left) is returned even when
+    // it still exceeds the budget.
     let mut trimmed = res.clone();
-    loop {
-        let encoded = serde_json::to_string(&trimmed).unwrap_or_else(|_| "{}".to_owned());
-        if encoded.len() <= budget_chars || trimmed.files.is_empty() {
-            return encoded;
-        }
-        if !opts.files_only {
-            if let Some(last) = trimmed.files.last_mut() {
-                if last.matches.len() > 1 {
-                    last.matches.pop();
-                    recompute_search_counts(&mut trimmed, opts.files_only);
-                    continue;
-                }
-            }
-        }
-        trimmed.files.pop();
-        recompute_search_counts(&mut trimmed, opts.files_only);
-    }
+    budget::trim_structured(
+        &mut trimmed,
+        opts.max_tokens,
+        |s| serde_json::to_string(s).unwrap_or_else(|_| "{}".to_owned()),
+        |s| search_trim_step(s, opts.files_only),
+    );
+    serde_json::to_string(&trimmed).unwrap_or_else(|_| "{}".to_owned())
 }
 
 #[cfg(test)]
@@ -556,27 +574,174 @@ mod tests {
         assert!(js_group.matches[0].text.len() < 150);
     }
 
+    /// Match texts are long on purpose: the ~95-byte truncation notice
+    /// must not dwarf a single dropped match at the budget edge.
+    fn sample_texts() -> (String, String, String, String) {
+        (
+            format!("alpha needle one {}", "x".repeat(40)),
+            format!("alpha needle two {}", "y".repeat(40)),
+            format!("beta needle three {}", "z".repeat(40)),
+            format!("beta needle four {}", "w".repeat(40)),
+        )
+    }
+
+    fn sample_result() -> SearchResult {
+        let (t1, t2, t3, t4) = sample_texts();
+        let m = |line: usize, text: String| SearchMatch {
+            line,
+            symbol: None,
+            text,
+            clipped: false,
+        };
+        SearchResult {
+            files: vec![
+                SearchFileGroup {
+                    path: "a.rs".to_owned(),
+                    total_matches: 2,
+                    matches: vec![m(1, t1), m(2, t2)],
+                },
+                SearchFileGroup {
+                    path: "b.rs".to_owned(),
+                    total_matches: 2,
+                    matches: vec![m(3, t3), m(4, t4)],
+                },
+            ],
+            total_matches: 4,
+            total_files: 2,
+            shown_matches: 4,
+            shown_files: 2,
+            omitted_matches: 0,
+            omitted_files: 0,
+            truncated: false,
+            raw_bytes: 0,
+        }
+    }
+
+    fn budgeted_opts(max_tokens: usize) -> SearchOptions {
+        SearchOptions {
+            max_tokens,
+            ..SearchOptions::default()
+        }
+    }
+
+    // Exact-output budget-edge tests (#99). They replace
+    // `enforces_max_tokens_in_text_and_json`, which only asserted
+    // lengths; these pin the exact bytes at the edge.
     #[test]
-    fn enforces_max_tokens_in_text_and_json() {
-        let tmp = Tmp::new("budget");
-        for i in 0..20 {
-            let body: String = (0..10)
-                .map(|j| format!("const TARGET_{i}_{j} = \"value_{i}_{j}\";\n"))
-                .collect();
-            tmp.write(&format!("f{i}.ts"), body.as_bytes());
+    fn search_text_budget_edge_exact_fit_one_token_less_and_below_notice() {
+        let (t1, t2, t3, t4) = sample_texts();
+        let res = sample_result();
+        let full = render_search_text(&res, &budgeted_opts(0));
+        assert_eq!(
+            full,
+            format!(
+                "a.rs (2 matches)\n  L1: {t1}\n  L2: {t2}\n\
+                 b.rs (2 matches)\n  L3: {t3}\n  L4: {t4}\n"
+            )
+        );
+        let exact = full.len().div_ceil(4);
+        // Exact fit: the whole rendering survives.
+        assert_eq!(render_search_text(&res, &budgeted_opts(exact)), full);
+        // One token less: head is kept (all of a.rs, nothing of b.rs),
+        // the cut lands on a line end, and the search notice survives
+        // with the recomputed counts.
+        let less = render_search_text(&res, &budgeted_opts(exact - 1));
+        assert_eq!(
+            less,
+            format!(
+                "a.rs (2 matches)\n  L1: {t1}\n  L2: {t2}\n\
+                 ... (+2 omitted matches across 1 files; narrow with --glob/--type or --max-tokens)\n"
+            )
+        );
+        assert!(less.len() <= (exact - 1) * 4);
+        // Budget smaller than the notice: the notice alone.
+        let tiny = render_search_text(&res, &budgeted_opts(10));
+        assert_eq!(
+            tiny,
+            "... (+4 omitted matches across 2 files; narrow with --glob/--type or --max-tokens)\n"
+        );
+    }
+
+    #[test]
+    fn search_json_budget_edge_exact_fit_one_token_less_and_below_smallest_valid() {
+        let (t1, t2, t3, t4) = sample_texts();
+        let res = sample_result();
+        let full = render_search_json(&res, &budgeted_opts(0));
+        assert_eq!(
+            full,
+            format!(
+                "{{\"files\":[{{\"path\":\"a.rs\",\"total_matches\":2,\"matches\":[\
+                 {{\"line\":1,\"text\":\"{t1}\"}},{{\"line\":2,\"text\":\"{t2}\"}}]}},\
+                 {{\"path\":\"b.rs\",\"total_matches\":2,\"matches\":[\
+                 {{\"line\":3,\"text\":\"{t3}\"}},{{\"line\":4,\"text\":\"{t4}\"}}]}}],\
+                 \"total_matches\":4,\"total_files\":2,\"shown_matches\":4,\"shown_files\":2,\
+                 \"omitted_matches\":0,\"omitted_files\":0,\"truncated\":false}}"
+            )
+        );
+        let exact = full.len().div_ceil(4);
+        // A result that fits the budget as JSON is returned whole.
+        assert_eq!(render_search_json(&res, &budgeted_opts(exact)), full);
+        // One token less, measured against the JSON size: only the last
+        // match of the last file is given up.
+        let less = render_search_json(&res, &budgeted_opts(exact - 1));
+        assert_eq!(
+            less,
+            format!(
+                "{{\"files\":[{{\"path\":\"a.rs\",\"total_matches\":2,\"matches\":[\
+                 {{\"line\":1,\"text\":\"{t1}\"}},{{\"line\":2,\"text\":\"{t2}\"}}]}},\
+                 {{\"path\":\"b.rs\",\"total_matches\":2,\"matches\":[\
+                 {{\"line\":3,\"text\":\"{t3}\"}}]}}],\
+                 \"total_matches\":4,\"total_files\":2,\"shown_matches\":3,\"shown_files\":2,\
+                 \"omitted_matches\":1,\"omitted_files\":0,\"truncated\":true}}"
+            )
+        );
+        assert!(less.len() <= (exact - 1) * 4);
+        // Below the smallest valid document: validity wins, the empty
+        // document is returned whole even though it exceeds the budget.
+        let tiny = render_search_json(&res, &budgeted_opts(1));
+        assert_eq!(
+            tiny,
+            "{\"files\":[],\"total_matches\":4,\"total_files\":2,\"shown_matches\":0,\
+             \"shown_files\":0,\"omitted_matches\":4,\"omitted_files\":2,\"truncated\":true}"
+        );
+        assert!(tiny.len() > 4);
+        let _: serde_json::Value = serde_json::from_str(&tiny).unwrap();
+    }
+
+    #[test]
+    fn search_execute_does_not_pretrim_and_run_twice_is_byte_identical() {
+        let tmp = Tmp::new("twice");
+        for i in 0..6 {
+            tmp.write(
+                &format!("f{i}.ts"),
+                format!("const TARGET_{i} = \"some longer value {i}\";\n").as_bytes(),
+            );
         }
         let opts = SearchOptions {
             pattern: "TARGET_".to_owned(),
             paths: vec![tmp.0.clone()],
-            max_tokens: 160,
+            max_tokens: 40,
             ..SearchOptions::default()
         };
-        let res = execute_search(&opts).unwrap();
-        assert!(res.truncated);
-        let txt = render_search_text(&res, &opts);
-        assert!(txt.len() <= 160 * 4);
-        let json = render_search_json(&res, &opts);
-        assert!(json.len() <= 160 * 4);
+        let first = execute_search(&opts).unwrap();
+        // Execution no longer trims by the text rendering: every file
+        // and match is still in the result; only the renders trim.
+        assert_eq!(first.files.len(), 6);
+        assert!(first.files.iter().all(|f| f.matches.len() == 1));
+        let second = execute_search(&opts).unwrap();
+        assert_eq!(
+            render_search_text(&first, &opts),
+            render_search_text(&second, &opts)
+        );
+        assert_eq!(
+            render_search_json(&first, &opts),
+            render_search_json(&second, &opts)
+        );
+        let txt = render_search_text(&first, &opts);
+        assert!(txt.len() <= 40 * 4);
+        assert!(txt.contains("omitted matches"));
+        let json = render_search_json(&first, &opts);
+        let _: serde_json::Value = serde_json::from_str(&json).unwrap();
     }
 
     #[test]

@@ -1,0 +1,20 @@
+{
+  "exit": 1,
+  "counts": {
+    "passed": 1,
+    "failed": 2,
+    "skipped": 0,
+    "total": 3
+  },
+  "error": null,
+  "failing_lines": [
+    "FAILED tests/test_x.py::T::test_a - AssertionError: boom",
+    "FAILED tests/test_x.py::test_c[param] - ValueError: bad",
+    "ERROR tests/test_y.py"
+  ],
+  "failed_tests": [
+    "tests/test_x.py::T::test_a",
+    "tests/test_x.py::test_c[param]",
+    "tests/test_y.py"
+  ]
+}

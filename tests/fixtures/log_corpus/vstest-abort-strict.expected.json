@@ -1,0 +1,7 @@
+{
+  "exit": null,
+  "counts": null,
+  "error": "dotnet-failed-contradiction",
+  "failing_lines": [],
+  "failed_tests": []
+}

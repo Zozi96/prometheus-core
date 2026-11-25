@@ -1,0 +1,16 @@
+Running tests from A/bin/A.dll (net10.0|arm64)
+Running tests from B/bin/B.dll (net10.0|arm64)
+A/bin/A.dll (net10.0|arm64) passed (146ms)
+B/bin/B.dll (net10.0|arm64) failed with 1 error(s) (151ms)
+Exit code: 2
+
+Test run summary: Failed!
+  A/bin/A.dll (net10.0|arm64) passed (146ms)
+  B/bin/B.dll (net10.0|arm64) failed with 1 error(s) (151ms)
+
+  total: 3
+  failed: 1
+  succeeded: 2
+  skipped: 0
+  duration: 395ms
+Test run completed with non-success exit code: 2

@@ -4,21 +4,26 @@ The native deterministic engine for `prometheus-check` and `prometheus-kit`.
 
 ## Modules
 
-- `check` — runner, targeted selection, receipts, and host-wide Check slot.
+- `budget` — the one token budget module: tokens-to-bytes conversion, trim, and truncation-notice guarantee for every Kit command, under its Keep policy (ADR-0017).
+- `check` — Check slot, Green receipts, and the Scan cache.
+- `check_run` — a Check run as a library module: request in, Executed / Reused / Validation pending out, with process launcher and Tree fingerprint adapters.
 - `classify` — documentation and test path classification.
 - `compact` — deduplicated CLI/build/test/log compactor with lossless spillover logs.
 - `diff` — compact structural git status, diff, and commit summary excluding lockfile noise.
 - `droid_mode` — data-driven switcher for Factory Droid model pins (`prometheus-kit droid-mode`).
 - `fingerprint` — in-process worktree fingerprinting.
-- `hook` — native `PreToolUse` secret-path, large-read/reread, and shell-rewrite guards (`prometheus-kit hook`).
+- `gather` — Tree scan gathering as a library step: real I/O in, typed Tree scan facts out, Ambient facts passed in.
+- `hook` — native `PreToolUse` secret-path, large-read/reread, and shell-rewrite guards (`prometheus-kit hook`); builds the Ambient facts once at the edge.
+- `hook_decide` — the hook decision, `decide(normalized event, Ambient facts) -> decision`, with one adapter and capabilities record per Host.
 - `hook_rewrite` — shell-command rewrite rules routing covered file, search, git, and `gh` log commands to kit equivalents (`slice`, `search`, `diff`, `compact`).
-- `impact` — impact graph and targeted selection.
+- `impact` — syntactic impact graph over a Tree scan.
 - `kit_util` — ANSI/CR normalization, noise-path classification, UTF-8 clipping, and spillover helpers.
-- `logs` — normalized test-log parsing.
+- `logs` — test-log parsing returning a typed result, with one adapter per test framework.
 - `map` — one-call repository directory map with line counts and optional top-level symbols.
 - `metrics` — bounded local savings counter read by `prometheus-kit metrics`.
 - `outline` — structural outline extraction for code (C#, Razor, Rust, Python, TS/JS, Go, PowerShell), JSON/JSONL, YAML, TOML, and Markdown with token budgets.
 - `search` — budgeted, grouped, line-clipped, optionally symbol-annotated search.
+- `selection` — Selection as a pure library function over Tree scan facts: the command, the level, and the Widening reasons.
 - `slice` — exact line-range and symbol/path slicing with interval merging and token budgets.
 - `store` — hashing and Check slot primitives.
 

@@ -1,0 +1,12 @@
+{
+  "exit": 0,
+  "counts": {
+    "passed": 63,
+    "failed": 0,
+    "skipped": 0,
+    "total": 63
+  },
+  "error": null,
+  "failing_lines": [],
+  "failed_tests": []
+}

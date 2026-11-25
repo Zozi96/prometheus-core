@@ -24,7 +24,7 @@ use std::time::Duration;
 /// The slice of `.prometheus.json` the runner reads. Unknown keys are the
 /// repository's business; a malformed file yields the defaults, and the
 /// caller reports that the config could not be read.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     /// `test_command`: a string (split on whitespace) or an argv list.
     pub test_command: Option<Vec<String>>,
@@ -607,11 +607,13 @@ pub fn mixed_plan(families: &[&str], config: &Config) -> MixedPlan {
 // Python runner resolution
 
 /// Interpreters to try, best first: the active or repository virtualenv,
-/// then `python3`, then `python`.
-pub fn python_candidates(root: &Path) -> Vec<String> {
+/// then `python3`, then `python`. The active virtualenv is an Ambient
+/// fact (ADR-0017 D2): the caller reads `VIRTUAL_ENV` once at the
+/// binary's edge and passes it in; this function reads no environment.
+pub fn python_candidates(root: &Path, virtual_env: Option<&Path>) -> Vec<String> {
     let mut envs: Vec<PathBuf> = Vec::new();
-    if let Some(active) = std::env::var_os("VIRTUAL_ENV") {
-        envs.push(PathBuf::from(active));
+    if let Some(active) = virtual_env {
+        envs.push(active.to_path_buf());
     }
     envs.push(root.join(".venv"));
     envs.push(root.join("venv"));
@@ -979,17 +981,6 @@ pub struct Counts {
     pub total: i64,
 }
 
-/// Counts from the engine's parsed check-log document, or `None` when the
-/// output carried no recognizable test summary.
-pub fn counts_of(document: &str) -> Option<Counts> {
-    let value: serde_json::Value = serde_json::from_str(document).ok()?;
-    let counts = value.get("counts")?;
-    if counts.is_null() {
-        return None;
-    }
-    serde_json::from_value(counts.clone()).ok()
-}
-
 /// A Behavioral pass: at least one executed test, at least one passing,
 /// none failing, exit 0. A lint, type, or build result and an empty
 /// selection are not one (GLOSSARY, ADR-0008).
@@ -1091,6 +1082,10 @@ pub struct ScanEntry {
 pub fn scan_cache_read(path: &Path, fingerprint: &str, base: &str) -> Option<ScanEntry> {
     let text = std::fs::read_to_string(path).ok()?;
     let entry: ScanEntry = serde_json::from_str(&text).ok()?;
+    // The entry's impact must deserialize into the typed Selection
+    // facts (ticket #96): an entry that does not is a miss, and the
+    // scan runs again. The cache keeps its JSON shape either way.
+    crate::selection::ImpactSelection::from_document(&entry.impact)?;
     (entry.fingerprint == fingerprint && entry.base == base).then_some(entry)
 }
 
@@ -1400,13 +1395,6 @@ mod tests {
     }
 
     #[test]
-    fn counts_parse_from_the_engine_document() {
-        let doc = r#"{"schema": 1, "counts": {"passed": 5, "failed": 0, "skipped": 1, "total": 6}, "error": null, "failing_lines": [], "failed_tests": []}"#;
-        assert_eq!(counts_of(doc), Some(Counts { passed: 5, failed: 0, skipped: 1, total: 6 }));
-        assert_eq!(counts_of(r#"{"counts": null}"#), None);
-    }
-
-    #[test]
     fn green_reuse_needs_fingerprint_command_and_unprofiled_for_plain() {
         let base = Receipt {
             kind: "check".into(),
@@ -1450,6 +1438,22 @@ mod tests {
         assert!(scan_cache_read(&path, "other", "main").is_none());
         assert!(scan_cache_read(&path, "abc", "develop").is_none(),
                 "a cache entry is only valid for the base it names");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scan_cache_entry_that_does_not_deserialize_is_a_miss() {
+        let dir = std::env::temp_dir().join(format!("prometheus-check-test-typed-{}", std::process::id()));
+        let path = dir.join("scan-cache.json");
+        let entry = ScanEntry {
+            fingerprint: "abc".into(),
+            base: "main".into(),
+            task_delta: argv(&["a.py"]),
+            integration_delta: vec![],
+            impact: serde_json::json!({"selection": {"level": "everything"}}),
+        };
+        scan_cache_write(&path, &entry).unwrap();
+        assert!(scan_cache_read(&path, "abc", "main").is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1653,7 +1657,7 @@ mod tests {
             base: "main=1;fork=2;head=3".into(),
             task_delta: vec![],
             integration_delta: vec![],
-            impact: serde_json::Value::Null,
+            impact: serde_json::json!({"selection": {"level": "full"}}),
         };
         scan_cache_write(&path, &entry).unwrap();
         assert!(scan_cache_read(&path, "abc", "main=1;fork=2;head=3").is_some());
@@ -1687,7 +1691,7 @@ mod tests {
         assert_eq!(python_full("py", false, true), argv(&["py", "-m", "unittest", "discover", "-s", "tests"]));
         let dir = TempDir::new("venv");
         write(&dir.0, ".venv/bin/python", "");
-        let found = python_candidates(&dir.0);
+        let found = python_candidates(&dir.0, None);
         // Candidates are built by joining path components, so on Windows
         // the same file is spelled with '\\' where this expectation uses
         // '/': compare separator-normalized, as the filesystem does.

@@ -9,7 +9,8 @@
 //! Every other read, inline script, tool, and edit passes silently without blocking,
 //! and direct checks never trigger `permissionDecision`.
 
-use crate::metrics::{self, Host, Rule};
+use crate::hook_decide::Host as HookHost;
+use crate::metrics::{self, Rule};
 use crate::store::{ensure_private_dir, sha256_hex};
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
@@ -24,11 +25,6 @@ pub const REREAD_MESSAGE: &str =
 const REREAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SYMLINK_HOPS: usize = 40;
 
-/// True only for hosts whose `PreToolUse` protocol delivers non-blocking
-/// context (`additionalContext`) to the model (ADR-0014 D3).
-pub fn host_delivers_pretool_context(host: &str) -> bool {
-    matches!(host, "claude" | "muse")
-}
 const PARTIAL_KEYS: [&str; 11] = [
     "offset",
     "start",
@@ -88,27 +84,27 @@ fn truthy(value: &Value) -> bool {
     }
 }
 
-fn get<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+pub(crate) fn get<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     value.as_object().and_then(|map| map.get(key))
 }
 
-fn py_or<'a>(a: Option<&'a Value>, b: Option<&'a Value>) -> Option<&'a Value> {
+pub(crate) fn py_or<'a>(a: Option<&'a Value>, b: Option<&'a Value>) -> Option<&'a Value> {
     match a {
         Some(value) if truthy(value) => Some(value),
         _ => b,
     }
 }
 
-fn as_str(value: Option<&Value>) -> &str {
+pub(crate) fn as_str(value: Option<&Value>) -> &str {
     value.and_then(Value::as_str).unwrap_or("")
 }
 
-fn casefold(text: &str) -> String {
+pub(crate) fn casefold(text: &str) -> String {
     text.to_lowercase()
 }
 
 /// `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`
-fn valid_session_id_str(text: &str) -> bool {
+pub(crate) fn valid_session_id_str(text: &str) -> bool {
     let mut chars = text.chars();
     match chars.next() {
         Some(first) if first.is_ascii_alphanumeric() => {}
@@ -118,11 +114,11 @@ fn valid_session_id_str(text: &str) -> bool {
         && text.chars().count() <= 128
 }
 
-fn tool_name(event: &Value) -> &str {
+pub(crate) fn tool_name(event: &Value) -> &str {
     as_str(py_or(get(event, "tool_name"), get(event, "toolName")))
 }
 
-fn event_name_normalized(event: &Value) -> String {
+pub(crate) fn event_name_normalized(event: &Value) -> String {
     let raw = as_str(py_or(
         py_or(get(event, "hook_event_name"), get(event, "hookEventName")),
         get(event, "event_name"),
@@ -172,7 +168,7 @@ pub fn secret_path_denied(path: &str) -> String {
     )
 }
 
-fn normalize_secret_candidate(raw: &str) -> String {
+pub(crate) fn normalize_secret_candidate(raw: &str) -> String {
     let mut path = raw.trim().to_string();
     let chars: Vec<char> = path.chars().collect();
     if chars.len() >= 2 && chars[0] == chars[chars.len() - 1] && matches!(chars[0], '"' | '\'') {
@@ -303,18 +299,22 @@ fn token_matches_secret(token: &str, norm: &str, strict: bool, has_secret_dir: b
     false
 }
 
-fn expand_tilde_path(raw: &str) -> Option<PathBuf> {
+fn expand_tilde_path(raw: &str, ambient: &AmbientFacts) -> Option<PathBuf> {
     if raw == "~" {
-        return crate::droid_mode::default_home().ok();
+        return ambient.home_dir.clone();
     }
     if let Some(rest) = raw.strip_prefix("~/") {
-        return crate::droid_mode::default_home().ok().map(|h| h.join(rest));
+        return ambient.home_dir.as_ref().map(|h| h.join(rest));
     }
     None
 }
 
-fn resolve_candidate_against_root(path: &str, root: Option<&Path>) -> Option<Result<PathBuf, ()>> {
-    let joined = if let Some(home_path) = expand_tilde_path(path) {
+pub(crate) fn resolve_candidate_against_root(
+    path: &str,
+    root: Option<&Path>,
+    ambient: &AmbientFacts,
+) -> Option<Result<PathBuf, ()>> {
+    let joined = if let Some(home_path) = expand_tilde_path(path, ambient) {
         home_path
     } else {
         let p = Path::new(path);
@@ -324,11 +324,31 @@ fn resolve_candidate_against_root(path: &str, root: Option<&Path>) -> Option<Res
             root?.join(p)
         }
     };
-    Some(resolve_secret_path(&joined))
+    Some(resolve_secret_path(&joined, ambient))
 }
 
 fn secret_denied_with_prompt(raw: Option<&Value>, prompt: &str) -> String {
-    secret_denied_with_prompt_and_root(raw, prompt, None, false)
+    secret_denied_with_prompt_and_root(raw, prompt, None, false, &pure_calls_ambient())
+}
+
+/// Ambient facts for the pure, non-filesystem secret-name check above: the
+/// resolve-fs path is disabled there, so no ambient fact is ever consulted.
+fn pure_calls_ambient() -> AmbientFacts {
+    AmbientFacts {
+        other_host_markers_present: false,
+        devin_project_dir: None,
+        rewrite_disabled: false,
+        rtk_coexist: None,
+        rtk_config_active: std::collections::BTreeMap::new(),
+        xdg_runtime_dir: None,
+        temp_dir: PathBuf::new(),
+        session_parent: PathBuf::new(),
+        process_cwd: None,
+        home_dir: None,
+        xdg_config_home: None,
+        agy_config_dir: None,
+        exe_path: PathBuf::new(),
+    }
 }
 
 fn secret_denied_with_prompt_and_root(
@@ -336,6 +356,7 @@ fn secret_denied_with_prompt_and_root(
     prompt: &str,
     root: Option<&Path>,
     resolve_fs: bool,
+    ambient: &AmbientFacts,
 ) -> String {
     let Some(raw) = raw.and_then(Value::as_str) else {
         return String::new();
@@ -346,7 +367,7 @@ fn secret_denied_with_prompt_and_root(
         return reason;
     }
     if resolve_fs && !path.is_empty() {
-        match resolve_candidate_against_root(&path, root) {
+        match resolve_candidate_against_root(&path, root, ambient) {
             Some(Err(())) => {
                 return SYMLINK_BLOCK_REASON.to_string();
             }
@@ -363,12 +384,12 @@ fn secret_denied_with_prompt_and_root(
     String::new()
 }
 
-fn check_keys_for_secret_with_prompt(
+pub(crate) fn check_keys_for_secret_with_prompt(
     source: &Map<String, Value>,
     keys: &[&str],
     prompt: &str,
 ) -> String {
-    check_keys_for_secret_with_prompt_and_root(source, keys, prompt, None, &[])
+    check_keys_for_secret_with_prompt_and_root(source, keys, prompt, None, &[], &pure_calls_ambient())
 }
 
 fn check_keys_for_secret_with_prompt_and_root(
@@ -377,6 +398,7 @@ fn check_keys_for_secret_with_prompt_and_root(
     prompt: &str,
     root: Option<&Path>,
     resolve_keys: &[&str],
+    ambient: &AmbientFacts,
 ) -> String {
     for key in keys {
         let resolve_fs = resolve_keys.contains(key);
@@ -384,7 +406,7 @@ fn check_keys_for_secret_with_prompt_and_root(
             Some(Value::Array(items)) => {
                 for item in items {
                     let reason =
-                        secret_denied_with_prompt_and_root(Some(item), prompt, root, resolve_fs);
+                        secret_denied_with_prompt_and_root(Some(item), prompt, root, resolve_fs, ambient);
                     if !reason.is_empty() {
                         return reason;
                     }
@@ -392,7 +414,7 @@ fn check_keys_for_secret_with_prompt_and_root(
             }
             Some(item) => {
                 let reason =
-                    secret_denied_with_prompt_and_root(Some(item), prompt, root, resolve_fs);
+                    secret_denied_with_prompt_and_root(Some(item), prompt, root, resolve_fs, ambient);
                 if !reason.is_empty() {
                     return reason;
                 }
@@ -403,10 +425,15 @@ fn check_keys_for_secret_with_prompt_and_root(
     String::new()
 }
 
-const SYMLINK_BLOCK_REASON: &str =
+pub(crate) const SYMLINK_BLOCK_REASON: &str =
     "unresolved symlink chain is blocked; ask the user to approve it explicitly";
 
-fn scan_secret_path_keys(event: &Value, prompt: &str, root: Option<&Path>) -> (String, bool) {
+fn scan_secret_path_keys(
+    event: &Value,
+    prompt: &str,
+    root: Option<&Path>,
+    ambient: &AmbientFacts,
+) -> (String, bool) {
     const KEYS: [&str; 9] = [
         "path",
         "file_path",
@@ -443,7 +470,7 @@ fn scan_secret_path_keys(event: &Value, prompt: &str, root: Option<&Path>) -> (S
                 saw_path_arg = true;
             }
             let reason =
-                check_keys_for_secret_with_prompt_and_root(inp, &KEYS, prompt, root, &PATH_KEYS);
+                check_keys_for_secret_with_prompt_and_root(inp, &KEYS, prompt, root, &PATH_KEYS, ambient);
             if !reason.is_empty() {
                 return (reason, saw_path_arg);
             }
@@ -452,15 +479,20 @@ fn scan_secret_path_keys(event: &Value, prompt: &str, root: Option<&Path>) -> (S
     (String::new(), saw_path_arg)
 }
 
-fn omp_secret_denial(event: &Value, prompt: &str, root: Option<&Path>) -> String {
-    let (reason, saw_path_arg) = scan_secret_path_keys(event, prompt, root);
+pub(crate) fn omp_secret_denial(
+    event: &Value,
+    prompt: &str,
+    root: Option<&Path>,
+    ambient: &AmbientFacts,
+) -> String {
+    let (reason, saw_path_arg) = scan_secret_path_keys(event, prompt, root, ambient);
     if !reason.is_empty() {
         return reason;
     }
     // File-read/search tools omitting a path argument target `cwd` implicitly (e.g. `ls({})`, `grep({pattern})`).
     if !saw_path_arg {
         let tool = tool_name(event);
-        let is_file_read = file_reads("omp").is_some_and(|allowed| allowed.contains(&tool));
+        let is_file_read = file_reads(HookHost::Omp).is_some_and(|allowed| allowed.contains(&tool));
         if is_file_read {
             if let Some(base) = root {
                 let base_str = base.to_string_lossy();
@@ -524,11 +556,11 @@ fn split_command(text: &str) -> Vec<String> {
     tokens
 }
 
-fn check_keys_for_secret(source: &Map<String, Value>, keys: &[&str]) -> String {
+pub(crate) fn check_keys_for_secret(source: &Map<String, Value>, keys: &[&str]) -> String {
     check_keys_for_secret_with_prompt(source, keys, "")
 }
 
-fn secret_tool_denial(event: &Value) -> String {
+pub(crate) fn secret_tool_denial(event: &Value) -> String {
     const KEYS: [&str; 8] = [
         "file_path",
         "filePath",
@@ -550,7 +582,7 @@ fn secret_tool_denial(event: &Value) -> String {
     String::new()
 }
 
-fn cursor_secret_denied(event: &Value) -> String {
+pub(crate) fn cursor_secret_denied(event: &Value) -> String {
     const KEYS: [&str; 10] = [
         "relative_workspace_path",
         "relativeWorkspacePath",
@@ -619,11 +651,11 @@ fn event_mentions_secret(event: &Value) -> bool {
     false
 }
 
-fn file_reads(host: &str) -> Option<&'static [&'static str]> {
+pub(crate) fn file_reads(host: HookHost) -> Option<&'static [&'static str]> {
     match host {
-        "claude" | "muse" => Some(&["Read", "Grep", "Glob", "LS", "NotebookRead"]),
-        "cursor" | "droid" => Some(&["Read", "Grep", "Glob", "LS", "Search", "Find"]),
-        "devin" => Some(&[
+        HookHost::Claude | HookHost::Muse => Some(&["Read", "Grep", "Glob", "LS", "NotebookRead"]),
+        HookHost::Cursor | HookHost::Droid => Some(&["Read", "Grep", "Glob", "LS", "Search", "Find"]),
+        HookHost::Devin => Some(&[
             "read",
             "grep",
             "glob",
@@ -637,7 +669,7 @@ fn file_reads(host: &str) -> Option<&'static [&'static str]> {
             "Search",
             "Find",
         ]),
-        "omp" => Some(&[
+        HookHost::Omp => Some(&[
             "read",
             "grep",
             "find",
@@ -650,14 +682,14 @@ fn file_reads(host: &str) -> Option<&'static [&'static str]> {
             "Glob",
             "LS",
         ]),
-        "antigravity" => Some(&[
+        HookHost::Antigravity => Some(&[
             "view_file",
             "read_file",
             "grep_search",
             "find_by_name",
             "list_dir",
         ]),
-        "grok" => Some(&[
+        HookHost::Grok => Some(&[
             "read_file",
             "read",
             "Read",
@@ -666,16 +698,16 @@ fn file_reads(host: &str) -> Option<&'static [&'static str]> {
             "list_dir",
             "search",
         ]),
-        _ => None,
+        HookHost::Opencode => None,
     }
 }
 
-fn read_failure_allows(host: &str, event: &Value) -> bool {
+pub(crate) fn read_failure_allows(host: HookHost, event: &Value) -> bool {
     let tool = tool_name(event);
     if tool.is_empty() {
         return false;
     }
-    let Some(allowed) = file_reads(&casefold(host)) else {
+    let Some(allowed) = file_reads(host) else {
         return false;
     };
     if !allowed.contains(&tool) {
@@ -689,34 +721,148 @@ fn read_failure_allows(host: &str, event: &Value) -> bool {
 // hosts (`claude`, `muse`); never block reads for token-saving (ADR-0016).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Ambient facts (ADR-0017 D2, #102): every value the hook decision takes from
+// the process environment, read ONCE at the hook entry point and passed down
+// as one value. No code below `run_hook` / `AmbientFacts::from_process` reads
+// an environment variable, the working directory, the home directory, the
+// executable path, or a host configuration file.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct AmbientFacts {
+    /// Any of the other-host marker env vars was present and non-empty.
+    pub other_host_markers_present: bool,
+    /// `DEVIN_PROJECT_DIR` when present and non-empty.
+    pub devin_project_dir: Option<PathBuf>,
+    /// `PROMETHEUS_KIT_NO_REWRITE=1`.
+    pub rewrite_disabled: bool,
+    /// Raw `PROMETHEUS_KIT_RTK_COEXIST` value, when set.
+    pub rtk_coexist: Option<String>,
+    /// RTK-hook presence per host name, scanned once from host configuration
+    /// files at construction time.
+    pub rtk_config_active: std::collections::BTreeMap<HookHost, bool>,
+    /// Raw `XDG_RUNTIME_DIR` (absolute) when set.
+    pub xdg_runtime_dir: Option<PathBuf>,
+    /// Process temp dir, captured at construction.
+    pub temp_dir: PathBuf,
+    /// Parent directory under which per-session state directories live.
+    pub session_parent: PathBuf,
+    /// Process working directory at construction, when it could be read.
+    pub process_cwd: Option<PathBuf>,
+    /// Home directory at construction, when it could be determined.
+    pub home_dir: Option<PathBuf>,
+    /// XDG config home (absolute) when set.
+    pub xdg_config_home: Option<PathBuf>,
+    /// Antigravity config dir (absolute) when set.
+    pub agy_config_dir: Option<PathBuf>,
+    /// Path of the running executable (fallback: `prometheus-kit`).
+    pub exe_path: PathBuf,
+}
+
+impl AmbientFacts {
+    /// The hook edge: read the process environment exactly once.
+    pub fn from_process() -> Self {
+        let abs_env = |name: &str| {
+            std::env::var_os(name)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+        };
+        let mut facts = Self {
+            other_host_markers_present: OTHER_HOSTS
+                .iter()
+                .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty())),
+            devin_project_dir: std::env::var("DEVIN_PROJECT_DIR")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            rewrite_disabled: crate::hook_rewrite::rewrite_disabled_from(
+                std::env::var_os("PROMETHEUS_KIT_NO_REWRITE").as_deref(),
+            ),
+            rtk_coexist: std::env::var("PROMETHEUS_KIT_RTK_COEXIST").ok(),
+            rtk_config_active: Default::default(),
+            xdg_runtime_dir: abs_env("XDG_RUNTIME_DIR"),
+            temp_dir: std::env::temp_dir(),
+            session_parent: PathBuf::new(),
+            process_cwd: std::env::current_dir().ok(),
+            home_dir: crate::droid_mode::default_home()
+                .ok()
+                .filter(|p| p.is_absolute()),
+            xdg_config_home: abs_env("XDG_CONFIG_HOME"),
+            agy_config_dir: abs_env("AGY_CONFIG_DIR"),
+            exe_path: std::env::current_exe()
+                .unwrap_or_else(|_| PathBuf::from("prometheus-kit")),
+        };
+        facts.recompute_derived();
+        facts
+    }
+
+    /// Recompute the derived facts (session-state parent, per-host RTK config
+    /// scan) from the raw fields. Called once by `from_process`; tests that
+    /// build ambient facts as plain values call it after setting raw fields.
+    pub fn recompute_derived(&mut self) {
+        self.session_parent =
+            compute_session_parent(self.xdg_runtime_dir.as_deref(), &self.temp_dir);
+        self.rtk_config_active = HookHost::all()
+            .iter()
+            .map(|host| {
+                (
+                    *host,
+                    crate::hook_rewrite::rtk_config_active_in(
+                        *host,
+                        self.home_dir.as_deref(),
+                        self.xdg_config_home.as_deref(),
+                        self.agy_config_dir.as_deref(),
+                    ),
+                )
+            })
+            .collect();
+    }
+
+    /// RTK deferral for `host` (ADR-0013 D7): the coexist env override wins,
+    /// otherwise the one-time host-config scan decides.
+    pub fn rtk_active(&self, host: HookHost) -> bool {
+        if let Some(val) = &self.rtk_coexist {
+            match val.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => return true,
+                "0" | "false" | "no" => return false,
+                _ => {}
+            }
+        }
+        self.rtk_config_active.get(&host).copied().unwrap_or(false)
+    }
+}
+
+fn compute_session_parent(xdg_runtime_dir: Option<&Path>, temp_dir: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Some(runtime) = xdg_runtime_dir {
+            if runtime.is_absolute() {
+                if let Ok(info) = std::fs::metadata(runtime) {
+                    if info.is_dir() && info.uid() == my_uid() {
+                        return runtime.join("prometheus");
+                    }
+                }
+            }
+        }
+        temp_dir.join(format!("prometheus-{}", my_uid()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = xdg_runtime_dir;
+        temp_dir.join("prometheus")
+    }
+}
+
 #[cfg(unix)]
 fn my_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-fn session_dir(session_id: &str) -> Option<PathBuf> {
-    let parent = {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let mut from_xdg = None;
-            if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-                let p = PathBuf::from(&runtime);
-                if p.is_absolute() {
-                    if let Ok(info) = std::fs::metadata(&p) {
-                        if info.is_dir() && info.uid() == my_uid() {
-                            from_xdg = Some(p.join("prometheus"));
-                        }
-                    }
-                }
-            }
-            from_xdg.unwrap_or_else(|| std::env::temp_dir().join(format!("prometheus-{}", my_uid())))
-        }
-        #[cfg(not(unix))]
-        {
-            std::env::temp_dir().join("prometheus")
-        }
-    };
+fn session_dir(session_id: &str, ambient: &AmbientFacts) -> Option<PathBuf> {
+    let parent = ambient.session_parent.clone();
     let folder = parent.join(session_id);
     // Lazily create owner-private 0o700 dirs on first use; an existing
     // insecure directory is never repaired or trusted.
@@ -746,10 +892,10 @@ fn push_path_components(path: &Path, into: &mut Vec<OwnedComponent>) {
     }
 }
 
-fn resolve_secret_path(path: &Path) -> Result<PathBuf, ()> {
+fn resolve_secret_path(path: &Path, ambient: &AmbientFacts) -> Result<PathBuf, ()> {
     let mut initial = Vec::new();
     if !path.is_absolute() {
-        let cur = std::env::current_dir().unwrap_or_default();
+        let cur = ambient.process_cwd.clone().unwrap_or_default();
         if path.has_root() {
             if let Some(Component::Prefix(prefix)) = cur.components().next() {
                 initial.push(OwnedComponent::Prefix(prefix.as_os_str().to_os_string()));
@@ -806,14 +952,14 @@ fn resolve_secret_path(path: &Path) -> Result<PathBuf, ()> {
     Ok(out)
 }
 
-fn resolve_loose(path: &Path) -> PathBuf {
+fn resolve_loose(path: &Path, ambient: &AmbientFacts) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return canonical;
     }
     let mut out = if path.is_absolute() {
         PathBuf::new()
     } else {
-        let cur = std::env::current_dir().unwrap_or_default();
+        let cur = ambient.process_cwd.clone().unwrap_or_default();
         std::fs::canonicalize(&cur).unwrap_or(cur)
     };
     for component in path.components() {
@@ -998,19 +1144,21 @@ fn write_deny_marker(path: &Path, text: &str) -> bool {
 /// Shared Tier-2 shell `Guided deny-once` state machine (ADR-0014).
 /// Returns `Some(reason)` on first denial and `None` on immediate retry or fail-open.
 pub(crate) fn shell_deny_once_decision(
-    host: &str,
     session_id: &str,
     event_cwd: Option<&Path>,
     command: &str,
     suggested: &str,
-) -> Option<String> {
+    ambient: &AmbientFacts,
+) -> (Option<String>, Vec<metrics::MetricRecord>) {
     if !valid_session_id_str(session_id) {
-        return None;
+        return (None, Vec::new());
     }
-    let folder = session_dir(session_id)?;
+    let Some(folder) = session_dir(session_id, ambient) else {
+        return (None, Vec::new());
+    };
     let cwd_str = event_cwd
         .filter(|p| !p.as_os_str().is_empty())
-        .map(resolve_loose)
+        .map(|p| resolve_loose(p, ambient))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let mut key_bytes = Vec::with_capacity(cwd_str.len() + 1 + command.len());
@@ -1018,38 +1166,41 @@ pub(crate) fn shell_deny_once_decision(
     key_bytes.push(0);
     key_bytes.extend_from_slice(command.as_bytes());
     let marker = folder.join(format!("shell-deny-{}", sha256_hex(&key_bytes)));
-    let record = |rule: Rule, raw: usize, emitted: usize| {
-        if let Some(h) = Host::from_hook(host) {
-            metrics::record(h, rule, raw, emitted);
-        }
-    };
     match read_deny_marker(&marker) {
-        DenyMarker::Malformed => None,
+        DenyMarker::Malformed => (None, Vec::new()),
         DenyMarker::Denied => {
             let _ = std::fs::remove_file(&marker);
-            record(Rule::AllowedRetry, 0, command.len());
-            None
+            (
+                None,
+                vec![metrics::MetricRecord {
+                    rule: Rule::AllowedRetry,
+                    raw_bytes: 0,
+                    emitted_bytes: command.len(),
+                }],
+            )
         }
         DenyMarker::Absent | DenyMarker::Allowed => {
             if !write_deny_marker(&marker, "denied\n") {
-                return None;
+                return (None, Vec::new());
             }
             let reason = format!(
                 "Covered shell command denied once: run `{suggested}` instead for token-budgeted output. Retry the same command if you still need raw shell output."
             );
-            record(Rule::ShellDenial, command.len(), reason.len());
-            Some(reason)
+            let metric = metrics::MetricRecord {
+                rule: Rule::ShellDenial,
+                raw_bytes: command.len(),
+                emitted_bytes: reason.len(),
+            };
+            (Some(reason), vec![metric])
         }
     }
 }
 
 /// Read-tool path plus the partial-read entries (casefolded key, value)
 /// sorted by key; an empty vec means a whole-file read.
-fn read_path(event: &Value, host: &str) -> Option<(String, Vec<(String, Value)>)> {
+fn read_path(event: &Value) -> Option<(String, Vec<(String, Value)>)> {
     let tool = casefold(tool_name(event));
-    let is_read = tool == "read"
-        || (matches!(host, "antigravity" | "grok") && matches!(tool.as_str(), "view_file" | "read_file"));
-    if !is_read {
+    if tool != "read" {
         return None;
     }
     let empty = Map::new();
@@ -1089,62 +1240,59 @@ pub enum ReadGuard {
     Warn(String),
 }
 
-/// Non-blocking unchanged whole-file reread advisory (ADR-0016):
-/// - On hosts without `PreToolUse` `additionalContext` (`devin`, `droid`,
-///   `cursor`, `omp`, `antigravity`, `grok`, `opencode`), returns `Pass`.
-/// - On `claude` and `muse`, ranged/partial reads always pass silently; an
-///   unchanged whole-file reread emits `Warn(REREAD_MESSAGE)` without blocking.
+/// Non-blocking unchanged whole-file reread advisory (ADR-0016). The caller
+/// (the hook decision) runs this only for hosts whose capabilities deliver
+/// non-blocking context: ranged/partial reads always pass silently; an
+/// unchanged whole-file reread emits `Warn(REREAD_MESSAGE)` without blocking.
 pub fn read_guard(
-    host: &str,
     event: &Value,
     session_id: &str,
     root: Option<&Path>,
-) -> ReadGuard {
-    if !host_delivers_pretool_context(host) {
-        return ReadGuard::Pass;
-    }
-    let Some((raw, partial)) = read_path(event, host) else {
-        return ReadGuard::Pass;
+    ambient: &AmbientFacts,
+) -> (ReadGuard, Vec<metrics::MetricRecord>) {
+    let pass = (ReadGuard::Pass, Vec::new());
+    let Some((raw, partial)) = read_path(event) else {
+        return pass;
     };
     if !partial.is_empty() {
-        return ReadGuard::Pass;
+        return pass;
     }
     if !valid_session_id_str(session_id) {
-        return ReadGuard::Pass;
+        return pass;
     }
-    let Some(folder) = session_dir(session_id) else {
-        return ReadGuard::Pass;
+    let Some(folder) = session_dir(session_id, ambient) else {
+        return pass;
     };
     if !secret_path_denied(&raw).is_empty() {
-        return ReadGuard::Pass;
+        return pass;
     }
     let base: PathBuf = match root {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => match get(event, "cwd").and_then(Value::as_str) {
             Some(c) if !c.is_empty() => PathBuf::from(c),
-            _ => return ReadGuard::Pass,
+            _ => return pass,
         },
     };
-    let canonical = resolve_loose(&base);
+    let canonical = resolve_loose(&base, ambient);
     let candidate = Path::new(&raw);
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
         base.join(candidate)
     };
-    let target_path = resolve_loose(&joined);
+    let target_path = resolve_loose(&joined, ambient);
     let target_str = target_path.to_string_lossy();
     if !secret_path_denied(&target_str).is_empty() {
-        return ReadGuard::Pass;
+        return pass;
     }
     let Ok(info) = std::fs::metadata(&target_path) else {
-        return ReadGuard::Pass;
+        return pass;
     };
     if !info.is_file() || info.len() > REREAD_MAX_BYTES {
-        return ReadGuard::Pass;
+        return pass;
     }
     let Some(digest) = hash_file(&target_path) else {
-        return ReadGuard::Pass;
+        return pass;
     };
     let canonical_str = canonical.to_string_lossy();
     let mut key_bytes = Vec::with_capacity(canonical_str.len() + 1 + target_str.len());
@@ -1154,16 +1302,18 @@ pub fn read_guard(
     let key = sha256_hex(&key_bytes);
     let state = folder.join(format!("reread-{key}"));
     match read_reread_state(&state) {
-        StoredHash::Malformed => ReadGuard::Pass,
-        StoredHash::Present(stored) if stored == digest => {
-            if let Some(metrics_host) = Host::from_hook(host) {
-                metrics::record(metrics_host, Rule::RereadWarning, 0, REREAD_MESSAGE.len());
-            }
-            ReadGuard::Warn(REREAD_MESSAGE.to_string())
-        }
+        StoredHash::Malformed => pass,
+        StoredHash::Present(stored) if stored == digest => (
+            ReadGuard::Warn(REREAD_MESSAGE.to_string()),
+            vec![metrics::MetricRecord {
+                rule: Rule::RereadWarning,
+                raw_bytes: 0,
+                emitted_bytes: REREAD_MESSAGE.len(),
+            }],
+        ),
         _ => {
             write_reread_state(&state, &digest);
-            ReadGuard::Pass
+            pass
         }
     }
 }
@@ -1217,12 +1367,16 @@ fn inline_structured_operand(event: &Value) -> Option<(String, String)> {
     Some((command.to_owned(), file.clone()))
 }
 
-pub fn use_time_hint(host: &str, event: &Value, session_id: &str) -> Option<String> {
-    if !host_delivers_pretool_context(host) || !valid_session_id_str(session_id) {
+pub fn use_time_hint(
+    event: &Value,
+    session_id: &str,
+    ambient: &AmbientFacts,
+) -> Option<(String, Vec<metrics::MetricRecord>)> {
+    if !valid_session_id_str(session_id) {
         return None;
     }
     let (command, file) = inline_structured_operand(event)?;
-    let folder = session_dir(session_id)?;
+    let folder = session_dir(session_id, ambient)?;
     let marker = folder.join(HINT_MARKER);
     // First writer wins: `create_new` fails when the marker already
     // exists (or is a pre-planted symlink), and the hint stays silent.
@@ -1239,32 +1393,19 @@ pub fn use_time_hint(host: &str, event: &Value, session_id: &str) -> Option<Stri
     let hint = format!(
         "Hint: `prometheus-kit slice '{file}::<selector>'` reads part of that structured file without an inline script; selectors include `@count`, `@keys` and `@fields(a,b)` — e.g. `prometheus-kit slice '{file}::@count'`."
     );
-    if let Some(metrics_host) = Host::from_hook(host) {
-        metrics::record(metrics_host, Rule::UseTimeHint, command.len(), hint.len());
-    }
-    Some(hint)
-}
-
-pub fn inline_dump_guard(
-    host: &str,
-    event: &Value,
-    session_id: &str,
-    _root: Option<&Path>,
-) -> ReadGuard {
-    if host_delivers_pretool_context(host) {
-        return match use_time_hint(host, event, session_id) {
-            Some(hint) => ReadGuard::Warn(hint),
-            None => ReadGuard::Pass,
-        };
-    }
-    ReadGuard::Pass
+    let metric = metrics::MetricRecord {
+        rule: Rule::UseTimeHint,
+        raw_bytes: command.len(),
+        emitted_bytes: hint.len(),
+    };
+    Some((hint, vec![metric]))
 }
 
 // ---------------------------------------------------------------------------
 // Host adapters & envelope handling.
 // ---------------------------------------------------------------------------
 
-fn ask_reply(reason: &str) -> Value {
+pub(crate) fn ask_reply(reason: &str) -> Value {
     json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -1274,7 +1415,7 @@ fn ask_reply(reason: &str) -> Value {
     })
 }
 
-fn warn_reply(text: &str) -> Value {
+pub(crate) fn warn_reply(text: &str) -> Value {
     if text.is_empty() {
         json!({})
     } else {
@@ -1287,22 +1428,7 @@ fn warn_reply(text: &str) -> Value {
     }
 }
 
-/// Host envelope for the read/inline-dump advisory: warnings emit only on
-/// hosts that deliver non-blocking `PreToolUse` context (`claude`, `muse`).
-fn read_guard_reply(host: &str, guard: ReadGuard) -> Value {
-    match guard {
-        ReadGuard::Pass => json!({}),
-        ReadGuard::Warn(text) => {
-            if host_delivers_pretool_context(host) {
-                warn_reply(&text)
-            } else {
-                json!({})
-            }
-        }
-    }
-}
-
-fn cursor_deny_reply(reason: &str) -> Value {
+pub(crate) fn cursor_deny_reply(reason: &str) -> Value {
     let text = format!("Prometheus: {reason}.");
     json!({
         "permission": "deny",
@@ -1311,7 +1437,7 @@ fn cursor_deny_reply(reason: &str) -> Value {
     })
 }
 
-fn problem_reply(host: &str, event: Option<&Value>, problem: &str) -> Value {
+pub(crate) fn problem_reply(host: HookHost, event: Option<&Value>, problem: &str) -> Value {
     let is_pretool = event
         .map(|ev| event_name_normalized(ev) == "pretooluse")
         .unwrap_or(false);
@@ -1328,7 +1454,7 @@ fn problem_reply(host: &str, event: Option<&Value>, problem: &str) -> Value {
     json!({"systemMessage": format!("Hook warning: {problem}")})
 }
 
-fn resolve_dir(path: &str) -> Result<PathBuf, &'static str> {
+pub(crate) fn resolve_dir(path: &str) -> Result<PathBuf, &'static str> {
     let resolved = std::fs::canonicalize(path).map_err(|_| "cwd-invalid")?;
     if !resolved.is_dir() {
         return Err("cwd-not-directory");
@@ -1336,131 +1462,15 @@ fn resolve_dir(path: &str) -> Result<PathBuf, &'static str> {
     Ok(resolved)
 }
 
-fn handle_claude_or_muse(host: &str, raw: &[u8]) -> Value {
-    if host == "claude"
-        && OTHER_HOSTS
-            .iter()
-            .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
-    {
-        return json!({});
-    }
-    let parsed: Option<Value> = serde_json::from_slice(raw).ok();
-    let Some(event) = parsed.as_ref().filter(|v| v.is_object()) else {
-        let problem = if parsed.is_some() {
-            "event-malformed"
-        } else {
-            "invalid-json"
-        };
-        return problem_reply(host, None, problem);
-    };
-    let cwd = as_str(get(event, "cwd"));
-    if cwd.is_empty() {
-        return problem_reply(host, Some(event), "cwd-missing");
-    }
-    let session_id = as_str(get(event, "session_id"));
-    if !valid_session_id_str(session_id) {
-        return problem_reply(host, Some(event), "session-id-invalid");
-    }
-    let root = match resolve_dir(cwd) {
-        Ok(root) => root,
-        Err(problem) => return problem_reply(host, Some(event), problem),
-    };
-    if event_name_normalized(event) != "pretooluse" {
-        return json!({});
-    }
-    let denial = secret_tool_denial(event);
-    if !denial.is_empty() {
-        return ask_reply(&denial);
-    }
-    if let Some(reply) = crate::hook_rewrite::rewrite_command_reply(host, event) {
-        return reply;
-    }
-    let dump = inline_dump_guard(host, event, session_id, Some(&root));
-    if dump != ReadGuard::Pass {
-        return read_guard_reply(host, dump);
-    }
-    read_guard_reply(
-        host,
-        read_guard(host, event, session_id, Some(&root)),
-    )
-}
-
-fn handle_droid(raw: &[u8]) -> Value {
-    let parsed: Option<Value> = serde_json::from_slice(raw).ok();
-    let Some(event) = parsed.as_ref().filter(|v| v.is_object()) else {
-        return json!({"systemMessage": "Hook warning: invalid-json"});
-    };
-    let session_id = as_str(get(event, "session_id"));
-    if !valid_session_id_str(session_id) {
-        return problem_reply("droid", Some(event), "session-id-invalid");
-    }
-    let cwd = as_str(get(event, "cwd"));
-    if cwd.is_empty() {
-        return problem_reply("droid", Some(event), "cwd-missing");
-    }
-    let _root = match resolve_dir(cwd) {
-        Ok(root) => root,
-        Err(problem) => return problem_reply("droid", Some(event), problem),
-    };
-    if event_name_normalized(event) != "pretooluse" {
-        return json!({});
-    }
-    let denial = secret_tool_denial(event);
-    if !denial.is_empty() {
-        return ask_reply(&denial);
-    }
-    if let Some(reply) = crate::hook_rewrite::rewrite_command_reply("droid", event) {
-        return reply;
-    }
-    json!({})
-}
-
-fn devin_candidate(event: &Value) -> Option<PathBuf> {
-    if let Ok(value) = std::env::var("DEVIN_PROJECT_DIR") {
-        if !value.is_empty() {
-            return Some(PathBuf::from(value));
-        }
+pub(crate) fn devin_candidate(event: &Value, ambient: &AmbientFacts) -> Option<PathBuf> {
+    if let Some(value) = &ambient.devin_project_dir {
+        return Some(value.clone());
     }
     let cwd = as_str(get(event, "cwd"));
     if !cwd.is_empty() {
         return Some(PathBuf::from(cwd));
     }
-    std::env::current_dir().ok()
-}
-
-fn handle_devin(raw: &[u8]) -> Value {
-    let parsed: Option<Value> = serde_json::from_slice(raw).ok();
-    let Some(event) = parsed.as_ref().filter(|v| v.is_object()) else {
-        return json!({"systemMessage": "Hook warning: invalid-json"});
-    };
-    if event_name_normalized(event) != "pretooluse" {
-        return json!({});
-    }
-    if casefold(tool_name(event)) == "read" && read_failure_allows("devin", event) {
-        return json!({});
-    }
-    let session_id = as_str(get(event, "session_id"));
-    if !valid_session_id_str(session_id) {
-        return problem_reply("devin", Some(event), "session-id-invalid");
-    }
-    let Some(candidate) = devin_candidate(event) else {
-        return problem_reply("devin", Some(event), "root-invalid");
-    };
-    let root = match std::fs::canonicalize(&candidate) {
-        Ok(resolved) if resolved.is_dir() => resolved,
-        Ok(_) => return problem_reply("devin", Some(event), "root-not-directory"),
-        Err(_) => return problem_reply("devin", Some(event), "root-invalid"),
-    };
-    let denial = secret_tool_denial(event);
-    if !denial.is_empty() {
-        return ask_reply(&denial);
-    }
-    if let Some(reply) =
-        crate::hook_rewrite::rewrite_command_reply_with_cwd("devin", event, Some(&root))
-    {
-        return reply;
-    }
-    json!({})
+    ambient.process_cwd.clone()
 }
 
 fn push_root(roots: &mut Vec<PathBuf>, candidate: &Path) {
@@ -1474,7 +1484,7 @@ fn push_root(roots: &mut Vec<PathBuf>, candidate: &Path) {
     }
 }
 
-fn cursor_roots(event: &Value) -> Vec<PathBuf> {
+pub(crate) fn cursor_roots(event: &Value, ambient: &AmbientFacts) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(Value::Array(listed)) = get(event, "workspace_roots") {
         for entry in listed {
@@ -1491,109 +1501,47 @@ fn cursor_roots(event: &Value) -> Vec<PathBuf> {
             push_root(&mut roots, Path::new(cwd));
         }
         if roots.is_empty() {
-            if let Ok(cur) = std::env::current_dir() {
-                push_root(&mut roots, &cur);
+            if let Some(cur) = &ambient.process_cwd {
+                push_root(&mut roots, cur);
             }
         }
     }
     roots
 }
 
-fn handle_cursor(raw: &[u8]) -> Value {
-    let parsed: Option<Value> = serde_json::from_slice(raw).ok();
-    let Some(event) = parsed.as_ref().filter(|v| v.is_object()) else {
-        return json!({});
-    };
-    let name = event_name_normalized(event);
-    if name == "beforesubmitprompt" {
-        return json!({"continue": true});
-    }
-    if name != "pretooluse" {
-        return json!({});
-    }
-    let session_id = as_str(py_or(get(event, "session_id"), get(event, "conversation_id")));
-    if !valid_session_id_str(session_id) {
-        if read_failure_allows("cursor", event) {
-            return json!({});
-        }
-        return cursor_deny_reply("the secret guard failed");
-    }
-    let reason = cursor_secret_denied(event);
-    if !reason.is_empty() {
-        return cursor_deny_reply(&reason);
-    }
-    let roots = cursor_roots(event);
-    let root = roots.first().map(PathBuf::as_path);
-    let shell_input: Option<Map<String, Value>> = get(event, "tool_input")
-        .and_then(Value::as_object)
-        .or_else(|| get(event, "input").and_then(Value::as_object))
-        .cloned()
-        .or_else(|| {
-            get(event, "command")
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .map(|cmd| {
-                    let mut m = Map::new();
-                    m.insert("command".to_owned(), Value::String(cmd.to_owned()));
-                    m
-                })
-        });
-    if let Some(inp) = shell_input.as_ref() {
-        if let crate::hook_rewrite::ShellAction::Rewrite {
-            command_key,
-            rewritten,
-            ..
-        } = crate::hook_rewrite::evaluate_shell_policy(
-            "cursor",
-            crate::hook_rewrite::ShellPolicyTier::Rewrite,
-            tool_name(event),
-            inp,
-            session_id,
-            root,
-        ) {
-            let mut updated = inp.clone();
-            updated.insert(command_key, Value::String(rewritten));
-            return json!({
-                "permission": "allow",
-                "updated_input": Value::Object(updated),
-            });
-        }
-    }
-    json!({})
-}
-
-fn omp_block_reply(reason: &str) -> Value {
+pub(crate) fn omp_block_reply(reason: &str) -> Value {
     json!({"block": true, "reason": reason})
 }
 
-fn resolve_optional_root(cwd: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_optional_root(cwd: &str, ambient: &AmbientFacts) -> Option<PathBuf> {
     if !cwd.is_empty() {
         return std::fs::canonicalize(cwd).ok().filter(|p| p.is_dir());
     }
-    std::env::current_dir()
-        .ok()
+    ambient
+        .process_cwd
+        .as_ref()
         .and_then(|p| std::fs::canonicalize(p).ok())
         .filter(|p| p.is_dir())
 }
 
-fn resolve_secret_root(cwd: &str) -> Result<Option<PathBuf>, ()> {
+pub(crate) fn resolve_secret_root(cwd: &str, ambient: &AmbientFacts) -> Result<Option<PathBuf>, ()> {
     let raw = normalize_secret_candidate(cwd);
     if !raw.is_empty() {
-        let path = expand_tilde_path(&raw).unwrap_or_else(|| PathBuf::from(&raw));
-        return resolve_secret_path(&path).map(Some);
+        let path = expand_tilde_path(&raw, ambient).unwrap_or_else(|| PathBuf::from(&raw));
+        return resolve_secret_path(&path, ambient).map(Some);
     }
-    match std::env::current_dir() {
-        Ok(cur) => resolve_secret_path(&cur).map(Some),
-        Err(_) => Ok(None),
+    match &ambient.process_cwd {
+        Some(cur) => resolve_secret_path(cur, ambient).map(Some),
+        None => Ok(None),
     }
 }
 
-fn opencode_deny_reply(reason: &str) -> Value {
+pub(crate) fn opencode_deny_reply(reason: &str) -> Value {
     json!({"decision": "deny", "reason": format!("Prometheus: {reason}.")})
 }
 
-fn opencode_secret_denial(event: &Value, root: Option<&Path>) -> String {
-    let (reason, saw_path_arg) = scan_secret_path_keys(event, "", root);
+pub(crate) fn opencode_secret_denial(event: &Value, root: Option<&Path>, ambient: &AmbientFacts) -> String {
+    let (reason, saw_path_arg) = scan_secret_path_keys(event, "", root, ambient);
     if !reason.is_empty() {
         return reason;
     }
@@ -1626,382 +1574,51 @@ fn opencode_secret_denial(event: &Value, root: Option<&Path>) -> String {
 /// OpenCode permission-`evaluate` payload (plugin-constructed canonical shape):
 /// `event_name`, `tool_name` (the permission action), `tool_input`
 /// (`path`/`paths` for file actions, `command` for shell), `cwd`, `session_id`.
-fn handle_opencode(raw: &[u8]) -> Value {
-    let parsed: Option<Value> = serde_json::from_slice(raw).ok();
-    let Some(event) = parsed.as_ref().filter(|v| v.is_object()) else {
-        return opencode_deny_reply("the secret guard failed");
-    };
-    if event_name_normalized(event) != "pretooluse" {
-        return json!({});
-    }
-    let root = match resolve_secret_root(as_str(get(event, "cwd"))) {
-        Ok(root) => root,
-        Err(()) => return opencode_deny_reply(SYMLINK_BLOCK_REASON),
-    };
-    let denial = opencode_secret_denial(event, root.as_deref());
-    if !denial.is_empty() {
-        return opencode_deny_reply(&denial);
-    }
-    json!({})
-}
-
-fn handle_omp(raw: &[u8]) -> Value {
-    let parsed: Option<Value> = serde_json::from_slice(raw).ok();
-    let Some(event) = parsed.as_ref().filter(|v| v.is_object()) else {
-        let problem = if parsed.is_some() {
-            "event-malformed"
-        } else {
-            "invalid-json"
-        };
-        return omp_block_reply(&format!(
-            "Hook warning: {problem} — consent could not be evaluated"
-        ));
-    };
-    let root = match resolve_secret_root(as_str(get(event, "cwd"))) {
-        Ok(root) => root,
-        Err(()) => return omp_block_reply(SYMLINK_BLOCK_REASON),
-    };
-    let prompt = as_str(py_or(
-        get(event, "lastPrompt"),
-        py_or(get(event, "last_prompt"), get(event, "prompt")),
-    ));
-    let denial = omp_secret_denial(event, prompt, root.as_deref());
-    if !denial.is_empty() {
-        return omp_block_reply(&denial);
-    }
-    let session_id = as_str(py_or(get(event, "sessionId"), get(event, "session_id")));
-    if !session_id.is_empty() && !valid_session_id_str(session_id) {
-        if read_failure_allows("omp", event) && omp_secret_denial(event, "", root.as_deref()).is_empty() {
-            return json!({});
-        }
-        return omp_block_reply(
-            "Hook warning: session-id-invalid — consent could not be evaluated",
-        );
-    }
-    let canonical_root = root
-        .as_ref()
-        .and_then(|p| std::fs::canonicalize(p).ok())
-        .filter(|d| d.is_dir());
-    let inp = get(event, "input")
-        .and_then(Value::as_object)
-        .or_else(|| get(event, "tool_input").and_then(Value::as_object));
-    let explicit_shell_cwd = inp
-        .and_then(|m| m.get("cwd"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let (shell_root, shell_cwd_is_secret) = match explicit_shell_cwd {
-        Some(sub) => {
-            let sub_norm = normalize_secret_candidate(sub);
-            let raw_secret = !command_token_denied(&sub_norm).is_empty();
-            let resolved_loose = resolve_candidate_against_root(&sub_norm, root.as_deref());
-            if matches!(resolved_loose, Some(Err(()))) {
-                return omp_block_reply(SYMLINK_BLOCK_REASON);
-            }
-            let resolved_secret = resolved_loose
-                .as_ref()
-                .and_then(|res| res.as_ref().ok())
-                .is_some_and(|p| !secret_path_denied(&p.to_string_lossy()).is_empty());
-            let canonical = resolved_loose
-                .and_then(Result::ok)
-                .and_then(|p| std::fs::canonicalize(p).ok())
-                .filter(|d| d.is_dir());
-            (canonical, raw_secret || resolved_secret)
-        }
-        None => {
-            let root_secret = root
-                .as_ref()
-                .is_some_and(|p| !secret_path_denied(&p.to_string_lossy()).is_empty());
-            (canonical_root.clone(), root_secret)
-        }
-    };
-    if !shell_cwd_is_secret {
-        if let Some(inp) = inp {
-            if let crate::hook_rewrite::ShellAction::Rewrite {
-                command_key,
-                rewritten,
-                ..
-            } = crate::hook_rewrite::evaluate_shell_policy(
-                "omp",
-                crate::hook_rewrite::ShellPolicyTier::Rewrite,
-                tool_name(event),
-                inp,
-                session_id,
-                shell_root.as_deref(),
-            ) {
-                let mut updated = inp.clone();
-                updated.insert(command_key, Value::String(rewritten));
-                return json!({ "input": Value::Object(updated) });
-            }
-        }
-    }
-    json!({})
-}
-
-const ANTIGRAVITY_FILE_TOOLS: [&str; 10] = [
-    "view_file",
-    "read_file",
-    "write_to_file",
-    "write_file",
-    "replace_file_content",
-    "multi_replace_file_content",
-    "edit_file",
-    "list_dir",
-    "find_by_name",
-    "grep_search",
-];
-
-const ANTIGRAVITY_SECRET_KEYS: [&str; 10] = [
-    "AbsolutePath",
-    "Path",
-    "TargetFile",
-    "DirectoryPath",
-    "SearchDirectory",
-    "SearchPath",
-    "file_path",
-    "path",
-    "pattern",
-    "glob",
-];
-
-fn antigravity_allow() -> Value {
-    json!({"decision": "allow"})
-}
-
-/// Normalize an Antigravity camelCase payload (`toolCall.{name,args}`,
-/// `conversationId`, `workspacePaths`) into the shared event shape.
-fn antigravity_event(event: &Value) -> Value {
-    let mut normalized = match event.as_object() {
-        Some(map) => map.clone(),
-        None => Map::new(),
-    };
-    let tool_call = get(event, "toolCall").cloned().unwrap_or(Value::Null);
-    let name = as_str(get(&tool_call, "name")).to_string();
-    let args = get(&tool_call, "args").cloned().unwrap_or_else(|| json!({}));
-    normalized.insert("tool_name".to_string(), Value::String(name));
-    normalized.insert("tool_input".to_string(), args);
-    let session = as_str(py_or(
-        get(event, "conversationId"),
-        get(event, "session_id"),
-    ))
-    .to_string();
-    normalized.insert("session_id".to_string(), Value::String(session));
-    if as_str(get(event, "cwd")).is_empty() {
-        if let Some(Value::Array(paths)) = get(event, "workspacePaths") {
-            if let Some(first) = paths.iter().find_map(Value::as_str) {
-                if !first.is_empty() {
-                    normalized.insert("cwd".to_string(), Value::String(first.to_string()));
-                }
-            }
-        }
-    }
-    Value::Object(normalized)
-}
-
-fn handle_antigravity(raw: &[u8]) -> Value {
-    let parsed: Option<Value> = serde_json::from_slice(raw).ok();
-    let Some(event) = parsed.as_ref().filter(|v| v.is_object()) else {
-        // Malformed payload: never emit `{}` (that denies on Antigravity);
-        // `ask` is the fail-closed secret-safe fallback.
-        return json!({
-            "decision": "ask",
-            "reason": "Hook warning: consent could not be evaluated",
-        });
-    };
-    if event_name_normalized(event) != "pretooluse" {
-        return antigravity_allow();
-    }
-    let normalized = antigravity_event(event);
-    let tool = casefold(tool_name(&normalized));
-    let prompt = as_str(get(event, "lastUserInput"));
-    if ANTIGRAVITY_FILE_TOOLS.contains(&tool.as_str()) {
-        if let Some(inp) = get(&normalized, "tool_input").and_then(Value::as_object) {
-            let reason =
-                check_keys_for_secret_with_prompt(inp, &ANTIGRAVITY_SECRET_KEYS, prompt);
-            if !reason.is_empty() {
-                return json!({"decision": "ask", "reason": reason});
-            }
-        }
-    }
-    let session_id = as_str(get(&normalized, "session_id")).to_string();
-    let root = resolve_optional_root(as_str(get(&normalized, "cwd")));
-    if tool == "run_command" {
-        if let Some(inp) = get(&normalized, "tool_input").and_then(Value::as_object) {
-            if let crate::hook_rewrite::ShellAction::Rewrite { rewritten, .. } =
-                crate::hook_rewrite::evaluate_shell_policy(
-                    "antigravity",
-                    crate::hook_rewrite::ShellPolicyTier::Rewrite,
-                    tool_name(&normalized),
-                    inp,
-                    &session_id,
-                    root.as_deref(),
-                )
-            {
-                return json!({
-                    "decision": "allow",
-                    "overwrite": {"CommandLine": rewritten},
-                });
-            }
-        }
-        return antigravity_allow();
-    }
-    antigravity_allow()
-}
-
-const GROK_SECRET_KEYS: [&str; 10] = [
-    "file_path",
-    "filePath",
-    "path",
-    "AbsolutePath",
-    "target_file",
-    "TargetFile",
-    "pattern",
-    "glob",
-    "directory",
-    "dir",
-];
-
-const GROK_FILE_TOOLS: [&str; 12] = [
-    "read_file",
-    "read",
-    "write_file",
-    "edit_file",
-    "create_file",
-    "list_dir",
-    "grep",
-    "search",
-    "glob",
-    "view_file",
-    "replace_file_content",
-    "multi_replace_file_content",
-];
-
-/// Normalize a Grok Build camelCase payload (`toolName`, `toolInput`,
-/// `sessionId`, `workspaceRoot`) into the shared event shape.
-fn grok_event(event: &Value) -> Value {
-    let mut normalized = match event.as_object() {
-        Some(map) => map.clone(),
-        None => Map::new(),
-    };
-    normalized.insert(
-        "tool_name".to_string(),
-        Value::String(as_str(get(event, "toolName")).to_string()),
-    );
-    normalized.insert(
-        "tool_input".to_string(),
-        get(event, "toolInput").cloned().unwrap_or_else(|| json!({})),
-    );
-    normalized.insert(
-        "session_id".to_string(),
-        Value::String(as_str(get(event, "sessionId")).to_string()),
-    );
-    if as_str(get(event, "cwd")).is_empty() {
-        let root = as_str(get(event, "workspaceRoot"));
-        if !root.is_empty() {
-            normalized.insert("cwd".to_string(), Value::String(root.to_string()));
-        }
-    }
-    Value::Object(normalized)
-}
-
-fn handle_grok(raw: &[u8]) -> Value {
-    let parsed: Option<Value> = serde_json::from_slice(raw).ok();
-    let Some(event) = parsed.as_ref().filter(|v| v.is_object()) else {
-        return json!({});
-    };
-    if event_name_normalized(event) != "pretooluse" {
-        return json!({});
-    }
-    let normalized = grok_event(event);
-    let tool = casefold(tool_name(&normalized));
-    if GROK_FILE_TOOLS.contains(&tool.as_str()) {
-        if let Some(inp) = get(&normalized, "tool_input").and_then(Value::as_object) {
-            let reason = check_keys_for_secret(inp, &GROK_SECRET_KEYS);
-            if !reason.is_empty() {
-                return json!({"decision": "deny", "reason": reason});
-            }
-        }
-    }
-    let session_id = as_str(get(&normalized, "session_id")).to_string();
-    let root = resolve_optional_root(as_str(get(&normalized, "cwd")));
-    if crate::hook_rewrite::is_shell_tool(tool_name(&normalized)) {
-        if let Some(inp) = get(&normalized, "tool_input").and_then(Value::as_object) {
-            if let crate::hook_rewrite::ShellAction::DenyOnce { reason, .. } =
-                crate::hook_rewrite::evaluate_shell_policy(
-                    "grok",
-                    crate::hook_rewrite::ShellPolicyTier::DenyOnce,
-                    tool_name(&normalized),
-                    inp,
-                    &session_id,
-                    root.as_deref(),
-                )
-            {
-                return json!({"decision": "deny", "reason": reason});
-            }
-        }
-        return json!({});
-    }
-    json!({})
-}
-
-pub fn is_supported_host(host: &str) -> bool {
-    matches!(
-        host,
-        "claude" | "cursor" | "devin" | "droid" | "muse" | "omp" | "opencode" | "antigravity" | "grok"
-    )
-}
-
 /// Evaluate one hook event from raw stdin JSON for `host`.
-pub fn run_hook(host: &str, raw_stdin: &[u8]) -> Value {
-    match host {
-        "claude" | "muse" => handle_claude_or_muse(host, raw_stdin),
-        "droid" => handle_droid(raw_stdin),
-        "devin" => handle_devin(raw_stdin),
-        "cursor" => handle_cursor(raw_stdin),
-        "omp" => handle_omp(raw_stdin),
-        "opencode" => handle_opencode(raw_stdin),
-        "antigravity" => handle_antigravity(raw_stdin),
-        "grok" => handle_grok(raw_stdin),
-        _ => json!({}),
-    }
+/// This is the hook entry point (the edge): it reads the ambient facts from
+/// the process environment exactly once and passes them down.
+pub fn run_hook(host: HookHost, raw_stdin: &[u8]) -> Value {
+    let ambient = AmbientFacts::from_process();
+    run_hook_with_ambient(host, raw_stdin, &ambient)
+}
+
+/// Evaluate one hook event with ambient facts supplied as a value (#102).
+pub fn run_hook_with_ambient(host: HookHost, raw_stdin: &[u8], ambient: &AmbientFacts) -> Value {
+    host.run(raw_stdin, ambient)
 }
 
 /// Fail-closed fallback reply if hook evaluation panics.
-pub fn panic_fallback(host: &str) -> Value {
-    match host {
-        "cursor" => cursor_deny_reply("the secret guard failed"),
-        "omp" => omp_block_reply("consent could not be evaluated"),
-        // `{}` denies on Antigravity, so its panic fallback must be explicit;
-        // `ask` keeps the secret guard fail-closed without a hard deny.
-        "antigravity" => json!({
-            "decision": "ask",
-            "reason": "consent could not be evaluated",
-        }),
-        "grok" => json!({
-            "decision": "deny",
-            "reason": "consent could not be evaluated",
-        }),
-        "opencode" => json!({
-            "decision": "deny",
-            "reason": "consent could not be evaluated",
-        }),
-        _ => ask_reply("consent could not be evaluated"),
-    }
+pub fn panic_fallback(host: HookHost) -> Value {
+    host.panic_fallback()
 }
 
 #[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[cfg(test)]
 mod tests {
+
+    fn base_amb() -> AmbientFacts {
+        let mut a = AmbientFacts {
+            other_host_markers_present: false,
+            devin_project_dir: None,
+            rewrite_disabled: false,
+            rtk_coexist: None,
+            rtk_config_active: std::collections::BTreeMap::new(),
+            xdg_runtime_dir: None,
+            temp_dir: std::env::temp_dir(),
+            session_parent: PathBuf::new(),
+            process_cwd: std::env::current_dir().ok(),
+            home_dir: None,
+            xdg_config_home: None,
+            agy_config_dir: None,
+            exe_path: std::env::current_exe()
+                .unwrap_or_else(|_| PathBuf::from("prometheus-kit")),
+        };
+        a.recompute_derived();
+        a
+    }
+
     use super::*;
     use std::fs;
-    use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn env_guard() -> MutexGuard<'static, ()> {
-        TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
 
     struct TempDir(PathBuf);
 
@@ -2026,32 +1643,29 @@ mod tests {
         }
     }
 
-    struct EnvOverride {
-        saved: Vec<(&'static str, Option<String>)>,
-    }
 
-    impl EnvOverride {
-        fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
-            let mut saved = Vec::new();
-            for &(k, v) in pairs {
-                saved.push((k, std::env::var(k).ok()));
-                match v {
-                    Some(val) => unsafe { std::env::set_var(k, val) },
-                    None => unsafe { std::env::remove_var(k) },
-                }
-            }
-            Self { saved }
-        }
-    }
-
-    impl Drop for EnvOverride {
-        fn drop(&mut self) {
-            for (k, v) in self.saved.drain(..).rev() {
-                match v {
-                    Some(val) => unsafe { std::env::set_var(k, val) },
-                    None => unsafe { std::env::remove_var(k) },
-                }
-            }
+    #[test]
+    fn same_event_twice_with_same_ambient_facts_gives_byte_identical_reply_for_all_nine_hosts() {
+        let amb = base_amb();
+        let tmp = TempDir::new("twice");
+        let cwd = tmp.0.to_string_lossy().into_owned();
+        let events: [(&str, Value); 9] = [
+            ("claude", json!({"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {"file_path": ".env"}, "cwd": cwd, "session_id": "s-twice"})),
+            ("muse", json!({"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {"file_path": ".env"}, "cwd": cwd, "session_id": "s-twice"})),
+            ("droid", json!({"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {"file_path": ".env"}, "cwd": cwd, "session_id": "s-twice"})),
+            ("devin", json!({"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {"file_path": ".env"}, "cwd": cwd, "session_id": "s-twice"})),
+            ("cursor", json!({"hook_event_name": "preToolUse", "tool_name": "Read", "tool_input": {"file_path": ".env"}, "workspace_roots": [cwd], "conversation_id": "s-twice"})),
+            ("omp", json!({"tool_name": "read", "input": {"path": ".env"}, "cwd": cwd, "sessionId": "s-twice"})),
+            ("opencode", json!({"event_name": "pretooluse", "tool_name": "read", "tool_input": {"path": ".env"}, "cwd": cwd, "session_id": "s-twice"})),
+            ("antigravity", json!({"hookEventName": "PreToolUse", "conversationId": "s-twice", "workspacePaths": [cwd], "toolCall": {"name": "view_file", "args": {"AbsolutePath": ".env"}}})),
+            ("grok", json!({"hookEventName": "PreToolUse", "sessionId": "s-twice", "workspaceRoot": cwd, "toolName": "read_file", "toolInput": {"file_path": ".env"}})),
+        ];
+        for (host, ev) in events {
+            let bytes = ev.to_string().into_bytes();
+            let first = run_hook_with_ambient(HookHost::parse(host).unwrap(), &bytes, &amb).to_string();
+            let second = run_hook_with_ambient(HookHost::parse(host).unwrap(), &bytes, &amb).to_string();
+            assert_ne!("{}", first, "{host} secret guard must fire");
+            assert_eq!(first, second, "{host} replies must be byte-identical");
         }
     }
 
@@ -2088,15 +1702,15 @@ mod tests {
 
     #[test]
     fn shell_commands_never_trigger_secret_ask_while_file_tools_do() {
-        let _g = env_guard();
         let tmp = TempDir::new("shell_no_ask");
-        let _env = EnvOverride::set(&[
-            ("CURSOR_PROJECT_DIR", None),
-            ("DEVIN_PROJECT_DIR", None),
-            ("GROK_SESSION_ID", None),
-            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
-            ("PROMETHEUS_KIT_NO_REWRITE", None),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.devin_project_dir = None;
+            a.rtk_coexist = Some("0".to_string());
+            a.rewrite_disabled = false;
+            a.recompute_derived();
+            a
+        };
         // Structured file tools still block secret paths across every host.
         for tool_input in [
             json!({"file_path": ".env"}),
@@ -2112,7 +1726,7 @@ mod tests {
                     "cwd": tmp.0,
                     "session_id": "s-file",
                 });
-                let reply = run_hook(host, ev.to_string().as_bytes());
+                let reply = run_hook_with_ambient(HookHost::parse(host).unwrap(), ev.to_string().as_bytes(), &amb);
                 assert_eq!(
                     "ask",
                     reply["hookSpecificOutput"]["permissionDecision"],
@@ -2128,7 +1742,7 @@ mod tests {
             });
             assert_eq!(
                 "deny",
-                run_hook("cursor", cev.to_string().as_bytes())["permission"],
+                run_hook_with_ambient(HookHost::Cursor, cev.to_string().as_bytes(), &amb)["permission"],
                 "cursor {tool_input}"
             );
         }
@@ -2152,7 +1766,7 @@ mod tests {
                 "cwd": tmp.0,
                 "session_id": "s-devin",
             });
-            let devin_reply = run_hook("devin", devin_ev.to_string().as_bytes());
+            let devin_reply = run_hook_with_ambient(HookHost::Devin, devin_ev.to_string().as_bytes(), &amb);
             assert!(
                 devin_reply["hookSpecificOutput"].get("permissionDecision").is_none()
                     && devin_reply.get("decision").is_none(),
@@ -2166,7 +1780,7 @@ mod tests {
                     "cwd": tmp.0,
                     "session_id": "s-host",
                 });
-                let reply = run_hook(host, ev.to_string().as_bytes());
+                let reply = run_hook_with_ambient(HookHost::parse(host).unwrap(), ev.to_string().as_bytes(), &amb);
                 assert!(
                     reply["hookSpecificOutput"].get("permissionDecision").is_none(),
                     "{host} {cmd}: {reply}"
@@ -2179,7 +1793,7 @@ mod tests {
                 "workspace_roots": [tmp.0],
                 "conversation_id": "s-cursor",
             });
-            let cursor_reply = run_hook("cursor", cursor_ev.to_string().as_bytes());
+            let cursor_reply = run_hook_with_ambient(HookHost::Cursor, cursor_ev.to_string().as_bytes(), &amb);
             assert_ne!(
                 Some("deny"),
                 cursor_reply.get("permission").and_then(Value::as_str),
@@ -2227,25 +1841,26 @@ mod tests {
 
     #[test]
     fn resolve_loose_keeps_dot_non_empty() {
-        let resolved = resolve_loose(Path::new("."));
+        let amb = base_amb();
+        let resolved = resolve_loose(Path::new("."), &amb);
         assert!(!resolved.as_os_str().is_empty());
         assert!(resolved.is_absolute());
-        let rel = resolve_loose(Path::new("./nonexistent_child_xyz"));
+        let rel = resolve_loose(Path::new("./nonexistent_child_xyz"), &amb);
         assert!(rel.is_absolute());
         assert!(rel.ends_with("nonexistent_child_xyz"));
     }
 
     #[test]
     fn direct_checks_and_edits_pass_across_hosts() {
-        let _g = env_guard();
         let tmp = TempDir::new("pass");
-        let _env = EnvOverride::set(&[
-            ("CURSOR_PROJECT_DIR", None),
-            ("DEVIN_PROJECT_DIR", None),
-            ("GROK_SESSION_ID", None),
-            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
-            ("PROMETHEUS_KIT_NO_REWRITE", None),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.devin_project_dir = None;
+            a.rtk_coexist = Some("0".to_string());
+            a.rewrite_disabled = false;
+            a.recompute_derived();
+            a
+        };
         for host in ["claude", "droid", "devin", "muse"] {
             for cmd in ["sudo dotnet test", "env cargo build"] {
                 let ev = json!({
@@ -2255,7 +1870,7 @@ mod tests {
                     "cwd": tmp.0,
                     "session_id": "s1",
                 });
-                assert_eq!(json!({}), run_hook(host, ev.to_string().as_bytes()), "{host} {cmd}");
+                assert_eq!(json!({}), run_hook_with_ambient(HookHost::parse(host).unwrap(), ev.to_string().as_bytes(), &amb), "{host} {cmd}");
             }
             for cmd in ["dotnet test", "cargo test"] {
                 let ev = json!({
@@ -2265,7 +1880,7 @@ mod tests {
                     "cwd": tmp.0,
                     "session_id": "s1",
                 });
-                let reply = run_hook(host, ev.to_string().as_bytes());
+                let reply = run_hook_with_ambient(HookHost::parse(host).unwrap(), ev.to_string().as_bytes(), &amb);
                 assert!(
                     reply["hookSpecificOutput"].get("permissionDecision").is_none(),
                     "{host} {cmd} must never ask/deny"
@@ -2286,11 +1901,16 @@ mod tests {
                     "cwd": tmp.0,
                     "session_id": "s1",
                 });
-                assert_eq!(json!({}), run_hook(host, ev.to_string().as_bytes()));
+                assert_eq!(json!({}), run_hook_with_ambient(HookHost::parse(host).unwrap(), ev.to_string().as_bytes(), &amb));
             }
         }
         {
-            let _no_rw = EnvOverride::set(&[("PROMETHEUS_KIT_NO_REWRITE", Some("1"))]);
+            let amb = {
+                let mut a = amb.clone();
+                a.rewrite_disabled = true;
+                a.recompute_derived();
+                a
+            };
             let ev = json!({
                 "hook_event_name": "PreToolUse",
                 "tool_name": "Bash",
@@ -2298,7 +1918,7 @@ mod tests {
                 "cwd": tmp.0,
                 "session_id": "s1",
             });
-            assert_eq!(json!({}), run_hook("droid", ev.to_string().as_bytes()));
+            assert_eq!(json!({}), run_hook_with_ambient(HookHost::Droid, ev.to_string().as_bytes(), &amb));
         }
         for cmd in [
             "sed -n '1,5p' .env",
@@ -2313,16 +1933,20 @@ mod tests {
                     "cwd": tmp.0,
                     "session_id": "s1",
                 });
-                assert_eq!(json!({}), run_hook(host, ev.to_string().as_bytes()), "{host} {cmd}");
+                assert_eq!(json!({}), run_hook_with_ambient(HookHost::parse(host).unwrap(), ev.to_string().as_bytes(), &amb), "{host} {cmd}");
             }
         }
     }
 
     #[test]
     fn claude_short_circuits_when_other_host_env_is_set_but_muse_does_not() {
-        let _g = env_guard();
         let tmp = TempDir::new("other");
-        let _env = EnvOverride::set(&[("CURSOR_PROJECT_DIR", Some("/tmp"))]);
+        let amb = {
+            let mut a = base_amb();
+            a.other_host_markers_present = true;
+            a.recompute_derived();
+            a
+        };
         let ev = json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "Read",
@@ -2330,39 +1954,39 @@ mod tests {
             "cwd": tmp.0,
             "session_id": "s1",
         });
-        assert_eq!(json!({}), run_hook("claude", ev.to_string().as_bytes()));
-        let muse_reply = run_hook("muse", ev.to_string().as_bytes());
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Claude, ev.to_string().as_bytes(), &amb));
+        let muse_reply = run_hook_with_ambient(HookHost::Muse, ev.to_string().as_bytes(), &amb);
         assert_eq!("ask", muse_reply["hookSpecificOutput"]["permissionDecision"]);
     }
 
     #[test]
     fn malformed_and_lifecycle_envelopes_match_adapters() {
-        let _g = env_guard();
         let tmp = TempDir::new("env");
-        let _env = EnvOverride::set(&[
-            ("CURSOR_PROJECT_DIR", None),
-            ("DEVIN_PROJECT_DIR", None),
-            ("GROK_SESSION_ID", None),
-        ]);
-        let claude_arr = run_hook("claude", b"[]");
+        let amb = {
+            let mut a = base_amb();
+            a.devin_project_dir = None;
+            a.recompute_derived();
+            a
+        };
+        let claude_arr = run_hook_with_ambient(HookHost::Claude, b"[]", &amb);
         assert!(claude_arr["systemMessage"]
             .as_str()
             .unwrap()
             .contains("event-malformed"));
-        let claude_bad = run_hook("claude", b"{");
+        let claude_bad = run_hook_with_ambient(HookHost::Claude, b"{", &amb);
         assert!(claude_bad["systemMessage"]
             .as_str()
             .unwrap()
             .contains("invalid-json"));
         assert_eq!(
             json!({"continue": true}),
-            run_hook("cursor", br#"{"hook_event_name":"beforeSubmitPrompt"}"#)
+            run_hook_with_ambient(HookHost::Cursor, br#"{"hook_event_name":"beforeSubmitPrompt"}"#, &amb)
         );
         assert_eq!(
             json!({}),
-            run_hook("devin", br#"{"hook_event_name":"Stop"}"#)
+            run_hook_with_ambient(HookHost::Devin, br#"{"hook_event_name":"Stop"}"#, &amb)
         );
-        let claude_stop_missing = run_hook("claude", br#"{"hook_event_name":"Stop"}"#);
+        let claude_stop_missing = run_hook_with_ambient(HookHost::Claude, br#"{"hook_event_name":"Stop"}"#, &amb);
         assert!(claude_stop_missing["systemMessage"]
             .as_str()
             .unwrap()
@@ -2376,7 +2000,7 @@ mod tests {
         for host in ["claude", "droid", "devin", "muse", "cursor"] {
             assert_eq!(
                 json!({}),
-                run_hook(host, non_secret_read.to_string().as_bytes()),
+                run_hook_with_ambient(HookHost::parse(host).unwrap(), non_secret_read.to_string().as_bytes(), &amb),
                 "{host}"
             );
         }
@@ -2389,18 +2013,17 @@ mod tests {
         });
         assert_eq!(
             "ask",
-            run_hook("claude", secret_read.to_string().as_bytes())["hookSpecificOutput"]
+            run_hook_with_ambient(HookHost::Claude, secret_read.to_string().as_bytes(), &amb)["hookSpecificOutput"]
                 ["permissionDecision"]
         );
         assert_eq!(
             "deny",
-            run_hook("cursor", secret_read.to_string().as_bytes())["permission"]
+            run_hook_with_ambient(HookHost::Cursor, secret_read.to_string().as_bytes(), &amb)["permission"]
         );
     }
 
     #[test]
     fn reread_warns_and_respects_security_and_edits() {
-        let _g = env_guard();
         let tmp = TempDir::new("reread");
         let rt = tmp.0.join("xdg");
         fs::create_dir_all(&rt).unwrap();
@@ -2409,12 +2032,13 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let _env = EnvOverride::set(&[
-            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
-            ("CURSOR_PROJECT_DIR", None),
-            ("DEVIN_PROJECT_DIR", None),
-            ("GROK_SESSION_ID", None),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.xdg_runtime_dir = Some(PathBuf::from(rt.to_str().unwrap()));
+            a.devin_project_dir = None;
+            a.recompute_derived();
+            a
+        };
         let repo = tmp.0.join("repo");
         fs::create_dir_all(&repo).unwrap();
         let file = repo.join("a.py");
@@ -2427,8 +2051,8 @@ mod tests {
             "cwd": repo,
             "session_id": "s-reread",
         });
-        assert_eq!(json!({}), run_hook("claude", ev.to_string().as_bytes()));
-        let second = run_hook("claude", ev.to_string().as_bytes());
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Claude, ev.to_string().as_bytes(), &amb));
+        let second = run_hook_with_ambient(HookHost::Claude, ev.to_string().as_bytes(), &amb);
         assert_eq!(REREAD_MESSAGE, second["hookSpecificOutput"]["additionalContext"]);
         assert!(second["hookSpecificOutput"].get("permissionDecision").is_none());
 
@@ -2441,15 +2065,15 @@ mod tests {
             "cwd": repo,
             "session_id": "s-reread",
         });
-        assert_eq!(json!({}), run_hook("claude", partial.to_string().as_bytes()));
-        assert_eq!(json!({}), run_hook("claude", partial.to_string().as_bytes()));
-        let third = run_hook("claude", ev.to_string().as_bytes());
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Claude, partial.to_string().as_bytes(), &amb));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Claude, partial.to_string().as_bytes(), &amb));
+        let third = run_hook_with_ambient(HookHost::Claude, ev.to_string().as_bytes(), &amb);
         assert_eq!(REREAD_MESSAGE, third["hookSpecificOutput"]["additionalContext"]);
 
         // Edited file updates hash without warning, then next reread warns.
         fs::write(&file, "x = 2\n").unwrap();
-        assert_eq!(json!({}), run_hook("claude", ev.to_string().as_bytes()));
-        let fourth = run_hook("claude", ev.to_string().as_bytes());
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Claude, ev.to_string().as_bytes(), &amb));
+        let fourth = run_hook_with_ambient(HookHost::Claude, ev.to_string().as_bytes(), &amb);
         assert_eq!(REREAD_MESSAGE, fourth["hookSpecificOutput"]["additionalContext"]);
 
         // Cursor drops non-blocking PreToolUse context, so <200-line rereads stay silent (ADR-0014 D3).
@@ -2460,8 +2084,8 @@ mod tests {
             "workspace_roots": [repo],
             "conversation_id": "s-cursor",
         });
-        assert_eq!(json!({}), run_hook("cursor", cev.to_string().as_bytes()));
-        assert_eq!(json!({}), run_hook("cursor", cev.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Cursor, cev.to_string().as_bytes(), &amb));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Cursor, cev.to_string().as_bytes(), &amb));
         // Droid and Devin also suppress inert <200-line reread warnings.
         let dev = json!({
             "hook_event_name": "PreToolUse",
@@ -2470,15 +2094,14 @@ mod tests {
             "cwd": repo,
             "session_id": "s-droid",
         });
-        assert_eq!(json!({}), run_hook("droid", dev.to_string().as_bytes()));
-        assert_eq!(json!({}), run_hook("droid", dev.to_string().as_bytes()));
-        assert_eq!(json!({}), run_hook("devin", dev.to_string().as_bytes()));
-        assert_eq!(json!({}), run_hook("devin", dev.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Droid, dev.to_string().as_bytes(), &amb));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Droid, dev.to_string().as_bytes(), &amb));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Devin, dev.to_string().as_bytes(), &amb));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Devin, dev.to_string().as_bytes(), &amb));
     }
 
     #[test]
     fn use_time_hint_fires_once_per_session_and_leaves_the_command_unchanged() {
-        let _g = env_guard();
         let tmp = TempDir::new("hint");
         let rt = tmp.0.join("xdg");
         fs::create_dir_all(&rt).unwrap();
@@ -2487,12 +2110,13 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let _env = EnvOverride::set(&[
-            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
-            ("CURSOR_PROJECT_DIR", None),
-            ("DEVIN_PROJECT_DIR", None),
-            ("GROK_SESSION_ID", None),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.xdg_runtime_dir = Some(PathBuf::from(rt.to_str().unwrap()));
+            a.devin_project_dir = None;
+            a.recompute_derived();
+            a
+        };
         let repo = tmp.0.join("repo");
         fs::create_dir_all(&repo).unwrap();
         // Session ids are unique per run: on Windows the session dir is
@@ -2515,7 +2139,7 @@ mod tests {
             "cwd": repo,
             "session_id": sid(""),
         });
-        let first = run_hook("claude", py.to_string().as_bytes());
+        let first = run_hook_with_ambient(HookHost::Claude, py.to_string().as_bytes(), &amb);
         let ctx = first["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .expect("first inline parse gets the hint");
@@ -2526,7 +2150,7 @@ mod tests {
         assert!(first["hookSpecificOutput"].get("permissionDecision").is_none());
         // Once per session per rule: the same session stays silent, even
         // for a different interpreter shape.
-        assert_eq!(json!({}), run_hook("claude", py.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Claude, py.to_string().as_bytes(), &amb));
         let jq = json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "Bash",
@@ -2534,7 +2158,7 @@ mod tests {
             "cwd": repo,
             "session_id": sid(""),
         });
-        assert_eq!(json!({}), run_hook("claude", jq.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Claude, jq.to_string().as_bytes(), &amb));
         // A new session gets the hint again (jq form).
         let jq2 = json!({
             "hook_event_name": "PreToolUse",
@@ -2543,7 +2167,7 @@ mod tests {
             "cwd": repo,
             "session_id": sid("2"),
         });
-        let jq_reply = run_hook("claude", jq2.to_string().as_bytes());
+        let jq_reply = run_hook_with_ambient(HookHost::Claude, jq2.to_string().as_bytes(), &amb);
         assert!(jq_reply["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .is_some_and(|c| c.contains("@fields")));
@@ -2555,7 +2179,7 @@ mod tests {
             "cwd": repo,
             "session_id": sid("3"),
         });
-        let hd = run_hook("claude", heredoc.to_string().as_bytes());
+        let hd = run_hook_with_ambient(HookHost::Claude, heredoc.to_string().as_bytes(), &amb);
         assert!(hd["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .is_some_and(|c| c.contains("cfg.yaml")));
@@ -2569,7 +2193,7 @@ mod tests {
         // `node -e` with the file only inside the script text has no
         // structured-file operand token after the program, but the
         // trailing cfg.toml operand names it.
-        let nd = run_hook("claude", node.to_string().as_bytes());
+        let nd = run_hook_with_ambient(HookHost::Claude, node.to_string().as_bytes(), &amb);
         assert!(nd["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .is_some_and(|c| c.contains("cfg.toml")));
@@ -2581,7 +2205,7 @@ mod tests {
             "cwd": repo,
             "session_id": sid("5"),
         });
-        assert_eq!(json!({}), run_hook("claude", plain.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Claude, plain.to_string().as_bytes(), &amb));
         let ls = json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "Bash",
@@ -2589,18 +2213,22 @@ mod tests {
             "cwd": repo,
             "session_id": sid("6"),
         });
-        assert_eq!(json!({}), run_hook("claude", ls.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Claude, ls.to_string().as_bytes(), &amb));
     }
 
     #[cfg(unix)]
     #[test]
     fn reread_refuses_symlinks_fifos_and_insecure_dirs() {
         use std::os::unix::fs::{symlink, PermissionsExt};
-        let _g = env_guard();
         let tmp = TempDir::new("sec");
         let rt = tmp.0.join("xdg");
         fs::create_dir_all(&rt).unwrap();
-        let _env = EnvOverride::set(&[("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap()))]);
+        let amb = {
+            let mut a = base_amb();
+            a.xdg_runtime_dir = Some(PathBuf::from(rt.to_str().unwrap()));
+            a.recompute_derived();
+            a
+        };
 
         let repo = tmp.0.join("repo");
         fs::create_dir_all(&repo).unwrap();
@@ -2612,20 +2240,20 @@ mod tests {
         assert_eq!(
             ReadGuard::Pass,
             read_guard(
-                "claude",
+                
                 &json!({"tool_name": "Read", "tool_input": {"file_path": link}}),
                 "s-sec",
                 Some(&repo),
-            )
+            &amb).0
         );
         assert_eq!(
             ReadGuard::Pass,
             read_guard(
-                "claude",
+                
                 &json!({"tool_name": "Read", "tool_input": {"file_path": link}}),
                 "s-sec",
                 Some(&repo),
-            )
+            &amb).0
         );
 
         // Insecure 0o755 session dir is refused and never chmod'd — even for
@@ -2639,11 +2267,11 @@ mod tests {
             assert_eq!(
                 ReadGuard::Pass,
                 read_guard(
-                    "claude",
+                    
                     &json!({"tool_name": "Read", "tool_input": {"file_path": file}}),
                     "s-bad",
                     Some(&repo),
-                )
+                &amb).0
             );
         }
         assert_eq!(
@@ -2654,7 +2282,6 @@ mod tests {
 
     #[test]
     fn large_whole_file_read_warns_only_context_hosts_and_never_denies() {
-        let _g = env_guard();
         let tmp = TempDir::new("large_read");
         let rt = tmp.0.join("xdg");
         fs::create_dir_all(&rt).unwrap();
@@ -2663,12 +2290,13 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let _env = EnvOverride::set(&[
-            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
-            ("CURSOR_PROJECT_DIR", None),
-            ("DEVIN_PROJECT_DIR", None),
-            ("GROK_SESSION_ID", None),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.xdg_runtime_dir = Some(PathBuf::from(rt.to_str().unwrap()));
+            a.devin_project_dir = None;
+            a.recompute_derived();
+            a
+        };
         let repo = tmp.0.join("repo");
         fs::create_dir_all(&repo).unwrap();
 
@@ -2683,8 +2311,8 @@ mod tests {
         });
         // No-context hosts never block whole-file reads or rereads, regardless of size.
         for host in ["droid", "devin"] {
-            assert_eq!(json!({}), run_hook(host, ev_big.to_string().as_bytes()), "{host} first");
-            assert_eq!(json!({}), run_hook(host, ev_big.to_string().as_bytes()), "{host} reread");
+            assert_eq!(json!({}), run_hook_with_ambient(HookHost::parse(host).unwrap(), ev_big.to_string().as_bytes(), &amb), "{host} first");
+            assert_eq!(json!({}), run_hook_with_ambient(HookHost::parse(host).unwrap(), ev_big.to_string().as_bytes(), &amb), "{host} reread");
         }
         // Context-delivering hosts (`claude`, `muse`) pass the first read, then emit a
         // non-blocking `additionalContext` warning on unchanged whole-file reread.
@@ -2697,8 +2325,8 @@ mod tests {
                 "cwd": repo,
                 "session_id": sid,
             });
-            assert_eq!(json!({}), run_hook(host, ev.to_string().as_bytes()));
-            let second = run_hook(host, ev.to_string().as_bytes());
+            assert_eq!(json!({}), run_hook_with_ambient(HookHost::parse(host).unwrap(), ev.to_string().as_bytes(), &amb));
+            let second = run_hook_with_ambient(HookHost::parse(host).unwrap(), ev.to_string().as_bytes(), &amb);
             assert_eq!(REREAD_MESSAGE, second["hookSpecificOutput"]["additionalContext"]);
             assert!(second["hookSpecificOutput"].get("permissionDecision").is_none());
         }
@@ -2712,8 +2340,8 @@ mod tests {
             "cwd": repo,
             "session_id": "s-large-claude",
         });
-        assert_eq!(json!({}), run_hook("claude", ev_claude.to_string().as_bytes()));
-        let after_edit_reread = run_hook("claude", ev_claude.to_string().as_bytes());
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Claude, ev_claude.to_string().as_bytes(), &amb));
+        let after_edit_reread = run_hook_with_ambient(HookHost::Claude, ev_claude.to_string().as_bytes(), &amb);
         assert_eq!(REREAD_MESSAGE, after_edit_reread["hookSpecificOutput"]["additionalContext"]);
         assert!(after_edit_reread["hookSpecificOutput"].get("permissionDecision").is_none());
 
@@ -2725,8 +2353,8 @@ mod tests {
             "cwd": repo,
             "session_id": "s-large-claude",
         });
-        assert_eq!(json!({}), run_hook("claude", range.to_string().as_bytes()));
-        assert_eq!(json!({}), run_hook("claude", range.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Claude, range.to_string().as_bytes(), &amb));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Claude, range.to_string().as_bytes(), &amb));
 
         // Large secret .env file still triggers secret ask, never silent pass.
         let big_env = repo.join(".env");
@@ -2738,13 +2366,12 @@ mod tests {
             "cwd": repo,
             "session_id": "s-large",
         });
-        let env_reply = run_hook("droid", ev_env.to_string().as_bytes());
+        let env_reply = run_hook_with_ambient(HookHost::Droid, ev_env.to_string().as_bytes(), &amb);
         assert_eq!("ask", env_reply["hookSpecificOutput"]["permissionDecision"]);
     }
 
     #[test]
     fn large_file_reads_never_block_across_hosts() {
-        let _g = env_guard();
         let tmp = TempDir::new("no_deny_hosts");
         let rt = tmp.0.join("xdg");
         fs::create_dir_all(&rt).unwrap();
@@ -2753,12 +2380,13 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let _env = EnvOverride::set(&[
-            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
-            ("CURSOR_PROJECT_DIR", None),
-            ("DEVIN_PROJECT_DIR", None),
-            ("GROK_SESSION_ID", None),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.xdg_runtime_dir = Some(PathBuf::from(rt.to_str().unwrap()));
+            a.devin_project_dir = None;
+            a.recompute_derived();
+            a
+        };
         let repo = tmp.0.join("repo");
         fs::create_dir_all(&repo).unwrap();
         let big_path = repo.join("big.rs");
@@ -2795,8 +2423,8 @@ mod tests {
                 }),
             };
             let bytes = ev.to_string().into_bytes();
-            assert_eq!(json!({}), run_hook(host, &bytes), "host={host} first read");
-            let second = run_hook(host, &bytes);
+            assert_eq!(json!({}), run_hook_with_ambient(HookHost::parse(host).unwrap(), &bytes, &amb), "host={host} first read");
+            let second = run_hook_with_ambient(HookHost::parse(host).unwrap(), &bytes, &amb);
             if matches!(host, "claude" | "muse") {
                 assert_eq!(REREAD_MESSAGE, second["hookSpecificOutput"]["additionalContext"], "host={host}");
                 assert!(second["hookSpecificOutput"].get("permissionDecision").is_none(), "host={host}");
@@ -2813,12 +2441,16 @@ mod tests {
         if my_uid() == 0 {
             return;
         }
-        let _g = env_guard();
         let tmp = TempDir::new("deny_failopen");
         let rt = tmp.0.join("xdg");
         fs::create_dir_all(&rt).unwrap();
         fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
-        let _env = EnvOverride::set(&[("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap()))]);
+        let amb = {
+            let mut a = base_amb();
+            a.xdg_runtime_dir = Some(PathBuf::from(rt.to_str().unwrap()));
+            a.recompute_derived();
+            a
+        };
         let repo = tmp.0.join("repo");
         fs::create_dir_all(&repo).unwrap();
         fs::write(repo.join("big.rs"), "fn a() {}\n".repeat(220)).unwrap();
@@ -2837,14 +2469,13 @@ mod tests {
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&folder, fs::Permissions::from_mode(0o500)).unwrap();
         for _ in 0..2 {
-            assert_eq!(json!({}), run_hook("claude", &bytes), "unwritable state dir must fail open");
+            assert_eq!(json!({}), run_hook_with_ambient(HookHost::Claude, &bytes, &amb), "unwritable state dir must fail open");
         }
         fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
     fn null_partial_parameters_count_as_a_whole_file_read() {
-        let _g = env_guard();
         let tmp = TempDir::new("null_partial");
         let rt = tmp.0.join("xdg");
         fs::create_dir_all(&rt).unwrap();
@@ -2853,12 +2484,13 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let _env = EnvOverride::set(&[
-            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
-            ("CURSOR_PROJECT_DIR", None),
-            ("DEVIN_PROJECT_DIR", None),
-            ("GROK_SESSION_ID", None),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.xdg_runtime_dir = Some(PathBuf::from(rt.to_str().unwrap()));
+            a.devin_project_dir = None;
+            a.recompute_derived();
+            a
+        };
         let repo = tmp.0.join("repo");
         fs::create_dir_all(&repo).unwrap();
         fs::write(repo.join("big.rs"), "fn a() {}\n".repeat(220)).unwrap();
@@ -2889,15 +2521,15 @@ mod tests {
                 .as_nanos()
         );
         let whole = ev(&sid, false);
-        assert_eq!(json!({}), run_hook("claude", whole.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Claude, whole.to_string().as_bytes(), &amb));
         let nulled = ev(&sid, true);
-        let second = run_hook("claude", nulled.to_string().as_bytes());
+        let second = run_hook_with_ambient(HookHost::Claude, nulled.to_string().as_bytes(), &amb);
         assert_eq!(REREAD_MESSAGE, second["hookSpecificOutput"]["additionalContext"]);
         assert!(second["hookSpecificOutput"].get("permissionDecision").is_none());
 
         // Legacy state files containing " first-denied" or " denied" are still
         // recognized as valid hashes and never deny.
-        let sess_dir = session_dir(&sid).expect("session dir");
+        let sess_dir = session_dir(&sid, &amb).expect("session dir");
         let state_files: Vec<_> = fs::read_dir(&sess_dir)
             .unwrap()
             .filter_map(Result::ok)
@@ -2906,7 +2538,7 @@ mod tests {
         assert_eq!(1, state_files.len());
         let existing = fs::read_to_string(&state_files[0]).unwrap();
         fs::write(&state_files[0], format!("{} first-denied\n", existing.trim())).unwrap();
-        let third = run_hook("claude", whole.to_string().as_bytes());
+        let third = run_hook_with_ambient(HookHost::Claude, whole.to_string().as_bytes(), &amb);
         assert_eq!(REREAD_MESSAGE, third["hookSpecificOutput"]["additionalContext"]);
         assert!(third["hookSpecificOutput"].get("permissionDecision").is_none());
         let _ = fs::remove_dir_all(&sess_dir);
@@ -2914,7 +2546,6 @@ mod tests {
 
     #[test]
     fn no_context_hosts_never_block_inline_structured_dumps() {
-        let _g = env_guard();
         let tmp = TempDir::new("inline_dump_pass");
         let rt = tmp.0.join("xdg");
         fs::create_dir_all(&rt).unwrap();
@@ -2923,13 +2554,14 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&rt, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let _env = EnvOverride::set(&[
-            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
-            ("CURSOR_PROJECT_DIR", None),
-            ("DEVIN_PROJECT_DIR", None),
-            ("GROK_SESSION_ID", None),
-            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.xdg_runtime_dir = Some(PathBuf::from(rt.to_str().unwrap()));
+            a.devin_project_dir = None;
+            a.rtk_coexist = Some("0".to_string());
+            a.recompute_derived();
+            a
+        };
         let repo = tmp.0.join("repo");
         fs::create_dir_all(&repo).unwrap();
         fs::write(repo.join("small.json"), "{\"a\": 1}\n").unwrap();
@@ -2966,10 +2598,10 @@ mod tests {
                     "session_id": sid,
                 }),
             };
-            assert_eq!(json!({}), run_hook(host, make_ev("jq '.a' small.json").to_string().as_bytes()), "{host} small");
-            assert_eq!(json!({}), run_hook(host, make_ev("jq '.a' missing.json").to_string().as_bytes()), "{host} missing");
-            assert_eq!(json!({}), run_hook(host, make_ev("jq '.k0' secrets.json").to_string().as_bytes()), "{host} secret");
-            assert_eq!(json!({}), run_hook(host, make_ev("jq '.k0' big.json").to_string().as_bytes()), "{host} big");
+            assert_eq!(json!({}), run_hook_with_ambient(HookHost::parse(host).unwrap(), make_ev("jq '.a' small.json").to_string().as_bytes(), &amb), "{host} small");
+            assert_eq!(json!({}), run_hook_with_ambient(HookHost::parse(host).unwrap(), make_ev("jq '.a' missing.json").to_string().as_bytes(), &amb), "{host} missing");
+            assert_eq!(json!({}), run_hook_with_ambient(HookHost::parse(host).unwrap(), make_ev("jq '.k0' secrets.json").to_string().as_bytes(), &amb), "{host} secret");
+            assert_eq!(json!({}), run_hook_with_ambient(HookHost::parse(host).unwrap(), make_ev("jq '.k0' big.json").to_string().as_bytes(), &amb), "{host} big");
         }
 
         fs::write(repo.join("big.yaml"), "item: 1\n".repeat(220)).unwrap();
@@ -2996,19 +2628,19 @@ mod tests {
             })
             .to_string()
             .into_bytes();
-            assert_eq!(json!({}), run_hook("droid", &ev), "cmd={cmd}");
+            assert_eq!(json!({}), run_hook_with_ambient(HookHost::Droid, &ev, &amb), "cmd={cmd}");
         }
     }
 
     #[test]
     fn secret_guard_blocks_input_filepath_and_absolute_path_aliases() {
-        let _g = env_guard();
         let tmp = TempDir::new("secret_aliases");
-        let _env = EnvOverride::set(&[
-            ("CURSOR_PROJECT_DIR", None),
-            ("DEVIN_PROJECT_DIR", None),
-            ("GROK_SESSION_ID", None),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.devin_project_dir = None;
+            a.recompute_derived();
+            a
+        };
         // Devin input.filePath alias (with and without session_id) must fail closed on secret paths.
         let devin_alias = json!({
             "hook_event_name": "PreToolUse",
@@ -3019,7 +2651,7 @@ mod tests {
         });
         assert_eq!(
             "ask",
-            run_hook("devin", devin_alias.to_string().as_bytes())["hookSpecificOutput"]["permissionDecision"]
+            run_hook_with_ambient(HookHost::Devin, devin_alias.to_string().as_bytes(), &amb)["hookSpecificOutput"]["permissionDecision"]
         );
         let devin_no_sid = json!({
             "hook_event_name": "PreToolUse",
@@ -3029,7 +2661,7 @@ mod tests {
         });
         assert_eq!(
             "ask",
-            run_hook("devin", devin_no_sid.to_string().as_bytes())["hookSpecificOutput"]["permissionDecision"]
+            run_hook_with_ambient(HookHost::Devin, devin_no_sid.to_string().as_bytes(), &amb)["hookSpecificOutput"]["permissionDecision"]
         );
         // AbsolutePath secret key must fail closed across all five hosts (with and without session_id).
         for host in ["claude", "droid", "devin", "muse"] {
@@ -3045,7 +2677,7 @@ mod tests {
                 }
                 assert_eq!(
                     "ask",
-                    run_hook(host, ev.to_string().as_bytes())["hookSpecificOutput"]["permissionDecision"],
+                    run_hook_with_ambient(HookHost::parse(host).unwrap(), ev.to_string().as_bytes(), &amb)["hookSpecificOutput"]["permissionDecision"],
                     "host={host} with_sid={with_sid}"
                 );
             }
@@ -3062,7 +2694,7 @@ mod tests {
             }
             assert_eq!(
                 "deny",
-                run_hook("cursor", ev.to_string().as_bytes())["permission"],
+                run_hook_with_ambient(HookHost::Cursor, ev.to_string().as_bytes(), &amb)["permission"],
                 "cursor with_sid={with_sid}"
             );
         }
@@ -3070,12 +2702,14 @@ mod tests {
 
     #[test]
     fn cursor_rewrites_shell_via_updated_input_preserves_siblings_and_defers_to_rtk() {
-        let _g = env_guard();
         let tmp = TempDir::new("cursor_rw");
-        let _env = EnvOverride::set(&[
-            ("PROMETHEUS_KIT_NO_REWRITE", None),
-            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.rewrite_disabled = false;
+            a.rtk_coexist = Some("0".to_string());
+            a.recompute_derived();
+            a
+        };
         let ev = json!({
             "hook_event_name": "preToolUse",
             "tool_name": "Shell",
@@ -3087,7 +2721,7 @@ mod tests {
             "workspace_roots": [tmp.0],
             "conversation_id": "s-cursor-rw",
         });
-        let reply = run_hook("cursor", ev.to_string().as_bytes());
+        let reply = run_hook_with_ambient(HookHost::Cursor, ev.to_string().as_bytes(), &amb);
         assert_eq!("allow", reply["permission"]);
         let updated = reply["updated_input"].as_object().expect("updated_input object");
         assert!(updated["command"].as_str().unwrap().contains("diff --status"), "{reply}");
@@ -3103,7 +2737,7 @@ mod tests {
             "workspace_roots": [tmp.0],
             "conversation_id": "s-cursor-rw",
         });
-        assert_eq!(json!({}), run_hook("cursor", write_ev.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Cursor, write_ev.to_string().as_bytes(), &amb));
 
         // Secret paths still deny before any rewrite.
         let sec_ev = json!({
@@ -3113,11 +2747,16 @@ mod tests {
             "workspace_roots": [tmp.0],
             "conversation_id": "s-cursor-rw",
         });
-        assert_eq!("deny", run_hook("cursor", sec_ev.to_string().as_bytes())["permission"]);
+        assert_eq!("deny", run_hook_with_ambient(HookHost::Cursor, sec_ev.to_string().as_bytes(), &amb)["permission"]);
 
         // RTK deferral skips RTK-owned commands while keeping RTK-gap commands.
-        let _rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("1"))]);
-        assert_eq!(json!({}), run_hook("cursor", ev.to_string().as_bytes()));
+        let amb = {
+            let mut a = amb.clone();
+            a.rtk_coexist = Some("1".to_string());
+            a.recompute_derived();
+            a
+        };
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Cursor, ev.to_string().as_bytes(), &amb));
         let dt_ev = json!({
             "hook_event_name": "preToolUse",
             "tool_name": "Shell",
@@ -3125,7 +2764,7 @@ mod tests {
             "workspace_roots": [tmp.0],
             "conversation_id": "s-cursor-rw",
         });
-        let dt_reply = run_hook("cursor", dt_ev.to_string().as_bytes());
+        let dt_reply = run_hook_with_ambient(HookHost::Cursor, dt_ev.to_string().as_bytes(), &amb);
         assert_eq!("allow", dt_reply["permission"]);
         assert!(dt_reply["updated_input"]["command"]
             .as_str()
@@ -3135,13 +2774,15 @@ mod tests {
 
     #[test]
     fn devin_rewrites_exec_via_updated_input_preserves_siblings_and_defers_to_rtk() {
-        let _g = env_guard();
         let tmp = TempDir::new("devin_rw");
-        let _env = EnvOverride::set(&[
-            ("DEVIN_PROJECT_DIR", None),
-            ("PROMETHEUS_KIT_NO_REWRITE", None),
-            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.devin_project_dir = None;
+            a.rewrite_disabled = false;
+            a.rtk_coexist = Some("0".to_string());
+            a.recompute_derived();
+            a
+        };
         // Standard tool_input and Devin `input` alias both rewrite `exec` via updatedInput.
         for ev in [
             json!({
@@ -3159,7 +2800,7 @@ mod tests {
                 "session_id": "s-devin-rw",
             }),
         ] {
-            let reply = run_hook("devin", ev.to_string().as_bytes());
+            let reply = run_hook_with_ambient(HookHost::Devin, ev.to_string().as_bytes(), &amb);
             let out = &reply["hookSpecificOutput"];
             assert_eq!("PreToolUse", out["hookEventName"]);
             assert!(out.get("permissionDecision").is_none());
@@ -3177,7 +2818,7 @@ mod tests {
             "cwd": tmp.0,
             "session_id": "s-devin-rw",
         });
-        assert_eq!(json!({}), run_hook("devin", write_ev.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Devin, write_ev.to_string().as_bytes(), &amb));
 
         // Secret-path guard runs before rewrites; secret shell operands skip rewrite.
         let sec_read = json!({
@@ -3187,7 +2828,7 @@ mod tests {
             "cwd": tmp.0,
             "session_id": "s-devin-rw",
         });
-        assert_eq!("ask", run_hook("devin", sec_read.to_string().as_bytes())["hookSpecificOutput"]["permissionDecision"]);
+        assert_eq!("ask", run_hook_with_ambient(HookHost::Devin, sec_read.to_string().as_bytes(), &amb)["hookSpecificOutput"]["permissionDecision"]);
         let sec_exec = json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "exec",
@@ -3195,10 +2836,15 @@ mod tests {
             "cwd": tmp.0,
             "session_id": "s-devin-rw",
         });
-        assert_eq!(json!({}), run_hook("devin", sec_exec.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Devin, sec_exec.to_string().as_bytes(), &amb));
 
         // RTK deferral skips RTK-owned commands while rewriting RTK-gap commands.
-        let _rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("1"))]);
+        let amb = {
+            let mut a = amb.clone();
+            a.rtk_coexist = Some("1".to_string());
+            a.recompute_derived();
+            a
+        };
         let git_ev = json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "exec",
@@ -3206,7 +2852,7 @@ mod tests {
             "cwd": tmp.0,
             "session_id": "s-devin-rw",
         });
-        assert_eq!(json!({}), run_hook("devin", git_ev.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Devin, git_ev.to_string().as_bytes(), &amb));
         let dt_ev = json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "exec",
@@ -3214,7 +2860,7 @@ mod tests {
             "cwd": tmp.0,
             "session_id": "s-devin-rw",
         });
-        let dt_reply = run_hook("devin", dt_ev.to_string().as_bytes());
+        let dt_reply = run_hook_with_ambient(HookHost::Devin, dt_ev.to_string().as_bytes(), &amb);
         assert!(dt_reply["hookSpecificOutput"]["updatedInput"]["command"]
             .as_str()
             .unwrap()
@@ -3255,7 +2901,6 @@ mod tests {
 
     #[test]
     fn omp_handles_rewrites_guards_unlock_fallback_and_rtk_deferral() {
-        let _g = env_guard();
         let tmp = TempDir::new("omp_hook");
         let rt = TempDir::new("omp_rt");
         #[cfg(unix)]
@@ -3263,11 +2908,14 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&rt.0, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let _env = EnvOverride::set(&[
-            ("XDG_RUNTIME_DIR", Some(rt.0.to_str().unwrap())),
-            ("PROMETHEUS_KIT_NO_REWRITE", None),
-            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.xdg_runtime_dir = Some(PathBuf::from(rt.0.to_str().unwrap()));
+            a.rewrite_disabled = false;
+            a.rtk_coexist = Some("0".to_string());
+            a.recompute_derived();
+            a
+        };
         let big_rs = tmp.0.join("big.rs");
         fs::write(
             &big_rs,
@@ -3302,7 +2950,7 @@ mod tests {
             "sessionId": "omp-sess-1",
             "lastPrompt": "",
         });
-        let rw = run_hook("omp", rw_ev.to_string().as_bytes());
+        let rw = run_hook_with_ambient(HookHost::Omp, rw_ev.to_string().as_bytes(), &amb);
         assert!(rw.get("block").is_none(), "{rw}");
         let inp = rw["input"].as_object().expect("rewritten input object");
         assert!(inp["command"].as_str().unwrap().contains("compact --mode test -- cargo test"), "{rw}");
@@ -3317,7 +2965,7 @@ mod tests {
             "sessionId": "omp-sess-1",
             "lastPrompt": "",
         });
-        assert_eq!(json!({}), run_hook("omp", cat_env.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Omp, cat_env.to_string().as_bytes(), &amb));
         let ssh_cwd_bash = json!({
             "toolName": "bash",
             "input": {"command": "cat config", "cwd": ssh_dir},
@@ -3325,7 +2973,7 @@ mod tests {
             "sessionId": "omp-sess-1",
             "lastPrompt": "",
         });
-        assert_eq!(json!({}), run_hook("omp", ssh_cwd_bash.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Omp, ssh_cwd_bash.to_string().as_bytes(), &amb));
         let bad_sub_cwd_dump = json!({
             "toolName": "bash",
             "input": {"command": "jq '.k0' big.json", "cwd": tmp.0.join("does-not-exist")},
@@ -3333,7 +2981,7 @@ mod tests {
             "sessionId": "omp-sess-1",
             "lastPrompt": "",
         });
-        assert_eq!(json!({}), run_hook("omp", bad_sub_cwd_dump.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Omp, bad_sub_cwd_dump.to_string().as_bytes(), &amb));
 
         // 3. Secret path blocks without prompt, catches cwd-relative/symlink secrets, and unlocks when named.
         let sec = json!({
@@ -3343,7 +2991,7 @@ mod tests {
             "sessionId": "omp-sess-1",
             "lastPrompt": "",
         });
-        let sec_reply = run_hook("omp", sec.to_string().as_bytes());
+        let sec_reply = run_hook_with_ambient(HookHost::Omp, sec.to_string().as_bytes(), &amb);
         assert!(sec_reply["block"].as_bool().unwrap());
         assert!(sec_reply["reason"].as_str().unwrap().contains(".env"));
 
@@ -3354,7 +3002,7 @@ mod tests {
             "sessionId": "omp-sess-1",
             "lastPrompt": "please inspect .env now",
         });
-        assert_eq!(json!({}), run_hook("omp", sec_unlocked.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Omp, sec_unlocked.to_string().as_bytes(), &amb));
 
         let ssh_rel_read = json!({
             "toolName": "read",
@@ -3363,7 +3011,7 @@ mod tests {
             "sessionId": "omp-sess-1",
             "lastPrompt": "debug /config",
         });
-        assert!(run_hook("omp", ssh_rel_read.to_string().as_bytes())["block"].as_bool().unwrap());
+        assert!(run_hook_with_ambient(HookHost::Omp, ssh_rel_read.to_string().as_bytes(), &amb)["block"].as_bool().unwrap());
         let ssh_ls = json!({
             "toolName": "ls",
             "input": {},
@@ -3371,7 +3019,7 @@ mod tests {
             "sessionId": "omp-sess-1",
             "lastPrompt": "",
         });
-        assert!(run_hook("omp", ssh_ls.to_string().as_bytes())["block"].as_bool().unwrap());
+        assert!(run_hook_with_ambient(HookHost::Omp, ssh_ls.to_string().as_bytes(), &amb)["block"].as_bool().unwrap());
 
         #[cfg(unix)]
         {
@@ -3384,7 +3032,7 @@ mod tests {
                 "sessionId": "omp-sess-1",
                 "lastPrompt": "please read notes.md",
             });
-            assert!(run_hook("omp", sym_ev.to_string().as_bytes())["block"].as_bool().unwrap());
+            assert!(run_hook_with_ambient(HookHost::Omp, sym_ev.to_string().as_bytes(), &amb)["block"].as_bool().unwrap());
         }
 
         // 4. Whole, ranged, and blank-`sel` reads of 220-line files never block on omp.
@@ -3395,7 +3043,7 @@ mod tests {
             "sessionId": "omp-sess-1",
             "lastPrompt": "",
         });
-        assert_eq!(json!({}), run_hook("omp", ranged.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Omp, ranged.to_string().as_bytes(), &amb));
         let sel_ranged = json!({
             "toolName": "read",
             "input": {"path": big_rs, "sel": "L1-L20"},
@@ -3403,7 +3051,7 @@ mod tests {
             "sessionId": "omp-sess-1",
             "lastPrompt": "",
         });
-        assert_eq!(json!({}), run_hook("omp", sel_ranged.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Omp, sel_ranged.to_string().as_bytes(), &amb));
         let blank_sel = json!({
             "toolName": "read",
             "input": {"path": big_rs, "sel": "   "},
@@ -3411,7 +3059,7 @@ mod tests {
             "sessionId": "omp-sess-sel-blank",
             "lastPrompt": "",
         });
-        assert_eq!(json!({}), run_hook("omp", blank_sel.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Omp, blank_sel.to_string().as_bytes(), &amb));
 
         let whole = json!({
             "toolName": "read",
@@ -3420,8 +3068,8 @@ mod tests {
             "sessionId": "omp-sess-1",
             "lastPrompt": "",
         });
-        assert_eq!(json!({}), run_hook("omp", whole.to_string().as_bytes()));
-        assert_eq!(json!({}), run_hook("omp", whole.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Omp, whole.to_string().as_bytes(), &amb));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Omp, whole.to_string().as_bytes(), &amb));
 
         // 5. Inline structured-file scripts pass silently on omp.
         let dump_ev = json!({
@@ -3431,11 +3079,11 @@ mod tests {
             "sessionId": "omp-sess-1",
             "lastPrompt": "",
         });
-        assert_eq!(json!({}), run_hook("omp", dump_ev.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Omp, dump_ev.to_string().as_bytes(), &amb));
 
         // 6. Malformed JSON and malformed non-empty session fail closed on non-reads, open on safe reads;
         //    empty sessionId still enforces secrets and rewrites safe shell commands without hard-blocking edits.
-        let bad_json = run_hook("omp", b"{not json");
+        let bad_json = run_hook_with_ambient(HookHost::Omp, b"{not json", &amb);
         assert!(bad_json["block"].as_bool().unwrap());
         let bad_sess_edit = json!({
             "toolName": "edit",
@@ -3443,28 +3091,28 @@ mod tests {
             "cwd": tmp.0,
             "sessionId": "../bad",
         });
-        assert!(run_hook("omp", bad_sess_edit.to_string().as_bytes())["block"].as_bool().unwrap());
+        assert!(run_hook_with_ambient(HookHost::Omp, bad_sess_edit.to_string().as_bytes(), &amb)["block"].as_bool().unwrap());
         let bad_sess_read = json!({
             "toolName": "read",
             "input": {"path": "src/a.rs"},
             "cwd": tmp.0,
             "sessionId": "../bad",
         });
-        assert_eq!(json!({}), run_hook("omp", bad_sess_read.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Omp, bad_sess_read.to_string().as_bytes(), &amb));
         let empty_sess_edit = json!({
             "toolName": "edit",
             "input": {"path": "src/a.rs"},
             "cwd": tmp.0,
             "sessionId": "",
         });
-        assert_eq!(json!({}), run_hook("omp", empty_sess_edit.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Omp, empty_sess_edit.to_string().as_bytes(), &amb));
         let empty_sess_bash = json!({
             "toolName": "bash",
             "input": {"command": "cargo test"},
             "cwd": tmp.0,
             "sessionId": "",
         });
-        assert!(run_hook("omp", empty_sess_bash.to_string().as_bytes())["input"]["command"]
+        assert!(run_hook_with_ambient(HookHost::Omp, empty_sess_bash.to_string().as_bytes(), &amb)["input"]["command"]
             .as_str()
             .unwrap()
             .contains("compact --mode test -- cargo test"));
@@ -3474,35 +3122,42 @@ mod tests {
             "cwd": tmp.0,
             "sessionId": "",
         });
-        assert!(run_hook("omp", empty_sess_sec.to_string().as_bytes())["block"].as_bool().unwrap());
-        assert!(panic_fallback("omp")["block"].as_bool().unwrap());
+        assert!(run_hook_with_ambient(HookHost::Omp, empty_sess_sec.to_string().as_bytes(), &amb)["block"].as_bool().unwrap());
+        assert!(panic_fallback(HookHost::Omp)["block"].as_bool().unwrap());
 
         // 7. RTK deferral skips RTK-owned commands while rewriting RTK-gap commands.
-        let _rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("1"))]);
-        assert_eq!(json!({}), run_hook("omp", rw_ev.to_string().as_bytes()));
+        let amb = {
+            let mut a = amb.clone();
+            a.rtk_coexist = Some("1".to_string());
+            a.recompute_derived();
+            a
+        };
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Omp, rw_ev.to_string().as_bytes(), &amb));
         let dt_ev = json!({
             "toolName": "bash",
             "input": {"command": "dotnet test", "timeout": 15},
             "cwd": tmp.0,
             "sessionId": "omp-sess-1",
         });
-        let dt = run_hook("omp", dt_ev.to_string().as_bytes());
+        let dt = run_hook_with_ambient(HookHost::Omp, dt_ev.to_string().as_bytes(), &amb);
         assert!(dt["input"]["command"].as_str().unwrap().contains("compact --mode test -- dotnet test"));
         assert_eq!(15, dt["input"]["timeout"].as_i64().unwrap());
     }
 
     #[test]
     fn antigravity_tier1_rewrite_read_guard_secret_ask_and_never_empty() {
-        let _g = env_guard();
         let tmp = TempDir::new("antigravity");
         let rt = tmp.0.join("rt");
         fs::create_dir_all(&rt).unwrap();
-        let _env = EnvOverride::set(&[
-            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
-            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
-            ("PROMETHEUS_KIT_NO_REWRITE", None),
-            ("PROMETHEUS_KIT_NO_METRICS", Some("1")),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.xdg_runtime_dir = Some(PathBuf::from(rt.to_str().unwrap()));
+            a.rtk_coexist = Some("0".to_string());
+            a.rewrite_disabled = false;
+            // PROMETHEUS_KIT_NO_METRICS is redundant under cfg(test): metrics recording is compiled off in unit tests.
+            a.recompute_derived();
+            a
+        };
         let big = tmp.0.join("big.rs");
         fs::write(&big, "pub fn f() {}\n".repeat(220)).unwrap();
         let big_json = tmp.0.join("big.json");
@@ -3523,12 +3178,12 @@ mod tests {
             })
         };
         // Rewrite via overwrite with explicit allow.
-        let rw = run_hook(
-            "antigravity",
+        let rw = run_hook_with_ambient(
+            HookHost::Antigravity,
             ev("run_command", json!({"CommandLine": "cargo test", "Cwd": tmp.0}))
                 .to_string()
                 .as_bytes(),
-        );
+        &amb);
         assert_eq!("allow", rw["decision"].as_str().unwrap(), "{rw}");
         assert!(
             rw["overwrite"]["CommandLine"]
@@ -3538,10 +3193,10 @@ mod tests {
             "{rw}"
         );
         // Pass-through shell emits explicit allow, never {}.
-        let pass = run_hook(
-            "antigravity",
+        let pass = run_hook_with_ambient(
+            HookHost::Antigravity,
             ev("run_command", json!({"CommandLine": "echo hi"})).to_string().as_bytes(),
-        );
+        &amb);
         assert_eq!(json!({"decision": "allow"}), pass);
         // Non-PreToolUse also allows explicitly.
         let other = json!({
@@ -3550,75 +3205,82 @@ mod tests {
         });
         assert_eq!(
             json!({"decision": "allow"}),
-            run_hook("antigravity", other.to_string().as_bytes())
+            run_hook_with_ambient(HookHost::Antigravity, other.to_string().as_bytes(), &amb)
         );
         // Secret ask on structured tools, unlock via lastUserInput.
-        let sec = run_hook(
-            "antigravity",
+        let sec = run_hook_with_ambient(
+            HookHost::Antigravity,
             ev("view_file", json!({"AbsolutePath": tmp.0.join(".env")}))
                 .to_string()
                 .as_bytes(),
-        );
+        &amb);
         assert_eq!("ask", sec["decision"].as_str().unwrap(), "{sec}");
         assert!(sec["reason"].as_str().unwrap().contains(".env"));
         let mut unlocked = ev("view_file", json!({"AbsolutePath": tmp.0.join(".env")}));
         unlocked["lastUserInput"] = json!("please read .env today");
         assert_eq!(
             json!({"decision": "allow"}),
-            run_hook("antigravity", unlocked.to_string().as_bytes())
+            run_hook_with_ambient(HookHost::Antigravity, unlocked.to_string().as_bytes(), &amb)
         );
         for (tool, args) in [
             ("write_to_file", json!({"TargetFile": tmp.0.join(".ssh/id_rsa")})),
             ("grep_search", json!({"SearchPath": tmp.0.join("config/secrets.yml")})),
             ("list_dir", json!({"DirectoryPath": tmp.0.join(".aws")})),
         ] {
-            let reply = run_hook("antigravity", ev(tool, args).to_string().as_bytes());
+            let reply = run_hook_with_ambient(HookHost::Antigravity, ev(tool, args).to_string().as_bytes(), &amb);
             assert_eq!("ask", reply["decision"].as_str().unwrap(), "{tool} {reply}");
         }
         // Whole and ranged view_file/read_file reads of 220-line files allow explicitly (never {} or deny).
         let whole = ev("view_file", json!({"AbsolutePath": big}));
-        assert_eq!(json!({"decision": "allow"}), run_hook("antigravity", whole.to_string().as_bytes()));
-        assert_eq!(json!({"decision": "allow"}), run_hook("antigravity", whole.to_string().as_bytes()));
+        assert_eq!(json!({"decision": "allow"}), run_hook_with_ambient(HookHost::Antigravity, whole.to_string().as_bytes(), &amb));
+        assert_eq!(json!({"decision": "allow"}), run_hook_with_ambient(HookHost::Antigravity, whole.to_string().as_bytes(), &amb));
         let ranged = ev(
             "view_file",
             json!({"AbsolutePath": big, "StartLine": 1, "EndLine": 20}),
         );
         assert_eq!(
             json!({"decision": "allow"}),
-            run_hook("antigravity", ranged.to_string().as_bytes())
+            run_hook_with_ambient(HookHost::Antigravity, ranged.to_string().as_bytes(), &amb)
         );
         let mut rf = ev("read_file", json!({"AbsolutePath": big}));
         rf["conversationId"] = json!("agy-sess-2");
-        assert_eq!(json!({"decision": "allow"}), run_hook("antigravity", rf.to_string().as_bytes()));
+        assert_eq!(json!({"decision": "allow"}), run_hook_with_ambient(HookHost::Antigravity, rf.to_string().as_bytes(), &amb));
         // Inline structured-file scripts also emit explicit allow.
         let dump = ev("run_command", json!({"CommandLine": "jq '.k0' big.json"}));
-        assert_eq!(json!({"decision": "allow"}), run_hook("antigravity", dump.to_string().as_bytes()));
+        assert_eq!(json!({"decision": "allow"}), run_hook_with_ambient(HookHost::Antigravity, dump.to_string().as_bytes(), &amb));
         // Malformed payload and panic fallback never emit {}.
-        let bad = run_hook("antigravity", b"{not json");
+        let bad = run_hook_with_ambient(HookHost::Antigravity, b"{not json", &amb);
         assert_eq!("ask", bad["decision"].as_str().unwrap(), "{bad}");
-        assert_eq!("ask", panic_fallback("antigravity")["decision"].as_str().unwrap());
-        assert!(is_supported_host("antigravity"));
+        assert_eq!("ask", panic_fallback(HookHost::Antigravity)["decision"].as_str().unwrap());
+        assert!(HookHost::parse("antigravity").is_some());
         // RTK deferral: RTK-owned command passes with explicit allow.
-        let _rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("1"))]);
-        let deferred = run_hook(
-            "antigravity",
+        let amb = {
+            let mut a = amb.clone();
+            a.rtk_coexist = Some("1".to_string());
+            a.recompute_derived();
+            a
+        };
+        let deferred = run_hook_with_ambient(
+            HookHost::Antigravity,
             ev("run_command", json!({"CommandLine": "git status"})).to_string().as_bytes(),
-        );
+        &amb);
         assert_eq!(json!({"decision": "allow"}), deferred);
     }
 
     #[test]
     fn grok_tier2_secret_deny_shell_deny_once_and_read_guard() {
-        let _g = env_guard();
         let tmp = TempDir::new("grok");
         let rt = tmp.0.join("rt");
         fs::create_dir_all(&rt).unwrap();
-        let _env = EnvOverride::set(&[
-            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
-            ("PROMETHEUS_KIT_RTK_COEXIST", Some("0")),
-            ("PROMETHEUS_KIT_NO_REWRITE", None),
-            ("PROMETHEUS_KIT_NO_METRICS", Some("1")),
-        ]);
+        let amb = {
+            let mut a = base_amb();
+            a.xdg_runtime_dir = Some(PathBuf::from(rt.to_str().unwrap()));
+            a.rtk_coexist = Some("0".to_string());
+            a.rewrite_disabled = false;
+            // PROMETHEUS_KIT_NO_METRICS is redundant under cfg(test): metrics recording is compiled off in unit tests.
+            a.recompute_derived();
+            a
+        };
         let big = tmp.0.join("big.rs");
         fs::write(&big, "pub fn f() {}\n".repeat(220)).unwrap();
         let sess = "grok-sess-1";
@@ -3633,33 +3295,33 @@ mod tests {
             })
         };
         // Secret deny on structured file tools.
-        let sec = run_hook(
-            "grok",
+        let sec = run_hook_with_ambient(
+            HookHost::Grok,
             ev("read_file", json!({"file_path": ".env"})).to_string().as_bytes(),
-        );
+        &amb);
         assert_eq!("deny", sec["decision"].as_str().unwrap(), "{sec}");
         assert!(sec["reason"].as_str().unwrap().contains(".env"));
         // Tier-2 deny-once on covered shell: first denies with exact kit command, retry passes {}.
         let shell = ev("run_terminal_command", json!({"command": "sed -n '1,3p' big.rs"}));
-        let s1 = run_hook("grok", shell.to_string().as_bytes());
+        let s1 = run_hook_with_ambient(HookHost::Grok, shell.to_string().as_bytes(), &amb);
         assert_eq!("deny", s1["decision"].as_str().unwrap(), "{s1}");
         // The kit command in the reason is built from the current exe and
         // platform quoting (POSIX always quotes, Windows only when needed),
         // so assert on the command parts, not the quoted form.
         assert!(s1["reason"].as_str().unwrap().contains("slice"), "{s1}");
         assert!(s1["reason"].as_str().unwrap().contains("big.rs:1-3"), "{s1}");
-        assert_eq!(json!({}), run_hook("grok", shell.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Grok, shell.to_string().as_bytes(), &amb));
         // Uncovered shell passes {}.
         assert_eq!(
             json!({}),
-            run_hook("grok", ev("run_terminal_command", json!({"command": "echo hi"}))
+            run_hook_with_ambient(HookHost::Grok, ev("run_terminal_command", json!({"command": "echo hi"}))
                 .to_string()
-                .as_bytes())
+                .as_bytes(), &amb)
         );
         // Large whole-file reads and inline structured-file scripts never block on grok.
         let whole = ev("read_file", json!({"file_path": big}));
-        assert_eq!(json!({}), run_hook("grok", whole.to_string().as_bytes()));
-        assert_eq!(json!({}), run_hook("grok", whole.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Grok, whole.to_string().as_bytes(), &amb));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Grok, whole.to_string().as_bytes(), &amb));
         let big_json = tmp.0.join("big.json");
         fs::write(
             &big_json,
@@ -3668,28 +3330,34 @@ mod tests {
         .unwrap();
         assert_eq!(
             json!({}),
-            run_hook(
-                "grok",
+            run_hook_with_ambient(
+                HookHost::Grok,
                 ev("run_terminal_command", json!({"command": "jq '.k0' big.json"}))
                     .to_string()
                     .as_bytes()
-            )
+            , &amb)
         );
         // Non-PreToolUse and malformed pass {}.
         let other = json!({"hookEventName": "Stop", "sessionId": sess, "toolName": "read_file", "toolInput": {"file_path": ".env"}});
-        assert_eq!(json!({}), run_hook("grok", other.to_string().as_bytes()));
-        assert_eq!(json!({}), run_hook("grok", b"{not json"));
-        assert_eq!("deny", panic_fallback("grok")["decision"].as_str().unwrap());
-        assert!(is_supported_host("grok"));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Grok, other.to_string().as_bytes(), &amb));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Grok, b"{not json", &amb));
+        assert_eq!("deny", panic_fallback(HookHost::Grok)["decision"].as_str().unwrap());
+        assert!(HookHost::parse("grok").is_some());
         // RTK deferral: with rtk active in ~/.grok/hooks, covered commands are not denied.
-        let _rtk = EnvOverride::set(&[("PROMETHEUS_KIT_RTK_COEXIST", Some("1"))]);
+        let amb = {
+            let mut a = amb.clone();
+            a.rtk_coexist = Some("1".to_string());
+            a.recompute_derived();
+            a
+        };
         let deferred = ev("run_terminal_command", json!({"command": "git status"}));
-        assert_eq!(json!({}), run_hook("grok", deferred.to_string().as_bytes()));
+        assert_eq!(json!({}), run_hook_with_ambient(HookHost::Grok, deferred.to_string().as_bytes(), &amb));
     }
 
     #[cfg(unix)]
     #[test]
     fn opencode_secret_guard_resolves_symlinks_loops_and_secret_cwd() {
+        let amb = base_amb();
         use std::os::unix::fs::symlink;
         let tmp = TempDir::new("opencode_secret_guard");
         let work = tmp.0.join("work");
@@ -3734,7 +3402,7 @@ mod tests {
                 "cwd": cwd.to_str().unwrap(),
                 "session_id": "sess-oc",
             });
-            run_hook("opencode", ev.to_string().as_bytes())
+            run_hook_with_ambient(HookHost::Opencode, ev.to_string().as_bytes(), &amb)
         };
 
         for (tool, path) in [
@@ -3782,6 +3450,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn omp_shell_cwd_blocks_symlink_loops_and_overlong_chains() {
+        let amb = base_amb();
         use std::os::unix::fs::symlink;
         let tmp = TempDir::new("omp_shell_cwd_symlinks");
         let work = tmp.0.join("work");
@@ -3803,7 +3472,7 @@ mod tests {
                 "cwd": work.to_str().unwrap(),
                 "sessionId": "sess-omp-sym",
             });
-            let reply = run_hook("omp", ev.to_string().as_bytes());
+            let reply = run_hook_with_ambient(HookHost::Omp, ev.to_string().as_bytes(), &amb);
             assert_eq!(
                 Some(true),
                 reply["block"].as_bool(),

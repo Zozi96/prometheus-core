@@ -1,0 +1,9 @@
+Passed! - Failed: 0, Passed: 63, Skipped: 0, Total: 63, Duration: 19 s - Sample.dll
+Test Run Successful.
+Total tests: 63
+     Passed: 63
+ Total time: 19.6319 Seconds
+Passed! - Failed: 0, Passed: 12, Skipped: 0, Total: 12, Duration: 2 s - Other.dll
+Test Run Successful.
+Total tests: 12
+     Passed: 12

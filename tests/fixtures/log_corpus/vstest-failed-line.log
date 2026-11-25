@@ -1,0 +1,9 @@
+Starting test execution, please wait...
+A total of 1 test files matched the specified pattern.
+  Failed Foo.Tests.UnitTest1.TestMethod1 [12 ms]
+  Error Message:
+   Assert.AreEqual failed.
+  Stack Trace:
+     at Foo.Tests.UnitTest1.TestMethod1() in C:\src\UnitTest1.cs:line 20
+
+Failed!  - Failed:     1, Passed:     3, Skipped:     0, Total:     4, Duration: 30 ms - Foo.Tests.dll (net10.0)

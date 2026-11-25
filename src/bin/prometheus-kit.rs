@@ -19,7 +19,8 @@ use prometheus_core::diff::{
     execute_diff, render_diff_json, render_diff_text, DiffMode, DiffOptions, DiffOutput,
 };
 use prometheus_core::droid_mode::{apply_mode, default_home, resolve_config_path};
-use prometheus_core::hook::{is_supported_host, panic_fallback, run_hook};
+use prometheus_core::hook::{panic_fallback, run_hook};
+use prometheus_core::hook_decide::Host;
 use prometheus_core::kit_util::write_private_spillover;
 use prometheus_core::map::{execute_map, render_map_json, render_map_text, MapOptions};
 use prometheus_core::metrics::{self, Rule};
@@ -603,7 +604,7 @@ fn run_kept_command(command: &[String], mut opts: CompactOptions) -> i32 {
     // tiny positive budget keeps the pointer and drops the summary entirely;
     // zero stays unlimited.
     let log_line = format!("log: {}\n", log_path.display());
-    let reserved = log_line.len().div_ceil(4);
+    let reserved = prometheus_core::budget::tokens_for_bytes(log_line.len());
     if opts.max_tokens != 0 && opts.max_tokens <= reserved {
         emit_measured(Rule::Compact, raw.len(), true, &log_line);
         return code;
@@ -1034,15 +1035,15 @@ fn run_hook_cmd(raw: &[String]) -> i32 {
         eprintln!("prometheus-kit hook: missing <host>\n{HOOK_USAGE}");
         return 2;
     };
-    if !is_supported_host(&host) {
+    let Some(host) = Host::parse(&host) else {
         eprintln!("prometheus-kit hook: unsupported host `{host}`\n{HOOK_USAGE}");
         return 2;
-    }
+    };
     let mut buf = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut buf);
-    let reply = match std::panic::catch_unwind(|| run_hook(&host, &buf)) {
+    let reply = match std::panic::catch_unwind(|| run_hook(host, &buf)) {
         Ok(value) => value,
-        Err(_) => panic_fallback(&host),
+        Err(_) => panic_fallback(host),
     };
     let rendered = serde_json::to_string(&reply).unwrap_or_else(|_| "{}".to_string());
     println!("{rendered}");

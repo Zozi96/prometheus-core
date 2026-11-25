@@ -1,0 +1,4 @@
+--- FAIL: TestAdd (0.00s)
+    app_test.go:10: boom
+FAIL
+FAIL	example.com/app	0.012s

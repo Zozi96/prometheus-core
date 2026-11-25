@@ -1,0 +1,17 @@
+{
+  "exit": 1,
+  "counts": {
+    "passed": 0,
+    "failed": 1,
+    "skipped": 0,
+    "total": 1
+  },
+  "error": null,
+  "failing_lines": [
+    "ERROR: test_broken (unittest.loader._FailedTest.test_broken)",
+    "FAILED (errors=1)"
+  ],
+  "failed_tests": [
+    "test_broken.py"
+  ]
+}

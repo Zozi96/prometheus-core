@@ -1,0 +1,7 @@
+{
+  "exit": 0,
+  "counts": null,
+  "error": "dotnet-duplicate-field",
+  "failing_lines": [],
+  "failed_tests": []
+}
