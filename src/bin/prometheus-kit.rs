@@ -613,6 +613,8 @@ fn run_kept_command(command: &[String], mut opts: CompactOptions) -> i32 {
     let text = String::from_utf8_lossy(&raw);
     let mut result = compact_text(&text, Some(code), &opts);
     result.raw_bytes = raw.len();
+    result.log_path = Some(log_path.display().to_string());
+    result.log_path_in_prefix = true;
     let summary = render_compact_text(&result, opts.max_tokens);
     let rendered = format!("{log_line}{summary}");
     emit_measured(Rule::Compact, raw.len(), true, &rendered);
