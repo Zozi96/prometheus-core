@@ -93,6 +93,7 @@ fn check_runs_twice_byte_identical_and_repeat_gets_next_ordinal() {
 
     let run = || -> Output {
         Command::new(check_bin())
+            .env("PROMETHEUS_METRICS_DIR", tmp.0.join("metrics"))
             .args([
                 "--root",
                 root.to_str().unwrap(),
@@ -123,6 +124,7 @@ fn check_runs_twice_byte_identical_and_repeat_gets_next_ordinal() {
     // the next ordinal and leaves the earlier log untouched. (--force so
     // the Green receipt is not reused instead of re-executing.)
     let repeat = Command::new(check_bin())
+        .env("PROMETHEUS_METRICS_DIR", tmp.0.join("metrics"))
         .args([
             "--root",
             root.to_str().unwrap(),
@@ -446,6 +448,7 @@ fn check_unavailable_known_runner_reports_guidance_without_asking_for_command() 
         .success());
 
     let missing = Command::new(check_bin())
+        .env("PROMETHEUS_METRICS_DIR", tmp.0.join("metrics"))
         .args([
             "--root",
             root.to_str().unwrap(),
@@ -471,6 +474,7 @@ fn check_unavailable_known_runner_reports_guidance_without_asking_for_command() 
 
     // Unknown command still asks for test_command.
     let unknown = Command::new(check_bin())
+        .env("PROMETHEUS_METRICS_DIR", tmp.0.join("metrics"))
         .args([
             "--root",
             root.to_str().unwrap(),
@@ -486,4 +490,171 @@ fn check_unavailable_known_runner_reports_guidance_without_asking_for_command() 
         unknown_out.contains("validation pending: ask for the test_command"),
         "{unknown_out}"
     );
+}
+
+#[test]
+fn check_telemetry_records_every_outcome_and_selection_report_reads_it() {
+    let tmp = TempDir::new("check_telemetry");
+    let root = tmp.0.join("root");
+    let store = tmp.0.join("store");
+    let metrics = tmp.0.join("metrics");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.txt"), "hello\n").unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .status()
+        .unwrap()
+        .success());
+
+    let run = |args: &[&str]| -> Output {
+        let mut command = Command::new(check_bin());
+        command
+            .env("PROMETHEUS_METRICS_DIR", &metrics)
+            .args([
+                "--root",
+                root.to_str().unwrap(),
+                "--store",
+                store.to_str().unwrap(),
+                "--",
+            ])
+            .args(args);
+        command.output().unwrap()
+    };
+    let pass = run(&["sh", "-c", "printf 'Ran 1 test in 0.0s\\n\\nOK\\n'"]);
+    assert_eq!(
+        pass.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&pass.stderr)
+    );
+    let pass_text = String::from_utf8_lossy(&pass.stdout);
+    assert!(!pass_text.contains("wall_ms"), "{pass_text}");
+    assert!(!pass_text.contains("cpu_ms"), "{pass_text}");
+    assert!(!pass_text.contains("peak_memory"), "{pass_text}");
+
+    let reuse = run(&["sh", "-c", "printf 'Ran 1 test in 0.0s\\n\\nOK\\n'"]);
+    assert_eq!(reuse.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&reuse.stdout).contains("reused green receipt"));
+
+    let fail = run(&[
+        "sh",
+        "-c",
+        "printf 'Ran 1 test in 0.0s\\n\\nFAILED (failures=1)\\n'; exit 1",
+    ]);
+    assert_eq!(fail.status.code(), Some(1));
+    let pending = run(&["nonexistent-runner-xyz"]);
+    assert_eq!(pending.status.code(), Some(1));
+
+    let ledger = metrics.join("check-runs.jsonl");
+    let text = fs::read_to_string(&ledger).unwrap();
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(4, rows.len(), "{text}");
+    let outcomes: Vec<&str> = rows
+        .iter()
+        .map(|row| row["outcome"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        [
+            "executed-pass",
+            "reused-green-receipt",
+            "executed-fail",
+            "validation-pending"
+        ],
+        outcomes.as_slice()
+    );
+    for row in &rows {
+        for key in [
+            "schema",
+            "timestamp",
+            "outcome",
+            "selection",
+            "widen",
+            "class",
+            "wall_ms",
+            "cpu_ms",
+            "peak_memory_kb",
+            "slot_wait_ms",
+        ] {
+            assert!(row.get(key).is_some(), "missing {key}: {row}");
+        }
+        assert_eq!("targeted", row["selection"]);
+    }
+    for leaked in [
+        root.to_str().unwrap(),
+        tmp.0.to_str().unwrap(),
+        "printf",
+        "nonexistent-runner-xyz",
+        "FAILED",
+    ] {
+        assert!(!text.contains(leaked), "ledger leaks {leaked}: {text}");
+    }
+
+    let receipts = fs::read_to_string(store.join("receipts.jsonl")).unwrap();
+    assert!(receipts.contains("\"cpu_ms\""), "{receipts}");
+    assert!(receipts.contains("\"peak_memory_kb\""), "{receipts}");
+
+    let report = Command::new(check_bin())
+        .env("PROMETHEUS_METRICS_DIR", &metrics)
+        .args(["selection-report", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        report.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let report_json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(4, report_json["total_runs"]);
+    assert_eq!(2, report_json["executed"]);
+    assert_eq!(1, report_json["reused"]);
+    assert_eq!(1, report_json["validation_pending"]);
+    assert_eq!(4, report_json["by_selection"]["targeted"]["runs"]);
+
+    let text_report = Command::new(check_bin())
+        .env("PROMETHEUS_METRICS_DIR", &metrics)
+        .arg("selection-report")
+        .output()
+        .unwrap();
+    assert_eq!(text_report.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&text_report.stdout).contains("total runs 4"));
+
+    let empty = Command::new(check_bin())
+        .env("PROMETHEUS_METRICS_DIR", &metrics)
+        .args(["selection-report", "--json", "--since", "9999-01-01"])
+        .output()
+        .unwrap();
+    assert_eq!(empty.status.code(), Some(0));
+    assert_eq!(
+        0,
+        serde_json::from_slice::<serde_json::Value>(&empty.stdout).unwrap()["total_runs"]
+    );
+    let bad = Command::new(check_bin())
+        .env("PROMETHEUS_METRICS_DIR", &metrics)
+        .args(["selection-report", "--since", "soon"])
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(2));
+
+    let disabled_metrics = tmp.0.join("disabled-metrics");
+    let disabled = Command::new(check_bin())
+        .env("PROMETHEUS_METRICS_DIR", &disabled_metrics)
+        .env("PROMETHEUS_KIT_NO_METRICS", "1")
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--store",
+            store.to_str().unwrap(),
+            "--force",
+            "--",
+        ])
+        .args(["sh", "-c", "printf 'Ran 1 test in 0.0s\\n\\nOK\\n'"])
+        .output()
+        .unwrap();
+    assert_eq!(disabled.status.code(), Some(0));
+    assert!(!disabled_metrics.join("check-runs.jsonl").exists());
 }

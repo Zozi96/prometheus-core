@@ -80,7 +80,7 @@ SYSTEM/admin rather than the current user — are refused rather than
 repaired, so elevated or shared-account setups simply record nothing.
 Refused opens, lock contention, malformed lines, and a full file all drop
 rows silently — totals are a lower bound, never an error. Set `PROMETHEUS_KIT_NO_METRICS=1`
-to disable all writes (an empty value still disables); reads never create
+to disable all metrics and check-run ledger writes (an empty value still disables); reads never create
 the file.
 
 ## Releases

@@ -3,6 +3,7 @@
 pub mod budget;
 pub mod check;
 pub mod check_run;
+pub mod check_runs;
 pub mod classify;
 pub mod compact;
 pub mod diff;
