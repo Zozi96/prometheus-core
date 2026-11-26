@@ -23,6 +23,9 @@ use crate::metrics::MetricRecord;
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 
+/// Default result cap injected into unbounded content-mode native `Grep` calls.
+const DEFAULT_GREP_HEAD_LIMIT: u64 = 100;
+
 /// The three capabilities a host adapter declares. `decide` branches only on
 /// these, never on a host name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,6 +244,11 @@ pub enum Decision {
         command_key: String,
         rewritten: String,
     },
+    /// Replace the whole tool input with an updated copy that preserves
+    /// every untouched key.
+    RewriteInput {
+        input: Map<String, Value>,
+    },
     /// Guided deny-once (ADR-0014): deny this attempt with `reason`.
     DenyOnce {
         reason: String,
@@ -299,6 +307,31 @@ fn decide_impl(
         };
     }
     let mut extra_metrics: Vec<MetricRecord> = Vec::new();
+    if caps.rewrite
+        && !ambient.rewrite_disabled
+        && casefold(&normalized.tool_name) == "grep"
+        && normalized.shell_input.as_ref().is_some_and(|inp| {
+            !inp.contains_key("head_limit")
+                && inp
+                    .get("output_mode")
+                    .or_else(|| inp.get("outputMode"))
+                    .and_then(Value::as_str)
+                    == Some("content")
+        })
+    {
+        let mut input = normalized.shell_input.clone().unwrap_or_default();
+        input.insert("head_limit".to_owned(), json!(DEFAULT_GREP_HEAD_LIMIT));
+        return Outcome {
+            decision: Decision::RewriteInput { input },
+            // PreToolUse cannot know result bytes; zero rows attribute the rewrite
+            // without fabricating savings.
+            metrics: vec![MetricRecord {
+                rule: crate::metrics::Rule::Search,
+                raw_bytes: 0,
+                emitted_bytes: 0,
+            }],
+        };
+    }
     if let Some(inp) = &normalized.shell_input {
         let tier = if caps.rewrite {
             ShellPolicyTier::Rewrite
@@ -483,6 +516,13 @@ impl HostAdapter for ClaudeAdapter {
         match decision {
             Decision::Pass | Decision::DenyOnce { .. } => json!({}),
             Decision::Block { reason } => crate::hook::ask_reply(reason),
+            Decision::RewriteInput { input } => json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecisionReason": "prometheus-kit auto-rewrite",
+                    "updatedInput": Value::Object(input.clone()),
+                }
+            }),
             Decision::RewriteShell {
                 command_key,
                 rewritten,
@@ -513,6 +553,13 @@ fn shared_envelope_reply(decision: &Decision, normalized: &NormalizedEvent) -> V
     match decision {
         Decision::Pass | Decision::DenyOnce { .. } => json!({}),
         Decision::Block { reason } => crate::hook::ask_reply(reason),
+        Decision::RewriteInput { input } => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecisionReason": "prometheus-kit auto-rewrite",
+                "updatedInput": Value::Object(input.clone()),
+            }
+        }),
         Decision::RewriteShell {
             command_key,
             rewritten,
@@ -697,6 +744,10 @@ impl HostAdapter for CursorAdapter {
     fn reply(&self, decision: &Decision, normalized: &NormalizedEvent) -> Value {
         match decision {
             Decision::Block { reason } => cursor_deny_reply(reason),
+            Decision::RewriteInput { input } => json!({
+                "permission": "allow",
+                "updated_input": Value::Object(input.clone()),
+            }),
             Decision::RewriteShell {
                 command_key,
                 rewritten,
@@ -818,6 +869,9 @@ impl HostAdapter for OmpAdapter {
     fn reply(&self, decision: &Decision, normalized: &NormalizedEvent) -> Value {
         match decision {
             Decision::Block { reason } => omp_block_reply(reason),
+            Decision::RewriteInput { input } => json!({
+                "input": Value::Object(input.clone()),
+            }),
             Decision::RewriteShell {
                 command_key,
                 rewritten,
@@ -1296,6 +1350,112 @@ mod tests {
 
             let _ = fs::remove_dir_all(&root);
         }
+    }
+
+    #[test]
+    fn native_grep_content_mode_gets_bounded_without_blocking() {
+        let (mut amb, root) = temp_amb("grep_limit");
+        let caps = Capabilities {
+            rewrite: true,
+            ask: true,
+            deliver_context: false,
+        };
+        let input = json!({
+            "pattern": "needle",
+            "path": "src",
+            "output_mode": "content",
+            "-C": 2,
+            "preserveRiskLevel": true,
+        });
+        let ev = json!({"tool_name": "Grep", "tool_input": input, "cwd": root});
+        let out = decide(&normalized(ev, &root, ""), &amb, caps);
+        match &out.decision {
+            Decision::RewriteInput { input } => {
+                assert_eq!(json!(100), input["head_limit"]);
+                assert_eq!(json!("needle"), input["pattern"]);
+                assert_eq!(json!(2), input["-C"]);
+                assert_eq!(json!(true), input["preserveRiskLevel"]);
+            }
+            other => panic!("expected grep input rewrite, got {other:?}"),
+        }
+        assert_eq!(Rule::Search, out.metrics[0].rule);
+        let ev = json!({"tool_name": "Grep", "tool_input": {"pattern": "needle", "outputMode": "content"}, "cwd": root});
+        assert!(matches!(
+            decide(&normalized(ev, &root, ""), &amb, caps).decision,
+            Decision::RewriteInput { .. }
+        ));
+
+        for input in [
+            json!({"pattern": "needle", "head_limit": 25}),
+            json!({"pattern": "needle", "output_mode": "files_with_matches"}),
+            json!({"pattern": "needle", "output_mode": "count"}),
+            json!({"pattern": "needle"}),
+            json!({"pattern": "needle", "outputMode": "files_with_matches"}),
+        ] {
+            let ev = json!({"tool_name": "Grep", "tool_input": input, "cwd": root});
+            assert_eq!(
+                Decision::Pass,
+                decide(&normalized(ev, &root, ""), &amb, caps).decision
+            );
+        }
+
+        amb.rewrite_disabled = true;
+        let ev = json!({"tool_name": "Grep", "tool_input": {"pattern": "needle"}, "cwd": root});
+        assert_eq!(
+            Decision::Pass,
+            decide(&normalized(ev.clone(), &root, ""), &amb, caps).decision
+        );
+        amb.rewrite_disabled = false;
+
+        let no_rewrite = Capabilities {
+            rewrite: false,
+            ..caps
+        };
+        assert_eq!(
+            Decision::Pass,
+            decide(&normalized(ev, &root, ""), &amb, no_rewrite).decision
+        );
+
+        let ev = json!({"tool_name": "Grep", "tool_input": {"pattern": "needle", "path": ".env"}, "cwd": root});
+        let out = decide(
+            &normalized(ev, &root, "secret path '.env' is blocked"),
+            &amb,
+            caps,
+        );
+        assert!(matches!(out.decision, Decision::Block { .. }));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rewrite_capable_host_grep_replies_preserve_input_fields() {
+        let (amb, root) = temp_amb("grep_hosts");
+        let cwd = root.to_string_lossy().into_owned();
+        let fields = json!({"pattern": "needle", "path": "src", "output_mode": "content", "-C": 2, "preserveRiskLevel": true});
+
+        let ev = json!({"hook_event_name": "PreToolUse", "tool_name": "Grep", "tool_input": fields, "cwd": cwd, "session_id": "s-decide"});
+        for host in [Host::Claude, Host::Droid, Host::Devin] {
+            let reply = host.run(ev.to_string().as_bytes(), &amb);
+            let updated = &reply["hookSpecificOutput"]["updatedInput"];
+            assert_eq!(100, updated["head_limit"], "{host:?} {reply}");
+            assert_eq!("needle", updated["pattern"], "{host:?} {reply}");
+            assert_eq!(2, updated["-C"], "{host:?} {reply}");
+            assert_eq!(true, updated["preserveRiskLevel"], "{host:?} {reply}");
+        }
+
+        let ev = json!({"hook_event_name": "preToolUse", "tool_name": "Grep", "tool_input": fields, "workspace_roots": [cwd], "conversation_id": "s-decide"});
+        let reply = Host::Cursor.run(ev.to_string().as_bytes(), &amb);
+        assert_eq!("allow", reply["permission"], "{reply}");
+        assert_eq!(100, reply["updated_input"]["head_limit"], "{reply}");
+        assert_eq!(true, reply["updated_input"]["preserveRiskLevel"], "{reply}");
+
+        let ev = json!({"tool_name": "Grep", "input": fields, "cwd": cwd, "sessionId": "s-decide"});
+        let reply = Host::Omp.run(ev.to_string().as_bytes(), &amb);
+        assert_eq!(100, reply["input"]["head_limit"], "{reply}");
+        assert_eq!("needle", reply["input"]["pattern"], "{reply}");
+
+        let ev = json!({"hook_event_name": "PreToolUse", "tool_name": "Grep", "tool_input": {"pattern": "needle", "head_limit": 7}, "cwd": cwd, "session_id": "s-decide"});
+        assert_eq!(json!({}), Host::Droid.run(ev.to_string().as_bytes(), &amb));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
