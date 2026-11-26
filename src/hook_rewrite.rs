@@ -310,46 +310,32 @@ fn unsupported_truncated_syntax(s: &str) -> bool {
     false
 }
 
-/// The tail after a terminal `|` must be exactly `head` or `tail` followed by
-/// nothing, `-N`, or `-n N` (N ascii decimal digits) — space/tab separators
-/// only. Anything else (other filters, flags, redirects, extra words,
-/// attached `-nN`, signed counts) is not a plain truncation.
-fn valid_trunc_tail(tail: &str) -> bool {
-    let t = tail.trim_matches([' ', '\t']);
-    for verb in ["head", "tail"] {
-        let Some(rest) = t.strip_prefix(verb) else {
-            continue;
-        };
-        if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
-            return false;
-        }
-        let rest = rest.trim_matches([' ', '\t']);
-        if rest.is_empty() {
-            return true;
-        }
-        if let Some(digits) = rest.strip_prefix('-') {
-            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-                return true;
-            }
-        }
-        if let Some(after_n) = rest.strip_prefix("-n") {
-            if !after_n.starts_with([' ', '\t']) {
-                return false;
-            }
-            let digits = after_n.trim_start_matches([' ', '\t']);
-            return !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
-        }
-        return false;
-    }
-    false
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalPipe {
+    Head(usize),
+    Tail(usize),
+    NumberedWhole,
+    Range(usize, usize),
 }
 
-/// Terminal `| head`/`| tail [-n] N` truncation pipe: return the verbatim
-/// runner prefix (cd prefix included, quotes and flags untouched) when the
-/// tail is a plain bounded truncation. Anything ambiguous — nested or
-/// additional pipes, comments, redirects, non-shell whitespace, unbalanced
-/// quoting — returns None and the command passes through untouched.
-fn truncated_runner(command: &str) -> Option<&str> {
+impl TerminalPipe {
+    fn is_runner_truncation(self) -> bool {
+        matches!(self, TerminalPipe::Head(_) | TerminalPipe::Tail(_))
+    }
+}
+
+fn pipe_count(token: &str) -> Option<usize> {
+    let digits = token.strip_prefix('-')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Terminal read-only pipe tails that can be represented exactly by slice
+/// ranges. Runner compactions accept only the head/tail forms; git blob reads
+/// also accept exact `nl` numbering and `sed -n 'A,Bp'` range selection.
+fn terminal_pipe(command: &str) -> Option<(&str, TerminalPipe)> {
     // Only space/tab may separate shell words; CR/LF/NUL and other Unicode
     // whitespace never appear in a safe one-line command.
     if command.contains('\0')
@@ -360,9 +346,33 @@ fn truncated_runner(command: &str) -> Option<&str> {
         return None;
     }
     let (prefix, tail) = command.rsplit_once('|')?;
-    if !valid_trunc_tail(tail) {
+    let tail_tokens = shell_split(tail.trim_matches([' ', '\t']))?;
+    if tail_tokens.is_empty() || tail_tokens.iter().any(|token| token.has_expansion) {
         return None;
     }
+    let words: Vec<&str> = tail_tokens
+        .iter()
+        .map(|token| token.value.as_str())
+        .collect();
+    let pipe = match words.as_slice() {
+        ["head"] => TerminalPipe::Head(10),
+        ["head", count] => TerminalPipe::Head(pipe_count(count)?),
+        ["head", "-n", count] if count.bytes().all(|b| b.is_ascii_digit()) => {
+            TerminalPipe::Head(count.parse().ok()?)
+        }
+        ["tail"] => TerminalPipe::Tail(10),
+        ["tail", count] => TerminalPipe::Tail(pipe_count(count)?),
+        ["tail", "-n", count] if count.bytes().all(|b| b.is_ascii_digit()) => {
+            TerminalPipe::Tail(count.parse().ok()?)
+        }
+        ["nl"] => TerminalPipe::NumberedWhole,
+        ["sed", "-n", expr] => {
+            let (start, end) = rules::parse_sed_range(expr)?;
+            TerminalPipe::Range(start, end)
+        }
+        _ => return None,
+    };
+
     let mut runner = prefix.trim_end_matches([' ', '\t']);
     // One pass refuses comment starts, boundary-glued escapes, subshell
     // parens, and the `$"…"` locale form before the redirect is stripped —
@@ -382,7 +392,7 @@ fn truncated_runner(command: &str) -> Option<&str> {
     if runner.ends_with('\\') {
         return None;
     }
-    Some(runner)
+    Some((runner, pipe))
 }
 
 /// Scan the command for dangerous shell metacharacters and extract at most one
@@ -641,8 +651,10 @@ fn rewrite_command(
     event_cwd: Option<&Path>,
     metrics_host: Option<crate::metrics::Host>,
 ) -> Option<String> {
-    let truncated = truncated_runner(command);
-    let (cd_prefix, rest) = scan_and_split_cd_prefix(truncated.unwrap_or(command))?;
+    let terminal = terminal_pipe(command);
+    let pipe = terminal.map(|(_, pipe)| pipe);
+    let (cd_prefix, rest) =
+        scan_and_split_cd_prefix(terminal.map(|(prefix, _)| prefix).unwrap_or(command))?;
     let tokens = shell_split(rest)?;
     let first = tokens.first()?;
     if is_excluded_wrapper(&first.value) {
@@ -655,11 +667,12 @@ fn rewrite_command(
         return None;
     }
     let cmd0 = basename_lower(&first.value);
-    // Piped truncation is runner-only inside the rule table: compact keeps
-    // the guaranteed raw log instead of the pipe's silent cut.
+    // Piped truncation stays runner-only except for revision-blob reads:
+    // compact keeps the guaranteed raw log, while blob pipes become slice ranges.
     let context = rules::RewriteContext {
         kit_bin,
-        truncated: truncated.is_some(),
+        truncated: pipe.is_some_and(TerminalPipe::is_runner_truncation),
+        pipe,
         rest,
         cd_prefix,
         event_cwd,
@@ -962,6 +975,88 @@ mod tests {
                 rewrite_command_str("cd '/my repo' && cat src/a.py", KIT, rtk, None),
                 "rtk={rtk}"
             );
+        }
+    }
+
+    #[test]
+    fn git_blob_show_rewrites_to_rev_slice_with_safe_terminal_pipes() {
+        let q = |s: &str| try_shell_quote(s).unwrap();
+        for rtk in [false, true] {
+            let cases = [
+                ("git show HEAD:src/a.rs", "src/a.rs:1-"),
+                ("git show HEAD:src/a.rs | nl", "src/a.rs:1-"),
+                ("git show HEAD:src/a.rs | head", "src/a.rs:1-10"),
+                ("git show HEAD:src/a.rs | head -20", "src/a.rs:1-20"),
+                ("git show HEAD:src/a.rs | tail -n 5", "src/a.rs:-5"),
+                ("git show HEAD:src/a.rs | sed -n '4,9p'", "src/a.rs:4-9"),
+            ];
+            for (cmd, spec) in cases {
+                assert_eq!(
+                    Some(format!(
+                        "{KIT} slice --rev {} {}",
+                        q("HEAD"),
+                        q(spec)
+                    )),
+                    rewrite_command_str(cmd, KIT, rtk, None),
+                    "rtk={rtk} cmd={cmd}"
+                );
+            }
+            assert_eq!(
+                Some(format!(
+                    "{KIT} slice --rev {} --root {} {}",
+                    q("HEAD~2"),
+                    q("repo"),
+                    q("src/a.rs:1-12")
+                )),
+                rewrite_command_str(
+                    "git -C repo --no-pager show HEAD~2:src/a.rs | head -n 12",
+                    KIT,
+                    rtk,
+                    None
+                ),
+                "rtk={rtk}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_diff_benign_flags_and_blob_show_unsafe_forms_behave_correctly() {
+        let q = |s: &str| try_shell_quote(s).unwrap();
+        assert_eq!(
+            Some(format!(
+                "{KIT} diff --root {} -C 5 --base {} -- {}",
+                q("repo"),
+                q("main"),
+                q("a.rs")
+            )),
+            rewrite_command_str(
+                "git -C repo --no-pager diff --no-ext-diff --no-color --no-textconv -U 5 main -- a.rs",
+                KIT,
+                false,
+                None
+            )
+        );
+        assert_eq!(
+            None,
+            rewrite_command_str(
+                "git -C repo --no-pager diff --no-ext-diff -U5 main -- a.rs",
+                KIT,
+                true,
+                None
+            ),
+            "rtk deferral remains authoritative for git diff"
+        );
+        for cmd in [
+            "git show HEAD --stat | head -5",
+            "git show --stat HEAD:src/a.rs",
+            "git show HEAD:src/a.rs | tee out",
+            "git show HEAD:src/a.rs | head -0",
+            "git show HEAD:src/a.rs | sed -n '9,4p'",
+            "git show HEAD:src/a.rs | sed -n 4,9p extra",
+            "git show HEAD:src/a:extra.rs",
+            "git show --pretty=fuller HEAD:src/a.rs",
+        ] {
+            assert_eq!(None, rewrite_command_str(cmd, KIT, false, None), "cmd={cmd}");
         }
     }
 
@@ -1369,6 +1464,7 @@ mod tests {
                 rules::TargetSpec::GitStatus | rules::TargetSpec::GitDiff | rules::TargetSpec::GitShow => {
                     "git-diff"
                 }
+                rules::TargetSpec::GitShowBlob => "git-blob-slice",
                 rules::TargetSpec::SearchRg | rules::TargetSpec::SearchGrep => "search",
                 rules::TargetSpec::FileDump(_) => "file-dump",
                 rules::TargetSpec::CompactLog => "compact-log",

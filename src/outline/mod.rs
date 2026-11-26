@@ -185,10 +185,18 @@ pub fn read_text_file_sized(path: &Path) -> Result<(String, Vec<String>, usize),
             path.display()
         ));
     }
+    decode_text_bytes(&path.to_string_lossy(), buf)
+}
+
+/// Decode bounded bytes with the same binary and UTF-8 contract as file reads.
+pub(crate) fn decode_text_bytes(
+    display: &str,
+    buf: Vec<u8>,
+) -> Result<(String, Vec<String>, usize), String> {
     let raw_bytes = buf.len();
     let probe_len = buf.len().min(BINARY_PROBE_BYTES);
     if buf[..probe_len].contains(&0) {
-        return Err(format!("{}: binary file skipped", path.display()));
+        return Err(format!("{display}: binary file skipped"));
     }
     match String::from_utf8(buf) {
         Ok(text) => Ok((text, Vec::new(), raw_bytes)),

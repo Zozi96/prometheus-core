@@ -359,6 +359,8 @@ fn main() {
     run_git(&["config", "user.email", "b@example.com"]);
     run_git(&["config", "user.name", "Bench"]);
     fs::write(git_dir.join("lib.rs"), "pub fn calc(x: i32) -> i32 {\n    x + 1\n}\n").unwrap();
+    let rev_src = synth_csharp_service(180);
+    fs::write(git_dir.join("TenantMigrationService.cs"), &rev_src).unwrap();
     let lock_v1: String = (0..600).map(|i| format!("pkg_{i} = \"1.0.0\"\n")).collect();
     fs::write(git_dir.join("Cargo.lock"), &lock_v1).unwrap();
     run_git(&["add", "-A"]);
@@ -375,7 +377,7 @@ fn main() {
         .unwrap();
     let d_raw = approx_tokens(&String::from_utf8_lossy(&raw_git.stdout));
     let d_opts = DiffOptions {
-        root: git_dir,
+        root: git_dir.clone(),
         mode: DiffMode::Worktree,
         ..DiffOptions::default()
     };
@@ -396,6 +398,40 @@ fn main() {
         d_tok,
         (1.0 - d_tok as f64 / d_raw.max(1) as f64) * 100.0,
         median_us(d_timings) / 1000.0
+    );
+
+    // 5. slice --rev benchmark: one selector from a large committed blob vs raw git show.
+    let raw_show = Command::new("git")
+        .arg("-C")
+        .arg(&git_dir)
+        .args(["show", "HEAD:TenantMigrationService.cs"])
+        .output()
+        .unwrap();
+    let rs_raw = approx_tokens(&String::from_utf8_lossy(&raw_show.stdout));
+    let rev_spec =
+        parse_spec("TenantMigrationService.cs::TenantMigrationService.RunStep120Async").unwrap();
+    let rev_opts = SliceOptions {
+        rev: Some("HEAD".to_owned()),
+        root: git_dir.clone(),
+        ..SliceOptions::default()
+    };
+    let rev_res = execute_slices(std::slice::from_ref(&rev_spec), &rev_opts).unwrap();
+    let rev_out = render_slice_text(&rev_res, &rev_opts);
+    let mut rev_timings = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let t0 = Instant::now();
+        let r = execute_slices(std::slice::from_ref(&rev_spec), &rev_opts).unwrap();
+        let _ = render_slice_text(&r, &rev_opts);
+        rev_timings.push(t0.elapsed().as_micros());
+    }
+    let rs_tok = approx_tokens(&rev_out);
+    println!(
+        "{:<44} {:>8} {:>8} {:>9.1}% {:>9.2}",
+        "slice --rev selector (180-method blob)",
+        rs_raw,
+        rs_tok,
+        (1.0 - rs_tok as f64 / rs_raw.max(1) as f64) * 100.0,
+        median_us(rev_timings) / 1000.0
     );
 
     let _ = fs::remove_dir_all(&scratch);

@@ -2250,6 +2250,106 @@ fn keep_log_windows_private_route_writes_log() {
 }
 
 #[test]
+fn slice_rev_reads_git_blobs_with_budget_json_selectors_determinism_and_secret_guard() {
+    let tmp = TempDir::new("slice_rev");
+    let repo = tmp.0.join("repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    let committed = b"pub fn value() -> i32 {\n    41\n}\n\npub fn other() {\n    println!(\"committed\");\n}\n";
+    fs::write(repo.join("src/rev.rs"), committed).unwrap();
+    fs::write(repo.join(".env"), b"TOKEN=fake-test-value\n").unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "initial"]);
+    fs::write(
+        repo.join("src/rev.rs"),
+        b"pub fn value() -> i32 {\n    999\n}\n// dirty working tree\n",
+    )
+    .unwrap();
+
+    let run_rev = || {
+        run_kit(
+            &["slice", "--rev", "HEAD", "src/rev.rs:1-3"],
+            Some(&repo),
+        )
+    };
+    let first = run_rev();
+    assert_eq!(first.status.code(), Some(0), "{}", String::from_utf8_lossy(&first.stderr));
+    let text = String::from_utf8_lossy(&first.stdout);
+    assert!(text.contains("=== HEAD:src/rev.rs:L1-L3 ==="), "{text}");
+    assert!(text.contains("L2:     41"), "{text}");
+    assert!(!text.contains("999"), "{text}");
+    let second = run_rev();
+    assert_eq!(second.status.code(), first.status.code());
+    assert_eq!(second.stdout, first.stdout);
+
+    let embedded = run_kit(&["slice", "HEAD:src/rev.rs:1-3"], Some(&repo));
+    assert_eq!(embedded.status.code(), Some(0));
+    assert_eq!(embedded.stdout, first.stdout);
+
+    let selector = run_kit(&["slice", "HEAD:src/rev.rs::value"], Some(&repo));
+    assert_eq!(selector.status.code(), Some(0), "{}", String::from_utf8_lossy(&selector.stderr));
+    let sel_text = String::from_utf8_lossy(&selector.stdout);
+    assert!(sel_text.contains("pub fn value()"), "{sel_text}");
+    assert!(!sel_text.contains("pub fn other"), "{sel_text}");
+
+    let json = run_kit(
+        &[
+            "slice",
+            "--rev",
+            "HEAD",
+            "--json",
+            "--max-tokens",
+            "60",
+            "src/rev.rs:1-7",
+        ],
+        Some(&repo),
+    );
+    assert_eq!(json.status.code(), Some(0));
+    assert!(json.stdout.len() <= 60 * 4 + 2, "json bytes {}", json.stdout.len());
+    let parsed: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(parsed["slices"][0]["path"], "HEAD:src/rev.rs");
+    assert!(parsed["slices"][0]["lines"].as_array().unwrap().len() < 7);
+
+    let rooted = run_kit(
+        &[
+            "slice",
+            "--root",
+            repo.to_str().unwrap(),
+            "--rev",
+            "HEAD",
+            "src/rev.rs:2-2",
+        ],
+        Some(&tmp.0),
+    );
+    assert_eq!(rooted.status.code(), Some(0), "{}", String::from_utf8_lossy(&rooted.stderr));
+    assert!(String::from_utf8_lossy(&rooted.stdout).contains("L2:     41"));
+
+    for args in [
+        vec!["slice", "--rev", "HEAD", ".env:1-1"],
+        vec!["slice", "HEAD:.env:1-1"],
+        vec!["slice", "--rev", "HEAD", "src/missing.rs:1-1"],
+        vec!["slice", "--rev", "not-a-rev", "src/rev.rs:1-1"],
+    ] {
+        let out = run_kit(&args, Some(&repo));
+        assert_ne!(out.status.code(), Some(0), "args={args:?}");
+        assert!(out.stdout.is_empty(), "args={args:?}");
+    }
+    let secret = run_kit(&["slice", "--rev", "HEAD", ".env:1-1"], Some(&repo));
+    assert!(String::from_utf8_lossy(&secret.stderr).contains("secret path is blocked"));
+}
+
+#[test]
 fn slice_partial_success_emits_valid_results_diagnostics_json_and_metrics() {
     let home = MetricsHome::new("slice_partial");
     let rs = home.repo.join("Svc.cs");

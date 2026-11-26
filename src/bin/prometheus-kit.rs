@@ -76,6 +76,8 @@ usage: prometheus-kit slice [options] <spec...>
 spec forms:
   <path>:<line>[,<start>-<end>...]   Exact 1-based line ranges
                                      (<path>::<start>-<end> is also accepted)
+  <rev>:<path>:<line or range>      Read a line range from a git blob
+  <rev>:<path>::<selector>          Read a symbol/selector from a git blob
   <path>:<start>-                   From <start> to the end of the file
   <path>:-<n>                        The last <n> lines of the file
   <path>::<selector>                 Code symbol (Foo.Bar), JSON Pointer (/a/b/0),
@@ -95,6 +97,8 @@ note:
 
 options:
   -C, --context <n>     Lines of surrounding context (default: 0)
+  --rev <ref>           Read repository-relative spec paths at git revision <ref>
+  --root <dir>          Repository directory for --rev (default: current directory)
   --max-tokens <n>      Output token budget (0 = unlimited; default: 4000)
   --no-line-numbers     Omit `L<n>: ` line prefixes
   --no-truncate-lines   Disable 2,000-char single-line safeguard
@@ -413,6 +417,14 @@ fn run_slice(raw: &[String]) -> i32 {
                 "--" => positional_only = true,
                 "-C" | "--context" => match next_usize(raw, &mut i, arg, SLICE_USAGE) {
                     Ok(n) => opts.context_lines = n,
+                    Err(code) => return code,
+                },
+                "--rev" => match next_val(raw, &mut i, "--rev", SLICE_USAGE) {
+                    Ok(v) => opts.rev = Some(v),
+                    Err(code) => return code,
+                },
+                "--root" => match next_val(raw, &mut i, "--root", SLICE_USAGE) {
+                    Ok(v) => opts.root = PathBuf::from(v),
                     Err(code) => return code,
                 },
                 "--max-tokens" => match next_usize(raw, &mut i, "--max-tokens", SLICE_USAGE) {

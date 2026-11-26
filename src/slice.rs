@@ -6,10 +6,14 @@ use crate::outline::structured::{
     resolve_computed_selector, resolve_structured_selector, split_computed_selector,
     suggest_candidates, ComputedSelection, ResolvedRange,
 };
-use crate::outline::{flatten_items, outline_source, read_text_file, Lang, OutlineItem, OutlineOptions};
+use crate::outline::{
+    decode_text_bytes, flatten_items, outline_source, read_text_file, Lang, OutlineItem,
+    OutlineOptions, MAX_FILE_BYTES,
+};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub const DEFAULT_SLICE_MAX_TOKENS: usize = 4000;
 const MAX_LINE_CHARS: usize = 2000;
@@ -29,10 +33,16 @@ pub struct SliceSpec {
     pub raw: String,
     pub path: PathBuf,
     pub target: SliceTarget,
+    /// Git revision for `<rev>:<path>...` specs; `None` reads the worktree.
+    pub rev: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SliceOptions {
+    /// Read specs at this revision when they do not carry their own `<rev>:` prefix.
+    pub rev: Option<String>,
+    /// Repository working directory used for revision reads.
+    pub root: PathBuf,
     pub context_lines: usize,
     pub max_tokens: usize,
     pub line_numbers: bool,
@@ -44,6 +54,8 @@ pub struct SliceOptions {
 impl Default for SliceOptions {
     fn default() -> Self {
         Self {
+            rev: None,
+            root: PathBuf::from("."),
             context_lines: 0,
             max_tokens: DEFAULT_SLICE_MAX_TOKENS,
             line_numbers: true,
@@ -109,6 +121,9 @@ pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
     if trimmed.is_empty() {
         return Err("empty slice spec".to_owned());
     }
+    if let Some(spec) = parse_revision_spec(trimmed, raw)? {
+        return Ok(spec);
+    }
     if let Some((path_part, sel)) = trimmed.split_once("::") {
         if path_part.is_empty() || sel.trim().is_empty() {
             return Err(format!(
@@ -125,6 +140,7 @@ pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
                 raw: trimmed.to_owned(),
                 path: PathBuf::from(path_part),
                 target: SliceTarget::Tail(n),
+                rev: None,
             });
         }
         if looks_like_range_list(sel) {
@@ -133,12 +149,14 @@ pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
                 raw: trimmed.to_owned(),
                 path: PathBuf::from(path_part),
                 target: SliceTarget::Ranges(ranges),
+                rev: None,
             });
         }
         return Ok(SliceSpec {
             raw: trimmed.to_owned(),
             path: PathBuf::from(path_part),
             target: SliceTarget::Selector(sel.to_owned()),
+            rev: None,
         });
     }
 
@@ -150,6 +168,7 @@ pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
                     raw: trimmed.to_owned(),
                     path: PathBuf::from(path_part),
                     target: SliceTarget::Tail(n),
+                    rev: None,
                 });
             }
         }
@@ -159,6 +178,7 @@ pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
                 raw: trimmed.to_owned(),
                 path: PathBuf::from(path_part),
                 target: SliceTarget::Ranges(ranges),
+                rev: None,
             });
         }
     }
@@ -166,6 +186,78 @@ pub fn parse_spec(raw: &str) -> Result<SliceSpec, String> {
     Err(format!(
         "missing range or selector in `{raw}`; pass <path>:<start>-<end> or <path>::<selector> (or run `prometheus-kit outline <path>`)"
     ))
+}
+
+/// Conservative shape for the `<rev>` prefix of an embedded revision spec.
+/// One-character prefixes stay ambiguous with Windows drive letters and are
+/// treated as ordinary paths.
+fn plausible_embedded_rev(rev: &str) -> bool {
+    rev.len() > 1
+        && !rev.starts_with('-')
+        && !rev
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+}
+
+fn revision_spec(
+    raw: &str,
+    rev: &str,
+    path_part: &str,
+    target: SliceTarget,
+) -> Result<SliceSpec, String> {
+    if path_part.is_empty() {
+        return Err(format!("missing path after revision in `{raw}`"));
+    }
+    Ok(SliceSpec {
+        raw: raw.trim().to_owned(),
+        path: PathBuf::from(path_part),
+        target,
+        rev: Some(rev.to_owned()),
+    })
+}
+
+/// Parse unambiguous `<rev>:<path>:<range>` and `<rev>:<path>::<selector>`
+/// forms. Ordinary `<path>:<range>` parsing remains the fallback when no
+/// plausible revision prefix is present.
+fn parse_revision_spec(trimmed: &str, raw: &str) -> Result<Option<SliceSpec>, String> {
+    if let Some((before, sel)) = trimmed.split_once("::") {
+        let Some((rev, path_part)) = before.split_once(':') else {
+            return Ok(None);
+        };
+        if !plausible_embedded_rev(rev) {
+            return Ok(None);
+        }
+        let sel = sel.trim();
+        if sel.is_empty() {
+            return Err(format!(
+                "invalid slice spec `{raw}`; expected <rev>:<path>::<selector>"
+            ));
+        }
+        let target = if let Some(n) = parse_tail_count(sel) {
+            SliceTarget::Tail(n)
+        } else if looks_like_range_list(sel) {
+            SliceTarget::Ranges(parse_ranges(sel, raw)?)
+        } else {
+            SliceTarget::Selector(sel.to_owned())
+        };
+        return revision_spec(raw, rev, path_part, target).map(Some);
+    }
+
+    if let Some((before, range_part)) = trimmed.rsplit_once(':') {
+        let target = if let Some(n) = parse_tail_count(range_part) {
+            Some(SliceTarget::Tail(n))
+        } else if looks_like_range_list(range_part) {
+            Some(SliceTarget::Ranges(parse_ranges(range_part, raw)?))
+        } else {
+            None
+        };
+        if let (Some(target), Some((rev, path_part))) = (target, before.split_once(':')) {
+            if plausible_embedded_rev(rev) {
+                return revision_spec(raw, rev, path_part, target).map(Some);
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn looks_like_range_list(s: &str) -> bool {
@@ -228,6 +320,78 @@ fn parse_ranges(part: &str, full_spec: &str) -> Result<Vec<(usize, usize)>, Stri
         }
     }
     Ok(out)
+}
+
+fn valid_git_rev(rev: &str) -> bool {
+    !rev.is_empty()
+        && !rev.starts_with('-')
+        && !rev.contains(':')
+        && !rev
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+}
+
+fn valid_git_blob_path(path: &str) -> bool {
+    !path.is_empty() && !path.chars().any(char::is_control)
+}
+
+fn git_cat_file_failure(rev: &str, path: &str, stderr: &[u8]) -> String {
+    let detail = String::from_utf8_lossy(stderr);
+    let detail = detail.lines().next().unwrap_or("git cat-file failed").trim();
+    if detail.is_empty() {
+        format!("{rev}:{path}: git cat-file failed")
+    } else {
+        format!("{rev}:{path}: {detail}")
+    }
+}
+
+/// Read one blob at a revision without touching the worktree. The path is a
+/// repository-relative git path, not a filesystem path.
+fn read_git_blob(root: &Path, rev: &str, path: &Path) -> Result<(String, Vec<String>), String> {
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    if !valid_git_rev(rev) {
+        return Err(format!("invalid git revision `{rev}`"));
+    }
+    if !valid_git_blob_path(&path_str) {
+        return Err(format!("{rev}:{path_str}: invalid git blob path"));
+    }
+    if !crate::hook::secret_path_denied(&path_str).is_empty() {
+        return Err(format!("{rev}:{path_str}: secret path is blocked"));
+    }
+
+    let object = format!("{rev}:{path_str}");
+    let size_out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "-s", "--"])
+        .arg(&object)
+        .output()
+        .map_err(|e| format!("{object}: failed to run git cat-file: {e}"))?;
+    if !size_out.status.success() {
+        return Err(git_cat_file_failure(rev, &path_str, &size_out.stderr));
+    }
+    let size_text = String::from_utf8_lossy(&size_out.stdout);
+    let size = size_text
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("{object}: unexpected git cat-file size output"))?;
+    if size > MAX_FILE_BYTES {
+        return Err(format!(
+            "{object}: file exceeds {MAX_FILE_BYTES} bytes limit"
+        ));
+    }
+
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "blob", "--"])
+        .arg(&object)
+        .output()
+        .map_err(|e| format!("{object}: failed to run git cat-file: {e}"))?;
+    if !out.status.success() {
+        return Err(git_cat_file_failure(rev, &path_str, &out.stderr));
+    }
+    decode_text_bytes(&object, out.stdout).map(|(text, warnings, _)| (text, warnings))
 }
 
 #[derive(Debug, Clone)]
@@ -547,7 +711,8 @@ fn execute_slice_items(items: &[Result<SliceSpec, SliceError>], opts: &SliceOpti
         idx: LineIndex,
         lang: Option<Lang>,
     }
-    let mut cache: HashMap<PathBuf, Result<CachedFile, String>> = HashMap::new();
+    type FileKey = (Option<String>, PathBuf);
+    let mut cache: HashMap<FileKey, Result<CachedFile, String>> = HashMap::new();
     let mut warnings = Vec::new();
     let mut errors: Vec<SliceError> = Vec::new();
     let mut succeeded_specs = 0usize;
@@ -556,8 +721,8 @@ fn execute_slice_items(items: &[Result<SliceSpec, SliceError>], opts: &SliceOpti
         display: String,
         intervals: Vec<Interval>,
     }
-    let mut per_file_order: Vec<PathBuf> = Vec::new();
-    let mut per_file_map: HashMap<PathBuf, FileIntervals> = HashMap::new();
+    let mut per_file_order: Vec<FileKey> = Vec::new();
+    let mut per_file_map: HashMap<FileKey, FileIntervals> = HashMap::new();
     let mut computed_blocks: Vec<(String, ComputedSelection)> = Vec::new();
 
     for item in items {
@@ -568,9 +733,21 @@ fn execute_slice_items(items: &[Result<SliceSpec, SliceError>], opts: &SliceOpti
                 continue;
             }
         };
-        let key = std::fs::canonicalize(&spec.path).unwrap_or_else(|_| spec.path.clone());
+        let rev = spec.rev.as_ref().or(opts.rev.as_ref()).cloned();
+        let key: FileKey = (
+            rev.clone(),
+            if rev.is_some() {
+                spec.path.clone()
+            } else {
+                std::fs::canonicalize(&spec.path).unwrap_or_else(|_| spec.path.clone())
+            },
+        );
         if !cache.contains_key(&key) {
-            let loaded = match read_text_file(&spec.path) {
+            let loaded = match if let Some(rev) = &rev {
+                read_git_blob(&opts.root, rev, &spec.path)
+            } else {
+                read_text_file(&spec.path)
+            } {
                 Ok((src, w)) => {
                     for msg in w {
                         warnings.push(format!("{}: {msg}", spec.path.display()));
@@ -593,7 +770,11 @@ fn execute_slice_items(items: &[Result<SliceSpec, SliceError>], opts: &SliceOpti
                 continue;
             }
         };
-        let display = spec.path.to_string_lossy().to_string();
+        let display = if let Some(rev) = &rev {
+            format!("{rev}:{}", spec.path.to_string_lossy())
+        } else {
+            spec.path.to_string_lossy().to_string()
+        };
         let resolution = match resolve_ranges_for_spec(
             &display,
             &cached.src,

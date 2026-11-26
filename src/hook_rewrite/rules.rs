@@ -32,8 +32,12 @@ pub struct RewriteRule {
 pub struct HeadSpec {
     pub commands: &'static [&'static str],
     pub argv_prefix: &'static [&'static str],
-    /// Accept one leading `git -C <dir>` before `argv_prefix`.
+    /// Accept one leading `git -C <dir>` and `--no-pager` before `argv_prefix`.
     pub git_c_prefix: bool,
+    /// When set, the first post-prefix token must/must not contain `:`.
+    /// This splits otherwise identical git-show heads without falling through
+    /// after a fail-closed parse.
+    pub first_positional_colon: Option<bool>,
 }
 
 const fn head(commands: &'static [&'static str], argv_prefix: &'static [&'static str]) -> HeadSpec {
@@ -41,6 +45,7 @@ const fn head(commands: &'static [&'static str], argv_prefix: &'static [&'static
         commands,
         argv_prefix,
         git_c_prefix: false,
+        first_positional_colon: None,
     }
 }
 
@@ -92,24 +97,35 @@ pub struct OperandRule {
     pub reject_expansion: bool,
     pub reject_empty: bool,
     pub reject_colon: bool,
+    pub require_colon: bool,
 }
 
 const OPERAND_ANY: OperandRule = OperandRule {
     reject_expansion: false,
     reject_empty: false,
     reject_colon: false,
+    require_colon: false,
 };
 
 const OPERAND_LITERAL: OperandRule = OperandRule {
     reject_expansion: true,
     reject_empty: false,
     reject_colon: false,
+    require_colon: false,
 };
 
 const OPERAND_STRICT_REF: OperandRule = OperandRule {
     reject_expansion: true,
     reject_empty: true,
     reject_colon: true,
+    require_colon: false,
+};
+
+const OPERAND_REV_PATH: OperandRule = OperandRule {
+    reject_expansion: true,
+    reject_empty: true,
+    reject_colon: false,
+    require_colon: true,
 };
 
 const NO_POSITIONALS: PositionalSpec = PositionalSpec {
@@ -247,6 +263,7 @@ pub enum TargetSpec {
     GitStatus,
     GitDiff,
     GitShow,
+    GitShowBlob,
     SearchRg,
     SearchGrep,
     FileDump(FileDumpKind),
@@ -334,9 +351,12 @@ const GIT_STATUS_FLAGS: &[FlagSpec] = &[
 const GIT_DIFF_FLAGS: &[FlagSpec] = &[
     bool_flag("staged", &["--staged", "--cached"], None),
     bool_flag("stat", &["--stat"], None),
+    bool_flag("no-ext-diff", &["--no-ext-diff"], None),
+    bool_flag("no-color", &["--no-color"], None),
+    bool_flag("no-textconv", &["--no-textconv"], None),
     value_flag(
         "unified",
-        &["--unified"],
+        &["--unified", "-U"],
         &["--unified=", "-U"],
         VALUE_USIZE,
         RepeatSpec::Many,
@@ -546,6 +566,7 @@ static REWRITE_RULES: &[RewriteRule] = &[
             commands: &["git"],
             argv_prefix: &["status"],
             git_c_prefix: true,
+            first_positional_colon: None,
         },
         parser: ParserSpec::Structured(StructuredParserSpec {
             flags: GIT_STATUS_FLAGS,
@@ -565,6 +586,7 @@ static REWRITE_RULES: &[RewriteRule] = &[
             commands: &["git"],
             argv_prefix: &["diff"],
             git_c_prefix: true,
+            first_positional_colon: None,
         },
         parser: structured(
             GIT_DIFF_FLAGS,
@@ -576,11 +598,33 @@ static REWRITE_RULES: &[RewriteRule] = &[
         expansion: EXPANSION_TRANSFORMED,
     },
     RewriteRule {
+        id: "git-show-blob",
+        head: HeadSpec {
+            commands: &["git"],
+            argv_prefix: &["show"],
+            git_c_prefix: true,
+            first_positional_colon: Some(true),
+        },
+        parser: structured(&[], DoubleDashSpec::Reject, {
+            PositionalSpec {
+                min: 1,
+                max: Some(1),
+                max_before_separator: None,
+                before_separator: OPERAND_REV_PATH,
+                after_separator: OPERAND_REV_PATH,
+            }
+        }),
+        target: TargetSpec::GitShowBlob,
+        rtk: RTK_NEVER,
+        expansion: EXPANSION_TRANSFORMED,
+    },
+    RewriteRule {
         id: "git-show-commit",
         head: HeadSpec {
             commands: &["git"],
             argv_prefix: &["show"],
             git_c_prefix: true,
+            first_positional_colon: None,
         },
         parser: structured(GIT_SHOW_FLAGS, DoubleDashSpec::Reject, {
             PositionalSpec {
@@ -863,6 +907,7 @@ struct HeadMatch<'a> {
 pub(super) struct RewriteContext<'a> {
     pub(super) kit_bin: &'a str,
     pub(super) truncated: bool,
+    pub(super) pipe: Option<super::TerminalPipe>,
     pub(super) rest: &'a str,
     pub(super) cd_prefix: Option<&'a str>,
     pub(super) event_cwd: Option<&'a Path>,
@@ -881,8 +926,15 @@ pub(super) fn rewrite_with_rule_table(
         let Some(head) = match_head(rule, cmd0, tokens) else {
             continue;
         };
-        if context.truncated && !matches!(rule.target, TargetSpec::CompactRunner { .. }) {
-            continue;
+        if let Some(pipe) = context.pipe {
+            let pipe_supported = match rule.target {
+                TargetSpec::CompactRunner { .. } => pipe.is_runner_truncation(),
+                TargetSpec::GitShowBlob => true,
+                _ => false,
+            };
+            if !pipe_supported {
+                continue;
+            }
         }
         if rtk_defers(rule, rtk_active, context.truncated, context.rest, cmd0) {
             return None;
@@ -918,19 +970,37 @@ fn match_head<'a>(
     }
     let mut idx = 1usize;
     let mut git_c_dir = None;
-    if rule.head.git_c_prefix && tokens.get(idx).is_some_and(|tok| tok.value == "-C") {
-        let dir = tokens.get(idx + 1)?;
-        if dir.value.is_empty() || dir.has_expansion {
-            return None;
+    if rule.head.git_c_prefix {
+        while let Some(tok) = tokens.get(idx) {
+            if tok.value == "--no-pager" {
+                idx += 1;
+                continue;
+            }
+            if tok.value == "-C" && git_c_dir.is_none() {
+                let dir = tokens.get(idx + 1)?;
+                if dir.value.is_empty() || dir.has_expansion {
+                    return None;
+                }
+                git_c_dir = Some(dir);
+                idx += 2;
+                continue;
+            }
+            break;
         }
-        git_c_dir = Some(dir);
-        idx += 2;
     }
     for expected in rule.head.argv_prefix {
         if tokens.get(idx)?.value != *expected {
             return None;
         }
         idx += 1;
+    }
+    if let Some(required) = rule.head.first_positional_colon {
+        let has_colon = tokens
+            .get(idx)
+            .is_some_and(|token| token.value.contains(':'));
+        if has_colon != required {
+            return None;
+        }
     }
     Some(HeadMatch {
         args_start: idx,
@@ -1193,6 +1263,7 @@ fn validate_positionals(spec: &PositionalSpec, positionals: &[Positional<'_>]) -
         if (rule.reject_expansion && pos.token.has_expansion)
             || (rule.reject_empty && pos.token.value.is_empty())
             || (rule.reject_colon && pos.token.value.contains(':'))
+            || (rule.require_colon && !pos.token.value.contains(':'))
         {
             return None;
         }
@@ -1214,7 +1285,9 @@ fn flag_values<'a>(parsed: &'a ParsedArgs<'_>, id: &'a str) -> impl Iterator<Ite
 
 fn metric_rule(target: TargetSpec) -> crate::metrics::Rule {
     match target {
-        TargetSpec::SliceSedRange | TargetSpec::FileDump(_) => crate::metrics::Rule::Slice,
+        TargetSpec::SliceSedRange | TargetSpec::GitShowBlob | TargetSpec::FileDump(_) => {
+            crate::metrics::Rule::Slice
+        }
         TargetSpec::GitStatus | TargetSpec::GitDiff | TargetSpec::GitShow => {
             crate::metrics::Rule::Diff
         }
@@ -1246,6 +1319,7 @@ fn build_target(
             context.event_cwd,
         ),
         TargetSpec::GitShow => build_git_show(parsed, git_c_dir, kit_bin),
+        TargetSpec::GitShowBlob => build_git_show_blob(parsed, git_c_dir, kit_bin, context.pipe),
         TargetSpec::SearchRg => build_rg_search(parsed, kit_bin),
         TargetSpec::SearchGrep => build_grep_search(parsed, kit_bin),
         TargetSpec::FileDump(kind) => build_file_dump(kind, parsed, kit_bin),
@@ -1259,7 +1333,7 @@ fn build_target(
     }
 }
 
-fn parse_sed_range(expr: &str) -> Option<(usize, usize)> {
+pub(super) fn parse_sed_range(expr: &str) -> Option<(usize, usize)> {
     let body = expr.strip_suffix('p')?;
     let (start_s, end_s) = body.split_once(',')?;
     if start_s.is_empty()
@@ -1413,6 +1487,56 @@ fn build_git_diff(
             parts.push(try_shell_quote(&path.value)?);
         }
     }
+    Some(parts.join(" "))
+}
+
+fn split_git_rev_path(value: &str) -> Option<(&str, &str)> {
+    let mut parts = value.split(':');
+    let rev = parts.next()?;
+    let path = parts.next()?;
+    if parts.next().is_some()
+        || rev.len() <= 1
+        || rev.starts_with('-')
+        || rev.chars().any(|c| c.is_whitespace() || c.is_control())
+        || path.is_empty()
+        || path.starts_with(['-', '/'])
+        || path
+            .chars()
+            .any(|c| {
+                c.is_control() || matches!(c, '$' | '*' | '?' | '[' | ']' | '~' | '{' | '}')
+            })
+    {
+        return None;
+    }
+    Some((rev, path))
+}
+
+fn build_git_show_blob(
+    parsed: &ParsedArgs<'_>,
+    git_c_dir: Option<&ShellToken>,
+    kit_bin: &str,
+    pipe: Option<super::TerminalPipe>,
+) -> Option<String> {
+    let operand = parsed.positionals.first()?.token.value.as_str();
+    let (rev, path) = split_git_rev_path(operand)?;
+    let spec = match pipe {
+        Some(super::TerminalPipe::Head(0)) | Some(super::TerminalPipe::Tail(0)) => return None,
+        Some(super::TerminalPipe::Head(n)) => format!("{path}:1-{n}"),
+        Some(super::TerminalPipe::Tail(n)) => format!("{path}:-{n}"),
+        Some(super::TerminalPipe::Range(start, end)) => format!("{path}:{start}-{end}"),
+        Some(super::TerminalPipe::NumberedWhole) | None => format!("{path}:1-"),
+    };
+    let mut parts = vec![
+        kit_bin.to_owned(),
+        "slice".to_owned(),
+        "--rev".to_owned(),
+        try_shell_quote(rev)?,
+    ];
+    if let Some(dir) = git_c_dir {
+        parts.push("--root".to_owned());
+        parts.push(try_shell_quote(&dir.value)?);
+    }
+    parts.push(try_shell_quote(&spec)?);
     Some(parts.join(" "))
 }
 
