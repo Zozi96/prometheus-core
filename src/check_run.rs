@@ -12,15 +12,16 @@
 //! fingerprint ([`RealFingerprint`]). The store and the Check slot stay
 //! real, over a temporary directory in tests. There is no clock
 //! adapter and no other single-adapter indirection: durations (wall
-//! time and Check-slot wait) are measured here and go to the Green
-//! receipt only, never to the outcome the binary prints (ADR-0017 D3).
+//! time and Check-slot wait) and child footprint are measured here and go
+//! to the Green receipt only, never to the outcome the binary prints
+//! (ADR-0017 D3).
 //! `--timeout` bounds only the Check-slot wait (ADR-0004); the launched
 //! command has no duration limit (ADR-0002).
 
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::check::{
@@ -34,10 +35,22 @@ use crate::selection::Level;
 // ---------------------------------------------------------------------------
 // Injected dependencies: the process launcher and the Tree fingerprint.
 
+/// Resource use of one reaped child process. CPU time is user plus system
+/// time; peak memory is the child's `wait4` maximum RSS where the platform
+/// exposes it, and zero elsewhere.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Footprint {
+    pub cpu_ms: u64,
+    pub peak_memory_kb: u64,
+}
+
 /// What one launch of a process did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchOutcome {
-    Exited(i32),
+    Exited {
+        code: i32,
+        footprint: Footprint,
+    },
     /// The program could not be found: the runner is unavailable.
     NotFound,
     /// The process could not be started at all.
@@ -55,12 +68,64 @@ pub trait ProcessLauncher {
 /// limit (ADR-0002).
 pub struct RealLauncher;
 
+#[cfg(unix)]
+fn wait_with_usage(child: Child) -> (i32, Footprint) {
+    let Ok(pid) = i32::try_from(child.id()) else {
+        return (1, Footprint::default());
+    };
+    let mut status = 0;
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        let result = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+        if result == pid {
+            break;
+        }
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return (1, Footprint::default());
+    }
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        1
+    };
+    let milliseconds = |time: libc::timeval| {
+        u64::try_from(time.tv_sec)
+            .unwrap_or(0)
+            .saturating_mul(1_000)
+            .saturating_add(u64::try_from(time.tv_usec).unwrap_or(0) / 1_000)
+    };
+    let cpu_ms = milliseconds(usage.ru_utime).saturating_add(milliseconds(usage.ru_stime));
+    #[cfg(target_os = "macos")]
+    let peak_memory_kb = u64::try_from(usage.ru_maxrss).unwrap_or(0) / 1024;
+    #[cfg(not(target_os = "macos"))]
+    let peak_memory_kb = u64::try_from(usage.ru_maxrss).unwrap_or(0);
+    (
+        code,
+        Footprint {
+            cpu_ms,
+            peak_memory_kb,
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn wait_with_usage(mut child: Child) -> (i32, Footprint) {
+    let code = child
+        .wait()
+        .ok()
+        .and_then(|status| status.code())
+        .unwrap_or(1);
+    (code, Footprint::default())
+}
+
 impl ProcessLauncher for RealLauncher {
     fn launch(&self, argv: &[String], root: &Path, log: &mut File) -> LaunchOutcome {
         let (Ok(stdout), Ok(stderr)) = (log.try_clone(), log.try_clone()) else {
             return LaunchOutcome::Failed("could not clone the log file".to_owned());
         };
-        let mut child = match Command::new(&argv[0])
+        let child = match Command::new(&argv[0])
             .args(&argv[1..])
             .current_dir(root)
             .env("PYTHONDONTWRITEBYTECODE", "1")
@@ -74,13 +139,8 @@ impl ProcessLauncher for RealLauncher {
             }
             Err(error) => return LaunchOutcome::Failed(error.to_string()),
         };
-        LaunchOutcome::Exited(
-            child
-                .wait()
-                .ok()
-                .and_then(|status| status.code())
-                .unwrap_or(1),
-        )
+        let (code, footprint) = wait_with_usage(child);
+        LaunchOutcome::Exited { code, footprint }
     }
 }
 
@@ -124,6 +184,8 @@ pub struct CheckRunRequest {
     pub logical: Option<Vec<String>>,
     pub level: Level,
     pub widen: Vec<String>,
+    /// The Change class that drove selection; empty for an explicit command.
+    pub change_class: String,
     /// For the no-test-command outcome only: print the Widening
     /// reasons before the pending line (the runner's standing shape
     /// for a multi-family selection with no declared command).
@@ -198,10 +260,18 @@ fn launch_sequence(
     launched: &[String],
     root: &Path,
     log_file: &mut File,
+    footprint: &mut Footprint,
 ) -> Result<i32, PendingReason> {
-    let launch = |argv: &[String], log_file: &mut File| -> Result<i32, PendingReason> {
+    let mut launch = |argv: &[String], log_file: &mut File| -> Result<i32, PendingReason> {
         match launcher.launch(argv, root, log_file) {
-            LaunchOutcome::Exited(code) => Ok(code),
+            LaunchOutcome::Exited {
+                code,
+                footprint: usage,
+            } => {
+                footprint.cpu_ms = footprint.cpu_ms.saturating_add(usage.cpu_ms);
+                footprint.peak_memory_kb = footprint.peak_memory_kb.max(usage.peak_memory_kb);
+                Ok(code)
+            }
             LaunchOutcome::NotFound => Err(PendingReason::RunnerUnavailable {
                 program: argv[0].clone(),
             }),
@@ -220,11 +290,55 @@ fn launch_sequence(
     }
 }
 
-/// Run one Check run end to end and return its outcome.
+fn millis64(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+#[derive(Default)]
+struct RunTelemetry {
+    footprint: Footprint,
+    slot_wait_ms: u64,
+}
+
+/// Run one Check run end to end, record its outcome in the cross-repo
+/// Check-run ledger, and return the outcome. Ledger writes are silent and
+/// never change the outcome.
 pub fn run_check(
     request: &CheckRunRequest,
     launcher: &dyn ProcessLauncher,
     fingerprints: &dyn TreeFingerprintSource,
+) -> Result<CheckOutcome, CheckRunError> {
+    let started = Instant::now();
+    let mut telemetry = RunTelemetry::default();
+    let result = run_check_inner(request, launcher, fingerprints, &mut telemetry);
+    if let Ok(outcome) = &result {
+        let kind = match outcome {
+            CheckOutcome::Executed(run) if behavioral_pass(run.parsed.counts, run.exit_code) => {
+                crate::check_runs::OutcomeKind::ExecutedPass
+            }
+            CheckOutcome::Executed(_) => crate::check_runs::OutcomeKind::ExecutedFail,
+            CheckOutcome::Reused(_) => crate::check_runs::OutcomeKind::ReusedGreenReceipt,
+            CheckOutcome::ValidationPending(_) => crate::check_runs::OutcomeKind::ValidationPending,
+        };
+        crate::check_runs::record(crate::check_runs::RunMetric {
+            outcome: kind,
+            selection: request.level.as_str().to_owned(),
+            widen: request.widen.clone(),
+            change_class: request.change_class.clone(),
+            wall_ms: millis64(started.elapsed()),
+            cpu_ms: telemetry.footprint.cpu_ms,
+            peak_memory_kb: telemetry.footprint.peak_memory_kb,
+            slot_wait_ms: telemetry.slot_wait_ms,
+        });
+    }
+    result
+}
+
+fn run_check_inner(
+    request: &CheckRunRequest,
+    launcher: &dyn ProcessLauncher,
+    fingerprints: &dyn TreeFingerprintSource,
+    telemetry: &mut RunTelemetry,
 ) -> Result<CheckOutcome, CheckRunError> {
     let Some(logical) = &request.logical else {
         return Ok(CheckOutcome::ValidationPending(
@@ -323,13 +437,21 @@ pub fn run_check(
         match acquire_slot_in(&request.slot_dir, logical, request.timeout) {
             Ok(slot) => {
                 let waited = slot.waited;
-                let code = match launch_sequence(launcher, &launched, root, &mut log_file) {
+                telemetry.slot_wait_ms = millis64(waited);
+                let code = match launch_sequence(
+                    launcher,
+                    &launched,
+                    root,
+                    &mut log_file,
+                    &mut telemetry.footprint,
+                ) {
                     Ok(code) => code,
                     Err(pending) => return Ok(CheckOutcome::ValidationPending(pending)),
                 };
                 (code, waited)
             }
             Err(timeout) => {
+                telemetry.slot_wait_ms = millis64(timeout.waited);
                 return Ok(CheckOutcome::ValidationPending(match timeout.unavailable {
                     Some(why) => PendingReason::SlotUnavailable { why },
                     None => PendingReason::SlotHeld {
@@ -339,7 +461,13 @@ pub fn run_check(
             }
         }
     } else {
-        let code = match launch_sequence(launcher, &launched, root, &mut log_file) {
+        let code = match launch_sequence(
+            launcher,
+            &launched,
+            root,
+            &mut log_file,
+            &mut telemetry.footprint,
+        ) {
             Ok(code) => code,
             Err(pending) => return Ok(CheckOutcome::ValidationPending(pending)),
         };
@@ -368,8 +496,10 @@ pub fn run_check(
             selection: request.level.as_str().to_owned(),
             widen: request.widen.clone(),
             log: log_path.to_string_lossy().to_string(),
-            // Durations live on the receipt only (ADR-0017 D3).
+            // Durations and footprint live on the receipt only (ADR-0017 D3).
             wall_ms: wall.as_millis(),
+            cpu_ms: telemetry.footprint.cpu_ms,
+            peak_memory_kb: telemetry.footprint.peak_memory_kb,
             slot_wait_ms: slot_wait.as_millis(),
         };
         let _ = append_receipt(&receipts_path, &receipt);
@@ -432,7 +562,13 @@ mod tests {
         fn exiting(log_text: &str, code: i32) -> TestLauncher {
             TestLauncher {
                 log_text: log_text.to_owned(),
-                outcome: LaunchOutcome::Exited(code),
+                outcome: LaunchOutcome::Exited {
+                    code,
+                    footprint: Footprint {
+                        cpu_ms: 7,
+                        peak_memory_kb: 11,
+                    },
+                },
                 sleep: Duration::ZERO,
                 calls: RefCell::new(Vec::new()),
             }
@@ -445,7 +581,7 @@ mod tests {
             if !self.sleep.is_zero() {
                 std::thread::sleep(self.sleep);
             }
-            if let LaunchOutcome::Exited(_) = self.outcome {
+            if let LaunchOutcome::Exited { .. } = self.outcome {
                 let _ = log.write_all(self.log_text.as_bytes());
                 let _ = log.flush();
             }
@@ -497,6 +633,7 @@ mod tests {
             logical,
             level: Level::Targeted,
             widen: Vec::new(),
+            change_class: String::new(),
             pending_prints_reasons: false,
             config: Config::default(),
             expected_fingerprint: None,
@@ -526,8 +663,38 @@ mod tests {
         assert!(!run.tree_changed);
         let receipts = std::fs::read_to_string(temp.0.join("store/receipts.jsonl")).unwrap();
         assert!(receipts.contains("\"wall_ms\""), "{receipts}");
+        assert!(receipts.contains("\"cpu_ms\":7"), "{receipts}");
+        assert!(receipts.contains("\"peak_memory_kb\":11"), "{receipts}");
         assert!(receipts.contains("\"slot_wait_ms\""), "{receipts}");
         assert!(receipts.contains("\"fingerprint\":\"fp\""), "{receipts}");
+    }
+
+    #[test]
+    fn compiled_receipt_sums_cpu_and_takes_peak_memory_across_build_and_test() {
+        let temp = TempDir::new("compiled-footprint");
+        let req = request(&temp, Some(argv(&["cargo", "test", "--workspace"])));
+        let launcher = TestLauncher::exiting(PASS_LOG, 0);
+        let run = executed(run_check(&req, &launcher, &TestFingerprint::fixed("fp")).unwrap());
+        assert!(run.receipt_kept);
+        assert_eq!(launcher.calls.borrow().len(), 2);
+        let receipts = std::fs::read_to_string(temp.0.join("store/receipts.jsonl")).unwrap();
+        assert!(receipts.contains("\"cpu_ms\":14"), "{receipts}");
+        assert!(receipts.contains("\"peak_memory_kb\":11"), "{receipts}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_launcher_reaps_with_wait4_footprint() {
+        let temp = TempDir::new("real-footprint");
+        let mut log = File::create(temp.0.join("run.log")).unwrap();
+        let outcome = RealLauncher.launch(&argv(&["sh", "-c", "exit 0"]), &temp.0, &mut log);
+        match outcome {
+            LaunchOutcome::Exited { code, footprint } => {
+                assert_eq!(code, 0);
+                assert!(footprint.peak_memory_kb > 0);
+            }
+            other => panic!("expected a launched sh, got {other:?}"),
+        }
     }
 
     #[test]

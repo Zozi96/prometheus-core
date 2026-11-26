@@ -420,7 +420,7 @@ fn open_metrics_file(file_path: &Path, write: bool, owner: PSID) -> Option<File>
 /// only, every ancestor pinned by a handle that refuses delete-sharing and
 /// reparse points, missing fixed directories created only for writes, and
 /// nothing created on the read path.
-pub(super) fn open_metrics(write: bool) -> Option<File> {
+pub(super) fn open_metrics(write: bool, file_name: &str) -> Option<File> {
     let home = local_drive_home()?;
     let user = token_user()?;
     let _home_dir = open_dir(&home).filter(|h| valid_dir(h, false, user.sid))?;
@@ -430,7 +430,19 @@ pub(super) fn open_metrics(write: bool) -> Option<File> {
     let _prometheus = pinned_dir(&prometheus_path, write, false, user.sid)?;
     let metrics_path = prometheus_path.join("metrics");
     let _metrics = pinned_dir(&metrics_path, write, true, user.sid)?;
-    open_metrics_file(&metrics_path.join("savings.jsonl"), write, user.sid)
+    open_metrics_file(&metrics_path.join(file_name), write, user.sid)
+}
+
+/// Open `file_name` inside an explicitly named private directory. The final
+/// directory gets the same owner, reparse-point, and owner-only-DACL checks as
+/// the fixed metrics directory; write mode may create only that directory.
+pub(super) fn open_in_dir(dir: &Path, write: bool, file_name: &str) -> Option<File> {
+    if !local_drive(dir) {
+        return None;
+    }
+    let user = token_user()?;
+    let _dir = pinned_dir(dir, write, true, user.sid)?;
+    open_metrics_file(&dir.join(file_name), write, user.sid)
 }
 
 /// Create `path` as a new owner-private file for kept logs: `CREATE_NEW`

@@ -12,7 +12,7 @@ use std::io::{BufRead, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 
 const MAX_BYTES: u64 = 1024 * 1024;
 
@@ -200,7 +200,7 @@ fn accumulate<K: Ord>(map: &mut BTreeMap<K, Total>, key: K, row: &Row) {
 /// creates. Unsafe owners, symlinks, or loose permissions refuse the whole
 /// route rather than repairing it.
 #[cfg(unix)]
-fn open_metrics(write: bool) -> Option<File> {
+fn open_named(write: bool, file_name: &str) -> Option<File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let home = crate::droid_mode::default_home().ok()?;
@@ -218,7 +218,7 @@ fn open_metrics(write: bool) -> Option<File> {
     let agents = child_dir(&home_dir, c".agents", write, false)?;
     let prometheus = child_dir(&agents, c"prometheus", write, false)?;
     let metrics = child_dir(&prometheus, c"metrics", write, true)?;
-    open_metrics_file(&metrics, write)
+    open_metrics_file(&metrics, write, file_name)
 }
 
 /// Open or (write mode only) create `name` under `parent`, refusing
@@ -250,22 +250,23 @@ fn child_dir(parent: &File, name: &CStr, write: bool, private: bool) -> Option<F
     Some(dir)
 }
 
-/// Open `savings.jsonl` under the pinned metrics dir; the file must be a
-/// regular, single-link file owned by the effective uid with no group/other
-/// bits. The writer opens `O_WRONLY|O_APPEND|O_CREAT` (mode 0o600); the
-/// reader opens `O_RDONLY` and never creates.
+/// Open one named JSONL file under a pinned private directory; the file must
+/// be a regular, single-link file owned by the effective uid with no
+/// group/other bits. The writer opens `O_WRONLY|O_APPEND|O_CREAT` (mode
+/// 0o600); the reader opens `O_RDONLY` and never creates.
 #[cfg(unix)]
-fn open_metrics_file(dir: &File, write: bool) -> Option<File> {
+fn open_metrics_file(dir: &File, write: bool, file_name: &str) -> Option<File> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::MetadataExt;
 
+    let name = CString::new(file_name).ok()?;
     let access = if write {
         libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT
     } else {
         libc::O_RDONLY
     };
     let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | access;
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), c"savings.jsonl".as_ptr(), flags, 0o600) };
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o600) };
     if fd < 0 {
         return None;
     }
@@ -281,16 +282,97 @@ fn open_metrics_file(dir: &File, write: bool) -> Option<File> {
     Some(file)
 }
 
+/// Open `file_name` inside an explicitly named directory with the same final
+/// directory and file refusals as the fixed metrics route. The directory must
+/// be absolute; write mode may create only that final directory (mode 0o700),
+/// never its parents. Used for test/store overrides, where the caller names
+/// the root of trust explicitly.
+#[cfg(unix)]
+fn open_in_dir(dir: &std::path::Path, write: bool, file_name: &str) -> Option<File> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+
+    if !dir.is_absolute() {
+        return None;
+    }
+    let open_dir = || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir)
+    };
+    let dir_file = match open_dir() {
+        Ok(file) => file,
+        Err(error) if write && error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return None,
+            }
+            open_dir().ok()?
+        }
+        Err(_) => return None,
+    };
+    let meta = dir_file.metadata().ok()?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return None;
+    }
+    open_metrics_file(&dir_file, write, file_name)
+}
+
+fn fixed_file_name(file_name: &str) -> bool {
+    !file_name.is_empty()
+        && !file_name.contains('/')
+        && !file_name.contains('\\')
+        && !file_name.contains('\0')
+}
+
+fn open_metrics(write: bool) -> Option<File> {
+    open_metrics_named(write, "savings.jsonl")
+}
+
+/// Open one fixed-name file in the private metrics store. Exposed inside the
+/// crate so sibling ledgers share exactly one owner/symlink/mode boundary.
+pub(crate) fn open_metrics_named(write: bool, file_name: &str) -> Option<File> {
+    if !fixed_file_name(file_name) {
+        return None;
+    }
+    open_named(write, file_name)
+}
+
+/// Open one fixed-name private JSONL file inside an explicitly named metrics
+/// directory (the test/store override seam). The directory itself must pass
+/// the same owner, non-symlink, and private-mode checks as the metrics store.
+pub(crate) fn open_private_file_in_dir(
+    dir: &std::path::Path,
+    write: bool,
+    file_name: &str,
+) -> Option<File> {
+    if !fixed_file_name(file_name) {
+        return None;
+    }
+    open_in_dir(dir, write, file_name)
+}
+
 #[cfg(windows)]
 pub(crate) mod windows;
 
 #[cfg(windows)]
-fn open_metrics(write: bool) -> Option<File> {
-    windows::open_metrics(write)
+fn open_named(write: bool, file_name: &str) -> Option<File> {
+    windows::open_metrics(write, file_name)
+}
+
+#[cfg(windows)]
+fn open_in_dir(dir: &std::path::Path, write: bool, file_name: &str) -> Option<File> {
+    windows::open_in_dir(dir, write, file_name)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_metrics(_write: bool) -> Option<File> {
+fn open_named(_write: bool, _file_name: &str) -> Option<File> {
+    None
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_in_dir(_dir: &std::path::Path, _write: bool, _file_name: &str) -> Option<File> {
     None
 }
 

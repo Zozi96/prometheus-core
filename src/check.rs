@@ -1020,6 +1020,10 @@ pub struct Receipt {
     #[serde(default)]
     pub wall_ms: u128,
     #[serde(default)]
+    pub cpu_ms: u64,
+    #[serde(default)]
+    pub peak_memory_kb: u64,
+    #[serde(default)]
     pub slot_wait_ms: u128,
 }
 
@@ -1408,6 +1412,8 @@ mod tests {
             widen: vec![],
             log: String::new(),
             wall_ms: 0,
+            cpu_ms: 0,
+            peak_memory_kb: 0,
             slot_wait_ms: 0,
         };
         assert!(find_green(std::slice::from_ref(&base), "abc", &argv(&["pytest", "-q"]), true).is_some());

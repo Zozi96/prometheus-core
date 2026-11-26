@@ -34,7 +34,9 @@ use std::time::Duration;
 
 const USAGE: &str = "usage: prometheus-check [--root <dir>] [--store <dir>] [--slot-dir <dir>] \
 [--log <path>] [--base <ref>] [--timeout <seconds>] [--force] [--no-profile] \
-(-- <command...> | --changed)";
+(-- <command...> | --changed)\n       prometheus-check selection-report [--since <YYYY-MM-DD|duration>] [--json]";
+const REPORT_USAGE: &str =
+    "usage: prometheus-check selection-report [--since <YYYY-MM-DD|duration>] [--json]";
 
 struct Args {
     root: PathBuf,
@@ -225,6 +227,57 @@ fn print_outcome(outcome: &prometheus_core::check_run::CheckOutcome) -> i32 {
     }
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn selection_report_cli(raw: &[String]) -> i32 {
+    let mut json = false;
+    let mut since = None;
+    let mut index = 0;
+    while index < raw.len() {
+        match raw[index].as_str() {
+            "--json" => json = true,
+            "--since" => {
+                index += 1;
+                let Some(text) = raw.get(index) else {
+                    eprintln!("{REPORT_USAGE}");
+                    return 2;
+                };
+                let Some(parsed) = prometheus_core::check_runs::parse_since(text, unix_now())
+                else {
+                    eprintln!("prometheus-check: invalid --since window\n{REPORT_USAGE}");
+                    return 2;
+                };
+                since = Some(parsed);
+            }
+            "--help" | "-h" => {
+                println!("{REPORT_USAGE}");
+                return 0;
+            }
+            _ => {
+                eprintln!("{REPORT_USAGE}");
+                return 2;
+            }
+        }
+        index += 1;
+    }
+    if json {
+        println!(
+            "{}",
+            prometheus_core::check_runs::selection_report_json(since)
+        );
+    } else {
+        print!(
+            "{}",
+            prometheus_core::check_runs::selection_report_text(since)
+        );
+    }
+    0
+}
+
 /// Run the library Check run for one request and exit from its
 /// outcome, in one place.
 fn run_and_exit(request: prometheus_core::check_run::CheckRunRequest) -> ! {
@@ -239,6 +292,10 @@ fn run_and_exit(request: prometheus_core::check_run::CheckRunRequest) -> ! {
 }
 
 fn main() {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("selection-report") {
+        std::process::exit(selection_report_cli(&raw[1..]));
+    }
     let args = match parse_args() {
         Ok(args) => args,
         Err(usage) => {
@@ -271,6 +328,7 @@ fn main() {
     let make_request = |logical: Option<Vec<String>>,
                         level: prometheus_core::selection::Level,
                         widen: Vec<String>,
+                        change_class: String,
                         pending_prints_reasons: bool,
                         expected_fingerprint: Option<String>|
      -> prometheus_core::check_run::CheckRunRequest {
@@ -285,6 +343,7 @@ fn main() {
             logical,
             level,
             widen,
+            change_class,
             pending_prints_reasons,
             config: config.clone(),
             expected_fingerprint,
@@ -301,6 +360,7 @@ fn main() {
             Some(args.command.clone()),
             level,
             Vec::new(),
+            String::new(),
             false,
             None,
         ));
@@ -357,6 +417,7 @@ fn main() {
                 None,
                 prometheus_core::selection::Level::Full,
                 reasons,
+                facts.change_class.clone(),
                 print_reasons,
                 Some(before.clone()),
             ));
@@ -374,6 +435,7 @@ fn main() {
         Some(selection.command),
         selection.level,
         selection.reasons,
+        facts.change_class.clone(),
         false,
         // The fingerprint that drove gathering and Selection: if the
         // tree changes before the run re-fingerprints, the run must
