@@ -4,12 +4,15 @@
 //! `prometheus-kit` invocations using the host `updatedInput` envelope, without
 //! changing `permissionDecision`.
 
-use crate::outline::Lang;
 use serde_json::{Map, Value};
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+
+pub mod rules;
+
+pub use rules::shell_rewrite_rules;
 
 const MAX_HOOK_CONFIG_BYTES: u64 = 1024 * 1024;
 
@@ -621,798 +624,6 @@ fn is_excluded_wrapper(cmd0: &str) -> bool {
     )
 }
 
-fn parse_sed_range(expr: &str) -> Option<(usize, usize)> {
-    let body = expr.strip_suffix('p')?;
-    let (start_s, end_s) = body.split_once(',')?;
-    if start_s.is_empty()
-        || end_s.is_empty()
-        || !start_s.bytes().all(|b| b.is_ascii_digit())
-        || !end_s.bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let start: usize = start_s.parse().ok()?;
-    let end: usize = end_s.parse().ok()?;
-    if start >= 1 && end >= start {
-        Some((start, end))
-    } else {
-        None
-    }
-}
-
-fn is_safe_sed_path(token: &ShellToken) -> bool {
-    let p = token.value.as_str();
-    !token.has_expansion
-        && !p.is_empty()
-        && p != "-"
-        && !p.starts_with('-')
-        && !p
-            .chars()
-            .any(|c| matches!(c, '$' | '*' | '?' | '[' | ']' | '~' | '{' | '}'))
-}
-
-fn resolve_git_dir(cd_prefix: Option<&str>, git_c_dir: Option<&str>, event_cwd: Option<&Path>) -> Option<PathBuf> {
-    if let Some(dir) = git_c_dir {
-        let p = PathBuf::from(dir);
-        if p.is_absolute() {
-            return Some(p);
-        }
-        return event_cwd.map(|c| c.join(p));
-    }
-    if let Some(prefix) = cd_prefix {
-        if let Some(tokens) = shell_split(prefix) {
-            if tokens.len() == 2 && !tokens[1].has_expansion {
-                let p = PathBuf::from(&tokens[1].value);
-                if p.is_absolute() {
-                    return Some(p);
-                }
-                return event_cwd.map(|c| c.join(p));
-            }
-        }
-    }
-    event_cwd.map(Path::to_path_buf)
-}
-
-fn rewrite_git(
-    tokens: &[ShellToken],
-    kit_bin: &str,
-    cd_prefix: Option<&str>,
-    event_cwd: Option<&Path>,
-) -> Option<String> {
-    rewrite_git_inner(tokens, kit_bin, cd_prefix, event_cwd, false)
-}
-
-/// With `rtk` active the kit defers every `git` form `rtk` compacts; the one
-/// exception is `git show <rev>`, which the `rtk` history shows it leaves
-/// raw (ADR-0013 D7, #75), so only that subcommand is rewritten here.
-fn rewrite_git_show_only(
-    tokens: &[ShellToken],
-    kit_bin: &str,
-    cd_prefix: Option<&str>,
-    event_cwd: Option<&Path>,
-) -> Option<String> {
-    rewrite_git_inner(tokens, kit_bin, cd_prefix, event_cwd, true)
-}
-
-fn rewrite_git_inner(
-    tokens: &[ShellToken],
-    kit_bin: &str,
-    cd_prefix: Option<&str>,
-    event_cwd: Option<&Path>,
-    show_only: bool,
-) -> Option<String> {
-    let mut idx = 1usize;
-    let mut git_c_dir: Option<&ShellToken> = None;
-
-    if idx < tokens.len() && tokens[idx].value == "-C" {
-        let dir = tokens.get(idx + 1)?;
-        if dir.value.is_empty() || dir.has_expansion {
-            return None;
-        }
-        git_c_dir = Some(dir);
-        idx += 2;
-    }
-
-    let subcmd = tokens.get(idx)?.value.as_str();
-    if show_only && subcmd != "show" {
-        return None;
-    }
-    idx += 1;
-
-    let mut parts = vec![kit_bin.to_owned(), "diff".to_owned()];
-    if let Some(dir) = git_c_dir {
-        parts.push("--root".to_owned());
-        parts.push(try_shell_quote(&dir.value)?);
-    }
-
-    match subcmd {
-        "status" => {
-            for tok in &tokens[idx..] {
-                let arg = tok.value.as_str();
-                let allowed = matches!(arg, "--short" | "--branch")
-                    || (arg.starts_with('-')
-                        && !arg.starts_with("--")
-                        && arg.len() > 1
-                        && arg[1..].chars().all(|c| matches!(c, 's' | 'b')));
-                if !allowed {
-                    return None;
-                }
-            }
-            parts.push("--status".to_owned());
-            Some(parts.join(" "))
-        }
-        "diff" => {
-            let mut staged = false;
-            let mut stat = false;
-            let mut context: Option<usize> = None;
-            let mut base_ref: Option<&ShellToken> = None;
-            let mut paths: Vec<&ShellToken> = Vec::new();
-            let mut positional_only = false;
-
-            let mut j = idx;
-            while j < tokens.len() {
-                let tok = &tokens[j];
-                let arg = tok.value.as_str();
-                if positional_only {
-                    if tok.has_expansion {
-                        return None;
-                    }
-                    paths.push(tok);
-                    j += 1;
-                    continue;
-                }
-                match arg {
-                    "--" => positional_only = true,
-                    "--staged" | "--cached" => staged = true,
-                    "--stat" => stat = true,
-                    "--unified" => {
-                        let next = tokens.get(j + 1)?;
-                        let n: usize = next.value.parse().ok()?;
-                        context = Some(n);
-                        j += 1;
-                    }
-                    _ if arg.starts_with("--unified=") => {
-                        let n: usize = arg["--unified=".len()..].parse().ok()?;
-                        context = Some(n);
-                    }
-                    _ if arg.starts_with("-U") && arg.len() > 2 => {
-                        let n: usize = arg[2..].parse().ok()?;
-                        context = Some(n);
-                    }
-                    _ if arg.starts_with('-') => return None,
-                    _ => {
-                        if base_ref.is_some() || arg.is_empty() || arg.contains(':') || tok.has_expansion {
-                            return None;
-                        }
-                        base_ref = Some(tok);
-                    }
-                }
-                j += 1;
-            }
-
-            if let Some(candidate) = base_ref {
-                let repo_dir = resolve_git_dir(
-                    cd_prefix,
-                    git_c_dir.map(|t| t.value.as_str()),
-                    event_cwd,
-                );
-                let exists_as_path = paths.is_empty()
-                    && !positional_only
-                    && repo_dir.is_some_and(|d| d.join(&candidate.value).exists());
-                if exists_as_path {
-                    paths.push(candidate);
-                    base_ref = None;
-                } else if staged {
-                    // `prometheus-kit diff` treats --staged and --base as mutually exclusive.
-                    return None;
-                }
-            }
-
-            if staged {
-                parts.push("--staged".to_owned());
-            }
-            if stat {
-                parts.push("--stat".to_owned());
-            }
-            if let Some(n) = context {
-                parts.push("-C".to_owned());
-                parts.push(n.to_string());
-            }
-            if let Some(base) = base_ref {
-                parts.push("--base".to_owned());
-                parts.push(try_shell_quote(&base.value)?);
-            }
-            if !paths.is_empty() {
-                parts.push("--".to_owned());
-                for p in paths {
-                    parts.push(try_shell_quote(&p.value)?);
-                }
-            }
-            Some(parts.join(" "))
-        }
-        "show" => {
-            let mut stat = false;
-            let mut rev: Option<&ShellToken> = None;
-            for tok in &tokens[idx..] {
-                let arg = tok.value.as_str();
-                match arg {
-                    "--stat" => stat = true,
-                    _ if arg.starts_with('-') => return None,
-                    _ => {
-                        if rev.is_some() || arg.is_empty() || arg.contains(':') || tok.has_expansion {
-                            return None;
-                        }
-                        rev = Some(tok);
-                    }
-                }
-            }
-            let rev = rev?;
-            parts.push("--commit".to_owned());
-            parts.push(try_shell_quote(&rev.value)?);
-            if stat {
-                parts.push("--stat".to_owned());
-            }
-            Some(parts.join(" "))
-        }
-        _ => None,
-    }
-}
-
-fn rewrite_rg(tokens: &[ShellToken], kit_bin: &str) -> Option<String> {
-    let mut ignore_case = false;
-    let mut fixed_strings = false;
-    let mut word_regexp = false;
-    let mut files_only = false;
-    let mut hidden = false;
-    let mut no_ignore = false;
-    let mut globs: Vec<String> = Vec::new();
-    let mut lang_type: Option<String> = None;
-    let mut positionals: Vec<String> = Vec::new();
-    let mut positional_only = false;
-
-    let mut i = 1usize;
-    while i < tokens.len() {
-        let tok = &tokens[i];
-        let arg = tok.value.as_str();
-        if positional_only {
-            if tok.has_expansion {
-                return None;
-            }
-            positionals.push(tok.value.clone());
-            i += 1;
-            continue;
-        }
-        match arg {
-            "--" => positional_only = true,
-            "-i" | "--ignore-case" => ignore_case = true,
-            "-F" | "--fixed-strings" => fixed_strings = true,
-            "-w" | "--word-regexp" => word_regexp = true,
-            "-l" | "--files-with-matches" => files_only = true,
-            "--hidden" => hidden = true,
-            "--no-ignore" => no_ignore = true,
-            "-g" | "--glob" => {
-                let val = tokens.get(i + 1)?;
-                if val.value.is_empty() || val.has_expansion {
-                    return None;
-                }
-                globs.push(val.value.clone());
-                i += 1;
-            }
-            _ if arg.starts_with("--glob=") => {
-                let v = &arg["--glob=".len()..];
-                if v.is_empty() || tok.has_expansion {
-                    return None;
-                }
-                globs.push(v.to_owned());
-            }
-            "-t" | "--type" => {
-                if lang_type.is_some() {
-                    return None;
-                }
-                let val = tokens.get(i + 1)?;
-                if val.has_expansion || Lang::from_name(&val.value).is_none() {
-                    return None;
-                }
-                lang_type = Some(val.value.clone());
-                i += 1;
-            }
-            _ if arg.starts_with("--type=") => {
-                if lang_type.is_some() {
-                    return None;
-                }
-                let v = &arg["--type=".len()..];
-                if tok.has_expansion || Lang::from_name(v).is_none() {
-                    return None;
-                }
-                lang_type = Some(v.to_owned());
-            }
-            _ if arg.starts_with('-')
-                && !arg.starts_with("--")
-                && arg.len() > 2
-                && arg[1..].chars().all(|c| matches!(c, 'i' | 'F' | 'w' | 'l')) =>
-            {
-                for c in arg[1..].chars() {
-                    match c {
-                        'i' => ignore_case = true,
-                        'F' => fixed_strings = true,
-                        'w' => word_regexp = true,
-                        'l' => files_only = true,
-                        _ => {}
-                    }
-                }
-            }
-            _ if arg.starts_with('-') => return None,
-            _ => {
-                if tok.has_expansion {
-                    return None;
-                }
-                positionals.push(tok.value.clone());
-            }
-        }
-        i += 1;
-    }
-
-    if positionals.is_empty() {
-        return None;
-    }
-
-    let mut parts = vec![kit_bin.to_owned(), "search".to_owned()];
-    if ignore_case {
-        parts.push("-i".to_owned());
-    }
-    if fixed_strings {
-        parts.push("-F".to_owned());
-    }
-    if word_regexp {
-        parts.push("-w".to_owned());
-    }
-    if files_only {
-        parts.push("--files-only".to_owned());
-    }
-    if hidden {
-        parts.push("--hidden".to_owned());
-    }
-    if no_ignore {
-        parts.push("--no-ignore".to_owned());
-    }
-    for g in globs {
-        parts.push("--glob".to_owned());
-        parts.push(try_shell_quote(&g)?);
-    }
-    if let Some(t) = lang_type {
-        parts.push("--type".to_owned());
-        parts.push(try_shell_quote(&t)?);
-    }
-    parts.push("--symbols".to_owned());
-    parts.push("--".to_owned());
-    for pos in positionals {
-        parts.push(try_shell_quote(&pos)?);
-    }
-    Some(parts.join(" "))
-}
-
-/// One safe file argument for the dump rewrites (`head`/`tail`/`cat`/`nl`):
-/// the same path rules as the `sed -n` rewrite — one literal path, no
-/// expansions, no stdin marker, no flag-shaped token.
-fn dump_file_arg(token: &ShellToken) -> Option<&str> {
-    if is_safe_sed_path(token) {
-        Some(token.value.as_str())
-    } else {
-        None
-    }
-}
-
-fn parse_dump_count(value: &str) -> Option<usize> {
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let n: usize = value.parse().ok()?;
-    if n >= 1 {
-        Some(n)
-    } else {
-        None
-    }
-}
-
-/// `head`/`tail`/`cat`/`nl` over one safe file → `slice` (#75). These are
-/// the file dumps `rtk` leaves raw (ADR-0013 D7), so the rewrite applies
-/// whether or not `rtk` is active. Only the documented flag forms are
-/// supported; anything else (several files, `-c`, `-f`, `-q`, a pipeline —
-/// already refused by the caller's scan) returns `None` untouched.
-///
-/// - `head [-n N | -N] <file>` → `slice <file>:1-N` (default N = 10)
-/// - `tail [-n N | -N] <file>` → `slice <file>:-N` (the last N lines);
-///   `tail -n +N <file>` → `slice <file>:N-` (from line N to the end)
-/// - `cat <file>` / `nl <file>` → `slice <file>:1-` (the whole file,
-///   under slice's default token budget)
-fn rewrite_file_dump(cmd0: &str, tokens: &[ShellToken], kit_bin: &str) -> Option<String> {
-    let args = &tokens[1..];
-    // An optional `--` separator before the single file.
-    let args: &[ShellToken] = match args.first() {
-        Some(t) if t.value == "--" => &args[1..],
-        _ => args,
-    };
-    let slice_for = |spec: String| -> Option<String> {
-        Some(format!("{kit_bin} slice {}", try_shell_quote(&spec)?))
-    };
-    match cmd0 {
-        "cat" | "nl" => {
-            if args.len() != 1 {
-                return None;
-            }
-            let file = dump_file_arg(&args[0])?;
-            slice_for(format!("{file}:1-"))
-        }
-        "head" | "tail" => {
-            let mut count: Option<usize> = None;
-            let mut from_line: Option<usize> = None;
-            let mut file: Option<&ShellToken> = None;
-            let mut i = 0usize;
-            while i < args.len() {
-                let arg = args[i].value.as_str();
-                if file.is_some() {
-                    return None;
-                }
-                match arg {
-                    "-n" | "--lines" => {
-                        let val = &args.get(i + 1)?.value;
-                        if let Some(n) = val.strip_prefix('+') {
-                            if cmd0 != "tail" {
-                                return None;
-                            }
-                            from_line = Some(parse_dump_count(n)?);
-                        } else {
-                            count = Some(parse_dump_count(val)?);
-                        }
-                        i += 1;
-                    }
-                    _ if arg.starts_with("--lines=") => {
-                        let val = &arg["--lines=".len()..];
-                        if let Some(n) = val.strip_prefix('+') {
-                            if cmd0 != "tail" {
-                                return None;
-                            }
-                            from_line = Some(parse_dump_count(n)?);
-                        } else {
-                            count = Some(parse_dump_count(val)?);
-                        }
-                    }
-                    _ if arg.starts_with('-')
-                        && arg.len() > 1
-                        && arg[1..].bytes().all(|b| b.is_ascii_digit()) =>
-                    {
-                        // The attached form: `head -5` / `tail -5`.
-                        count = Some(parse_dump_count(&arg[1..])?);
-                    }
-                    _ if arg.starts_with('-') => return None,
-                    _ => file = Some(&args[i]),
-                }
-                i += 1;
-            }
-            let file = dump_file_arg(file?)?;
-            if cmd0 == "head" {
-                if from_line.is_some() {
-                    return None;
-                }
-                let n = count.unwrap_or(10);
-                slice_for(format!("{file}:1-{n}"))
-            } else if let Some(n) = from_line {
-                slice_for(format!("{file}:{n}-"))
-            } else {
-                let n = count.unwrap_or(10);
-                slice_for(format!("{file}:-{n}"))
-            }
-        }
-        _ => None,
-    }
-}
-
-/// `grep` over files or directories → `search` (#75), with or without
-/// `rtk` active (`rtk` leaves `grep` raw; ADR-0013 D7). Only flags whose
-/// meaning `search` reproduces are supported; inverting, counting,
-/// context, colour, Perl/byte modes and similar return `None` untouched.
-/// The pattern is the first positional (or the `-e` argument); every
-/// remaining positional is a search path, exactly as in `rewrite_rg`.
-fn rewrite_grep(tokens: &[ShellToken], kit_bin: &str) -> Option<String> {
-    let mut ignore_case = false;
-    let mut fixed_strings = false;
-    let mut word_regexp = false;
-    let mut files_only = false;
-    let mut extended = false;
-    let mut pattern: Option<String> = None;
-    let mut globs: Vec<String> = Vec::new();
-    let mut positionals: Vec<String> = Vec::new();
-    let mut positional_only = false;
-
-    let mut i = 1usize;
-    while i < tokens.len() {
-        let tok = &tokens[i];
-        let arg = tok.value.as_str();
-        if positional_only {
-            if tok.has_expansion {
-                return None;
-            }
-            positionals.push(tok.value.clone());
-            i += 1;
-            continue;
-        }
-        match arg {
-            "--" => positional_only = true,
-            "-i" | "--ignore-case" => ignore_case = true,
-            "-F" | "--fixed-strings" => fixed_strings = true,
-            "-w" | "--word-regexp" => word_regexp = true,
-            "-l" | "--files-with-matches" => files_only = true,
-            "-E" | "--extended-regexp" => extended = true,
-            // Output-shape flags `search` already matches: it prints
-            // grouped, line-numbered matches, one per line.
-            "-n" | "--line-number" | "-H" | "--with-filename" | "-h" | "--no-filename"
-            | "-r" | "-R" | "--recursive" | "-s" | "--no-messages" => {}
-            "-e" | "--regexp" => {
-                if pattern.is_some() {
-                    return None;
-                }
-                let val = tokens.get(i + 1)?;
-                if val.value.is_empty() || val.has_expansion {
-                    return None;
-                }
-                pattern = Some(val.value.clone());
-                i += 1;
-            }
-            _ if arg.starts_with("--regexp=") => {
-                if pattern.is_some() {
-                    return None;
-                }
-                let v = &arg["--regexp=".len()..];
-                if v.is_empty() || tok.has_expansion {
-                    return None;
-                }
-                pattern = Some(v.to_owned());
-            }
-            _ if arg.starts_with("--include=") => {
-                let v = &arg["--include=".len()..];
-                if v.is_empty() || tok.has_expansion {
-                    return None;
-                }
-                globs.push(v.to_owned());
-            }
-            "--include" => {
-                let val = tokens.get(i + 1)?;
-                if val.value.is_empty() || val.has_expansion {
-                    return None;
-                }
-                globs.push(val.value.clone());
-                i += 1;
-            }
-            _ if arg.starts_with('-')
-                && !arg.starts_with("--")
-                && arg.len() > 1
-                && arg[1..]
-                    .chars()
-                    .all(|c| matches!(c, 'i' | 'F' | 'w' | 'l' | 'E' | 'n' | 'H' | 'h' | 'r' | 'R' | 's')) =>
-            {
-                for c in arg[1..].chars() {
-                    match c {
-                        'i' => ignore_case = true,
-                        'F' => fixed_strings = true,
-                        'w' => word_regexp = true,
-                        'l' => files_only = true,
-                        'E' => extended = true,
-                        _ => {}
-                    }
-                }
-            }
-            _ if arg.starts_with('-') => return None,
-            _ => {
-                if tok.has_expansion {
-                    return None;
-                }
-                positionals.push(tok.value.clone());
-            }
-        }
-        i += 1;
-    }
-    let _ = extended; // `search` patterns are regexes, like `grep -E`.
-
-    let pattern = match pattern {
-        Some(p) => p,
-        None => {
-            if positionals.is_empty() {
-                return None;
-            }
-            positionals.remove(0)
-        }
-    };
-    // `grep` needs at least one explicit path here: with none it reads
-    // stdin or the working tree implicitly, which `search` does not
-    // reproduce faithfully enough to rewrite blind.
-    if positionals.is_empty() {
-        return None;
-    }
-
-    let mut parts = vec![kit_bin.to_owned(), "search".to_owned()];
-    if ignore_case {
-        parts.push("-i".to_owned());
-    }
-    if fixed_strings {
-        parts.push("-F".to_owned());
-    }
-    if word_regexp {
-        parts.push("-w".to_owned());
-    }
-    if files_only {
-        parts.push("--files-only".to_owned());
-    }
-    for g in globs {
-        parts.push("--glob".to_owned());
-        parts.push(try_shell_quote(&g)?);
-    }
-    parts.push("--symbols".to_owned());
-    parts.push("--".to_owned());
-    parts.push(try_shell_quote(&pattern)?);
-    for pos in positionals {
-        parts.push(try_shell_quote(&pos)?);
-    }
-    Some(parts.join(" "))
-}
-
-/// Read-only `gh` log pulls → `compact --mode log` (#76, ADR-0013 D2(a):
-/// a hook rewrite to an existing verb, no new verb). Only the exact
-/// `gh run view … --log|--log-failed` shape is rewritten, re-emitting the
-/// original command verbatim after `--`, so the full log stays
-/// recoverable through compact's spillover file. Structured output
-/// (`--json`/`--jq`/`--template`), browser/exit-status forms, and every
-/// other `gh` shape — including all writes (`create`, `merge`, `comment`,
-/// `edit`, `close`, `gh api` with a method or fields), which can never
-/// match this shape — are left untouched.
-fn rewrite_gh_log(tokens: &[ShellToken], kit_bin: &str, rest: &str) -> Option<String> {
-    if tokens.len() < 4
-        || tokens[1].value != "run"
-        || tokens[2].value != "view"
-    {
-        return None;
-    }
-    let mut log_flags = 0usize;
-    let mut positionals = 0usize;
-    let mut i = 3usize;
-    while i < tokens.len() {
-        let arg = tokens[i].value.as_str();
-        match arg {
-            "--log" | "--log-failed" => log_flags += 1,
-            "--job" | "--attempt" | "-R" | "--repo" => {
-                let val = tokens.get(i + 1)?;
-                if val.value.is_empty() {
-                    return None;
-                }
-                i += 1;
-            }
-            _ if arg.starts_with("--job=")
-                || arg.starts_with("--attempt=")
-                || arg.starts_with("--repo=") =>
-            {
-                if arg.ends_with('=') {
-                    return None;
-                }
-            }
-            // Structured output and behaviour-changing flags never rewrite.
-            "--json" | "--jq" | "--template" | "-q" | "--web" | "-w" | "--exit-status" => {
-                return None;
-            }
-            _ if arg.starts_with("--json=")
-                || arg.starts_with("--jq=")
-                || arg.starts_with("--template=") =>
-            {
-                return None;
-            }
-            _ if arg.starts_with('-') => return None,
-            _ => {
-                positionals += 1;
-                if positionals > 1 {
-                    return None;
-                }
-            }
-        }
-        i += 1;
-    }
-    if log_flags != 1 {
-        return None;
-    }
-    Some(format!("{kit_bin} compact --mode log -- {rest}"))
-}
-
-/// Literal-prefix predicate for the measured RTK 1.2.0 piped replies: the
-/// claimed form must end at a literal ASCII space — a tab or extra spacing
-/// right after the command does not count.
-fn word_prefix(s: &str, prefix: &str) -> bool {
-    s.strip_prefix(prefix)
-        .is_some_and(|tail| tail.is_empty() || tail.starts_with(' '))
-}
-
-/// Whether the raw piped runner `rest` (truncation and cd prefix already
-/// stripped) spells a form RTK 1.2.0 claims: literal `pytest` or
-/// `python[3] -m pytest` prefixes matched with single spaces, or a
-/// cargo/dotnet/go/mvn command followed by a space and an eligible
-/// subcommand — extra whitespace or tabs after that first separator still
-/// match, per the measured replies. Everything else keeps the kit log.
-fn rtk_claims_piped(rest: &str, cmd: &str, arg1: Option<&str>, arg2: Option<&str>) -> bool {
-    if word_prefix(rest, "pytest")
-        || word_prefix(rest, "python -m pytest")
-        || word_prefix(rest, "python3 -m pytest")
-    {
-        return true;
-    }
-    if !matches!(cmd, "cargo" | "dotnet" | "go" | "mvn") {
-        return false;
-    }
-    if !matches!(
-        (cmd, arg1, arg2),
-        ("cargo", Some("build" | "check" | "clippy" | "test"), _)
-            | ("dotnet", Some("restore" | "build"), _)
-            | ("go", Some("build" | "test"), _)
-            | ("mvn", Some("test"), _)
-    ) {
-        return false;
-    }
-    rest.strip_prefix(cmd)
-        .and_then(|s| s.strip_prefix(' '))
-        .is_some_and(|s| {
-            s.trim_start_matches([' ', '\t'])
-                .strip_prefix(arg1.unwrap_or(""))
-                .is_some_and(|tail| tail.is_empty() || tail.starts_with([' ', '\t']))
-        })
-}
-
-/// Runner command → compact mode (`"build"`/`"test"`), or None when the
-/// command is not an eligible runner or RTK claims it. `piped` carries the
-/// raw runner text for truncated forms — RTK's piped claims were measured
-/// on literal spellings only, so path-qualified or quoted runners are never
-/// deferred. Plain commands keep the original always/standalone split.
-fn runner_mode(
-    cmd: &str,
-    arg1: Option<&str>,
-    arg2: Option<&str>,
-    rtk_active: bool,
-    piped: Option<&str>,
-) -> Option<&'static str> {
-    // Empirical split (rtk 1.2.0 probes): piped `dotnet restore|build`,
-    // `cargo build|check|clippy|test`, `go build|test`, `mvn test`, `pytest`,
-    // and `python[3] -m pytest` are claimed by RTK; tsc/jest/vitest,
-    // dotnet test/format, msbuild, unittest, npm/pnpm/yarn/bun test, and
-    // gradle/gradlew test are not, so kit keeps their logs.
-    let rtk_defers = rtk_active
-        && match piped {
-            Some(rest) => rtk_claims_piped(rest, cmd, arg1, arg2),
-            None => matches!(
-                (cmd, arg1, arg2),
-                ("dotnet", Some("build"), _)
-                    | ("cargo", Some("build" | "check" | "clippy" | "test"), _)
-                    | ("go", Some("build" | "test"), _)
-                    | ("tsc", _, _)
-                    | ("pytest" | "jest" | "vitest", _, _)
-                    | ("python" | "python3", Some("-m"), Some("pytest"))
-            ),
-        };
-    if rtk_defers {
-        return None;
-    }
-    match (cmd, arg1, arg2) {
-        ("dotnet", Some("test"), _) => Some("test"),
-        ("dotnet", Some("restore" | "format" | "build"), _) => Some("build"),
-        ("msbuild" | "msbuild.exe", _, _) => Some("build"),
-        ("python" | "python3", Some("-m"), Some("unittest")) => Some("test"),
-        ("npm", Some("test"), _) | ("npm", Some("run"), Some("test")) => Some("test"),
-        ("pnpm" | "yarn" | "bun", Some("test"), _) => Some("test"),
-        ("mvn" | "gradle" | "gradlew", Some("test"), _) => Some("test"),
-        ("tsc", _, _) => Some("build"),
-        ("cargo", Some("build" | "check" | "clippy"), _) => Some("build"),
-        ("cargo", Some("test"), _) => Some("test"),
-        ("go", Some("build"), _) => Some("build"),
-        ("go", Some("test"), _) => Some("test"),
-        ("pytest" | "jest" | "vitest", _, _) => Some("test"),
-        ("python" | "python3", Some("-m"), Some("pytest")) => Some("test"),
-        _ => None,
-    }
-}
-
 /// Pure command rewriter parameterized by quoted binary path, RTK status, and optional cwd.
 pub fn rewrite_command_str(
     command: &str,
@@ -1423,17 +634,6 @@ pub fn rewrite_command_str(
     let truncated = truncated_runner(command);
     let (cd_prefix, rest) = scan_and_split_cd_prefix(truncated.unwrap_or(command))?;
     let tokens = shell_split(rest)?;
-    // Piped truncation additionally refuses token expansions anywhere in the
-    // runner or its `cd` prefix — an expanded word could resolve to anything,
-    // so the command passes through untouched.
-    if truncated.is_some()
-        && (tokens.iter().any(|t| t.has_expansion)
-            || cd_prefix.is_some_and(|prefix| {
-                shell_split(prefix).is_none_or(|ts| ts.iter().any(|t| t.has_expansion))
-            }))
-    {
-        return None;
-    }
     let first = tokens.first()?;
     if is_excluded_wrapper(&first.value) {
         return None;
@@ -1444,39 +644,17 @@ pub fn rewrite_command_str(
     {
         return None;
     }
-
     let cmd0 = basename_lower(&first.value);
-    let arg1 = tokens.get(1).map(|t| t.value.as_str());
-    let arg2 = tokens.get(2).map(|t| t.value.as_str());
-
-    let rewritten_tail = if truncated.is_some() {
-        // Piped truncation: runners only (no sed/git/rg fallback) — compact
-        // keeps the guaranteed raw log instead of the pipe's silent cut. The
-        // RTK deferral matches the literal spellings its replies claimed.
-        let mode = runner_mode(&cmd0, arg1, arg2, rtk_active, Some(rest))?;
-        format!("{kit_bin} compact --mode {mode} --keep-log -- {rest}")
-    } else {
-        match cmd0.as_str() {
-            "sed" if tokens.len() == 4 && arg1 == Some("-n") => {
-                let (start, end) = parse_sed_range(&tokens[2].value)?;
-                if !is_safe_sed_path(&tokens[3]) {
-                    return None;
-                }
-                let spec = format!("{}:{start}-{end}", tokens[3].value);
-                Some(format!("{kit_bin} slice {}", try_shell_quote(&spec)?))
-            }
-            "git" if !rtk_active => rewrite_git(&tokens, kit_bin, cd_prefix, event_cwd),
-            // With `rtk` active, only the forms its history leaves raw are
-            // taken (#75): `git show`, the file dumps, and `grep`.
-            "git" => rewrite_git_show_only(&tokens, kit_bin, cd_prefix, event_cwd),
-            "head" | "tail" | "cat" | "nl" => rewrite_file_dump(&cmd0, &tokens, kit_bin),
-            "grep" => rewrite_grep(&tokens, kit_bin),
-            "gh" => rewrite_gh_log(&tokens, kit_bin, rest),
-            "rg" if !rtk_active => rewrite_rg(&tokens, kit_bin),
-            _ => runner_mode(&cmd0, arg1, arg2, rtk_active, None)
-                .map(|mode| format!("{kit_bin} compact --mode {mode} -- {rest}")),
-        }?
+    // Piped truncation is runner-only inside the rule table: compact keeps
+    // the guaranteed raw log instead of the pipe's silent cut.
+    let context = rules::RewriteContext {
+        kit_bin,
+        truncated: truncated.is_some(),
+        rest,
+        cd_prefix,
+        event_cwd,
     };
+    let rewritten_tail = rules::rewrite_with_rule_table(&cmd0, &tokens, rtk_active, &context)?;
 
     if let Some(prefix) = cd_prefix {
         Some(format!("{prefix} && {rewritten_tail}"))
@@ -1779,6 +957,7 @@ mod tests {
                 "gh run view 12345 --log-failed",
                 "gh run view --log",
                 "gh run view 12345 --job 678 --log",
+                "gh run view 12345 --job foo= --log",
                 "gh run view --attempt 2 --log-failed 12345",
                 "gh run view -R owner/repo 12345 --log",
             ] {
@@ -1808,6 +987,9 @@ mod tests {
                 "gh pr view 42",
                 "gh run view 12345 --log --log-failed",
                 "gh run view 12345 --job 1 --job 2 --log extra1 extra2",
+                "gh run view 12345 --job=foo= --log",
+                "gh run view 12345 --attempt=2= --log",
+                "gh run view 12345 --repo=owner/repo= --log",
                 // Structured output stays untouched.
                 "gh run view 12345 --log --json conclusion",
                 "gh run view 12345 --log --jq .conclusion",
@@ -2121,58 +1303,130 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_rule_metadata_is_enumerable_versioned_and_complete() {
+        let rules = shell_rewrite_rules();
+        assert!(rules.len() >= 11);
+        let mut ids = std::collections::BTreeSet::new();
+        let mut families = std::collections::BTreeSet::new();
+        for rule in rules {
+            assert!(ids.insert(rule.id), "duplicate rule id {}", rule.id);
+            assert_eq!(rules::RTK_VERIFIED_VERSION, rule.rtk.verified_version, "{}", rule.id);
+            assert!(!rule.head.commands.is_empty(), "{}", rule.id);
+            families.insert(match rule.target {
+                rules::TargetSpec::SliceSedRange => "slice-range",
+                rules::TargetSpec::GitStatus | rules::TargetSpec::GitDiff | rules::TargetSpec::GitShow => {
+                    "git-diff"
+                }
+                rules::TargetSpec::SearchRg | rules::TargetSpec::SearchGrep => "search",
+                rules::TargetSpec::FileDump(_) => "file-dump",
+                rules::TargetSpec::CompactLog => "compact-log",
+                rules::TargetSpec::CompactRunner { .. } => "compact-runner",
+            });
+            if let rules::ParserSpec::Structured(spec) = rule.parser {
+                if let Some(id) = spec.numeric_short_flag {
+                    assert!(
+                        spec.flags.iter().any(|flag| flag.id == id),
+                        "numeric short flag {id} in {} has no flag spec",
+                        rule.id
+                    );
+                }
+                let mut flag_ids = std::collections::BTreeSet::new();
+                for flag in spec.flags {
+                    assert!(flag_ids.insert(flag.id), "duplicate flag {} in {}", flag.id, rule.id);
+                    assert!(
+                        !flag.exact.is_empty() || !flag.attached_prefixes.is_empty() || flag.cluster.is_some(),
+                        "flag {} in {} has no spelling",
+                        flag.id,
+                        rule.id
+                    );
+                    if !flag.attached_prefixes.is_empty() {
+                        assert!(flag.value.is_some(), "attached valueless flag {} in {}", flag.id, rule.id);
+                    }
+                    if flag.cluster.is_some() {
+                        assert!(flag.value.is_none(), "clustered value flag {} in {}", flag.id, rule.id);
+                    }
+                }
+            }
+        }
+        for family in [
+            "slice-range",
+            "git-diff",
+            "search",
+            "file-dump",
+            "compact-log",
+            "compact-runner",
+        ] {
+            assert!(families.contains(family), "missing rewrite family {family}");
+        }
+    }
+
+    #[test]
     fn truncated_runner_table_covers_groups_tails_counts_and_rtk() {
-        // Every eligible runner group -> expected compact mode.
-        let runners: &[(&str, &str)] = &[
-            ("dotnet test", "test"),
-            ("dotnet restore", "build"),
-            ("dotnet build", "build"),
-            ("dotnet format", "build"),
-            ("msbuild", "build"),
-            ("msbuild.exe", "build"),
-            ("python -m unittest", "test"),
-            ("python3 -m unittest", "test"),
-            ("python -m pytest", "test"),
-            ("python3 -m pytest", "test"),
-            ("npm test", "test"),
-            ("npm run test", "test"),
-            ("pnpm test", "test"),
-            ("yarn test", "test"),
-            ("bun test", "test"),
-            ("mvn test", "test"),
-            ("gradle test", "test"),
-            ("gradlew test", "test"),
-            ("./gradlew test", "test"),
-            ("cargo build", "build"),
-            ("cargo check", "build"),
-            ("cargo clippy", "build"),
-            ("cargo test", "test"),
-            ("go build", "build"),
-            ("go test", "test"),
-            ("tsc", "build"),
-            ("pytest", "test"),
-            ("jest", "test"),
-            ("vitest", "test"),
+        // Independent oracle for runner mode and measured piped RTK deferral.
+        // Metadata enumeration below only checks that the declarative table is
+        // complete against this oracle; behavior expectations never derive
+        // from the implementation under test.
+        let runners: &[(&str, &str, bool)] = &[
+            ("dotnet test", "test", false),
+            ("dotnet restore", "build", true),
+            ("dotnet format", "build", false),
+            ("dotnet build", "build", true),
+            ("msbuild", "build", false),
+            ("msbuild.exe", "build", false),
+            ("python -m unittest", "test", false),
+            ("python3 -m unittest", "test", false),
+            ("python -m pytest", "test", true),
+            ("python3 -m pytest", "test", true),
+            ("npm test", "test", false),
+            ("npm run test", "test", false),
+            ("pnpm test", "test", false),
+            ("yarn test", "test", false),
+            ("bun test", "test", false),
+            ("mvn test", "test", true),
+            ("gradle test", "test", false),
+            ("gradlew test", "test", false),
+            ("./gradlew test", "test", false),
+            ("cargo build", "build", true),
+            ("cargo check", "build", true),
+            ("cargo clippy", "build", true),
+            ("cargo test", "test", true),
+            ("go build", "build", true),
+            ("go test", "test", true),
+            ("tsc", "build", false),
+            ("pytest", "test", true),
+            ("jest", "test", false),
+            ("vitest", "test", false),
         ];
-        // Groups RTK verifiably claims in piped form (rtk 1.2.0 probes) defer
-        // when rtk_active; every other runner keeps the keep-log rewrite.
-        let rtk_deferred = |runner: &str| {
-            matches!(
-                runner,
-                "dotnet restore"
-                    | "dotnet build"
-                    | "cargo build"
-                    | "cargo check"
-                    | "cargo clippy"
-                    | "cargo test"
-                    | "go build"
-                    | "go test"
-                    | "mvn test"
-                    | "pytest"
-                    | "python -m pytest"
-                    | "python3 -m pytest"
-            )
-        };
+
+        let mut metadata_runners = std::collections::BTreeSet::new();
+        for rule in shell_rewrite_rules() {
+            let rules::TargetSpec::CompactRunner { mode } = rule.target else {
+                continue;
+            };
+            let piped_deferred = match rule.rtk.posture {
+                rules::RtkPosture::Runner {
+                    piped_claim: rules::RtkPipedClaim::None,
+                    ..
+                } => false,
+                rules::RtkPosture::Runner { .. } => true,
+                _ => false,
+            };
+            for command in rule.head.commands {
+                let mut words = vec![(*command).to_owned()];
+                words.extend(rule.head.argv_prefix.iter().map(|word| (*word).to_owned()));
+                let runner = words.join(" ");
+                metadata_runners.insert((runner.clone(), mode, piped_deferred));
+                if *command == "gradlew" {
+                    metadata_runners.insert((format!("./{runner}"), mode, piped_deferred));
+                }
+            }
+        }
+        let oracle: std::collections::BTreeSet<_> = runners
+            .iter()
+            .map(|(runner, mode, deferred)| ((*runner).to_owned(), *mode, *deferred))
+            .collect();
+        assert_eq!(oracle, metadata_runners, "runner metadata does not match independent oracle");
+
         let tails = [
             "| tail",
             "| tail -5",
@@ -2183,7 +1437,7 @@ mod tests {
             "| head -n 3",
             "|tail -5",
         ];
-        for &(runner, mode) in runners {
+        for &(runner, mode, rtk_deferred) in runners {
             for tail in tails {
                 for redirect in ["", " 2>&1"] {
                     let input = format!("{runner}{redirect} {tail}");
@@ -2195,11 +1449,7 @@ mod tests {
                         rewrite_command_str(&input, KIT, false, None),
                         "rtk=false input={input}"
                     );
-                    let expected_rtk = if rtk_deferred(runner) {
-                        None
-                    } else {
-                        expected.clone()
-                    };
+                    let expected_rtk = if rtk_deferred { None } else { expected.clone() };
                     assert_eq!(
                         expected_rtk,
                         rewrite_command_str(&input, KIT, true, None),
