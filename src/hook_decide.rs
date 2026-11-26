@@ -18,7 +18,7 @@ use crate::hook::{
     secret_path_denied, secret_tool_denial, tool_name, valid_session_id_str, AmbientFacts,
     SYMLINK_BLOCK_REASON,
 };
-use crate::hook_rewrite::{evaluate_shell_policy, ShellAction, ShellPolicyTier};
+use crate::hook_rewrite::{evaluate_shell_policy_attributed, ShellAction, ShellPolicyTier};
 use crate::metrics::MetricRecord;
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
@@ -269,6 +269,24 @@ fn pass() -> Outcome {
 /// The shared hook decision: secret block, shell rewrite or Guided
 /// deny-once, Use-time hint, reread advisory, pass — in that order.
 pub fn decide(normalized: &NormalizedEvent, ambient: &AmbientFacts, caps: Capabilities) -> Outcome {
+    decide_impl(normalized, ambient, caps, None)
+}
+
+pub(crate) fn decide_with_metrics_host(
+    normalized: &NormalizedEvent,
+    ambient: &AmbientFacts,
+    caps: Capabilities,
+    metrics_host: Option<crate::metrics::Host>,
+) -> Outcome {
+    decide_impl(normalized, ambient, caps, metrics_host)
+}
+
+fn decide_impl(
+    normalized: &NormalizedEvent,
+    ambient: &AmbientFacts,
+    caps: Capabilities,
+    metrics_host: Option<crate::metrics::Host>,
+) -> Outcome {
     if !normalized.is_pretool {
         return pass();
     }
@@ -287,7 +305,7 @@ pub fn decide(normalized: &NormalizedEvent, ambient: &AmbientFacts, caps: Capabi
         } else {
             ShellPolicyTier::DenyOnce
         };
-        match evaluate_shell_policy(
+        match evaluate_shell_policy_attributed(
             ambient,
             normalized.rtk_active,
             tier,
@@ -295,6 +313,7 @@ pub fn decide(normalized: &NormalizedEvent, ambient: &AmbientFacts, caps: Capabi
             inp,
             &normalized.session_id,
             normalized.shell_cwd.as_deref(),
+            metrics_host,
         ) {
             ShellAction::Rewrite {
                 command_key,
@@ -377,7 +396,7 @@ pub fn run_adapter<A: HostAdapter>(
         Ok(normalized) => normalized,
         Err(reply) => return reply,
     };
-    let outcome = decide(&normalized, ambient, caps);
+    let outcome = decide_with_metrics_host(&normalized, ambient, caps, metrics_host);
     if let Some(host) = metrics_host {
         for metric in &outcome.metrics {
             crate::metrics::record_metric(host, *metric);
@@ -1204,8 +1223,10 @@ mod tests {
                     }
                     other => panic!("{label}: expected rewrite, got {other:?}"),
                 }
-                assert_eq!(1, out.metrics.len(), "{label}");
-                assert_eq!(Rule::ShellRewrite, out.metrics[0].rule, "{label}");
+                assert!(
+                    out.metrics.is_empty(),
+                    "{label}: rewrite rows are recorded by the executed kit command"
+                );
             } else {
                 match &out.decision {
                     Decision::DenyOnce { reason } => {

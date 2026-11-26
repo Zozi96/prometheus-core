@@ -876,7 +876,7 @@ pub(super) fn rewrite_with_rule_table(
     tokens: &[ShellToken],
     rtk_active: bool,
     context: &RewriteContext<'_>,
-) -> Option<String> {
+) -> Option<(String, crate::metrics::Rule)> {
     for rule in REWRITE_RULES {
         let Some(head) = match_head(rule, cmd0, tokens) else {
             continue;
@@ -902,7 +902,8 @@ pub(super) fn rewrite_with_rule_table(
             return None;
         }
         let parsed = parse_args(rule, &tokens[head.args_start..])?;
-        return build_target(rule, &parsed, head.git_c_dir, context);
+        return build_target(rule, &parsed, head.git_c_dir, context)
+            .map(|rewritten| (rewritten, metric_rule(rule.target)));
     }
     None
 }
@@ -1209,6 +1210,17 @@ fn flag_values<'a>(parsed: &'a ParsedArgs<'_>, id: &'a str) -> impl Iterator<Ite
         .iter()
         .filter(move |flag| flag.id == id)
         .filter_map(|flag| flag.value.as_deref())
+}
+
+fn metric_rule(target: TargetSpec) -> crate::metrics::Rule {
+    match target {
+        TargetSpec::SliceSedRange | TargetSpec::FileDump(_) => crate::metrics::Rule::Slice,
+        TargetSpec::GitStatus | TargetSpec::GitDiff | TargetSpec::GitShow => {
+            crate::metrics::Rule::Diff
+        }
+        TargetSpec::SearchRg | TargetSpec::SearchGrep => crate::metrics::Rule::Search,
+        TargetSpec::CompactLog | TargetSpec::CompactRunner { .. } => crate::metrics::Rule::Compact,
+    }
 }
 
 fn build_target(

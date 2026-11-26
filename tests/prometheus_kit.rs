@@ -702,6 +702,8 @@ impl MetricsHome {
             .env_remove("DEVIN_PROJECT_DIR")
             .env_remove("CLAUDECODE")
             .env_remove("FACTORY_DROID_SESSION_ID")
+            .env_remove("FACTORY_SESSION_ID")
+            .env_remove("PI_SESSION_ID")
             .env_remove("MUSE_SESSION_ID")
             .env_remove("GROK_SESSION_ID")
             .env_remove("ANTIGRAVITY_CONVERSATION_ID")
@@ -736,7 +738,7 @@ impl MetricsHome {
     }
 
     fn metrics(&self) -> Output {
-        self.command(&["metrics"])
+        self.command(&["metrics", "--json"])
             .output()
             .expect("failed to run prometheus-kit metrics")
     }
@@ -821,7 +823,7 @@ fn assert_metric_row_keys(row: &Value) {
 }
 
 #[test]
-fn metrics_records_shell_rewrite_for_rewrite_hosts() {
+fn rewrite_hooks_carry_attribution_without_command_length_rows() {
     let home = MetricsHome::new("rewrite_metrics");
     for (host, tool) in [
         ("claude", "Bash"),
@@ -840,6 +842,10 @@ fn metrics_records_shell_rewrite_for_rewrite_hosts() {
             command.contains("compact --mode test"),
             "host={host}: {command}"
         );
+        assert!(
+            command.contains(&format!("--rewrite-host {host} --rewrite-rule compact")),
+            "host={host}: {command}"
+        );
     }
     let cursor_ev = serde_json::json!({
         "hook_event_name": "preToolUse",
@@ -852,30 +858,104 @@ fn metrics_records_shell_rewrite_for_rewrite_hosts() {
     assert_eq!(c_out.status.code(), Some(0));
     let c_reply: Value = serde_json::from_slice(&c_out.stdout).unwrap();
     assert_eq!("allow", c_reply["permission"]);
-    assert!(c_reply["updated_input"]["command"]
+    let cursor_command = c_reply["updated_input"]["command"].as_str().unwrap();
+    assert!(cursor_command.contains("compact --mode test"));
+    assert!(cursor_command.contains("--rewrite-host cursor --rewrite-rule compact"));
+
+    assert!(
+        !home.metrics_file().exists(),
+        "hook rewrites must not write command-string shell-rewrite rows"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rewritten_kit_command_records_real_bytes_under_originating_host_and_rule() {
+    let home = MetricsHome::new("rewrite_attributed_exec");
+    let fakebin = home.repo.join("fakebin");
+    fs::create_dir_all(&fakebin).unwrap();
+    fake_executable(
+        &fakebin,
+        "dotnet",
+        "#!/bin/sh
+i=1
+while [ $i -le 100 ]; do printf 'test suite repeated failure line\n'; i=$((i+1)); done
+exit 0
+",
+    );
+
+    let droid_ev = rewrite_event("Execute", &home.repo, "sess-droid-attribution");
+    let droid_hook = home.hook("droid", &droid_ev);
+    assert_eq!(droid_hook.status.code(), Some(0));
+    let droid_reply: Value = serde_json::from_slice(&droid_hook.stdout).unwrap();
+    let droid_command = droid_reply["hookSpecificOutput"]["updatedInput"]["command"]
         .as_str()
         .unwrap()
-        .contains("compact --mode test"));
+        .to_owned();
+    assert!(droid_command.contains("--rewrite-host droid --rewrite-rule compact"));
 
-    let rows = home.rows();
-    assert_eq!(rows.len(), 5, "rows: {rows:?}");
-    for host in ["claude", "cursor", "devin", "droid", "muse"] {
-        let row = find_row(&rows, host, "shell-rewrite");
-        assert_metric_row_keys(row);
+    let omp_ev = serde_json::json!({
+        "toolName": "bash",
+        "input": {"command": "dotnet test"},
+        "cwd": home.repo.to_str().unwrap(),
+        "sessionId": "omp-rewrite-attribution",
+        "lastPrompt": "",
+    });
+    let omp_hook = home.hook("omp", &omp_ev);
+    assert_eq!(omp_hook.status.code(), Some(0));
+    let omp_reply: Value = serde_json::from_slice(&omp_hook.stdout).unwrap();
+    let omp_command = omp_reply["input"]["command"].as_str().unwrap().to_owned();
+    assert!(omp_command.contains("--rewrite-host omp --rewrite-rule compact"));
+
+    assert!(
+        !home.metrics_file().exists(),
+        "hook evaluation alone must not append rows"
+    );
+    let mut stdout_lens = Vec::new();
+    for rewritten in [&droid_command, &omp_command] {
+        let run = Command::new("sh")
+            .arg("-c")
+            .arg(rewritten)
+            .env("HOME", &home.home)
+            .env("USERPROFILE", &home.home)
+            .env("XDG_RUNTIME_DIR", &home.runtime)
+            .env("PATH", fixture_path(&fakebin))
+            .env_remove("PROMETHEUS_KIT_NO_METRICS")
+            .output()
+            .expect("failed to execute rewritten command");
         assert_eq!(
-            row["raw_bytes"].as_u64().unwrap(),
-            REWRITE_COMMAND.len() as u64
+            run.status.code(),
+            Some(0),
+            "stderr={}",
+            String::from_utf8_lossy(&run.stderr)
         );
-        assert!(row["emitted_bytes"].as_u64().unwrap() > 0);
-        assert!(row["timestamp"].as_u64().unwrap() > 0);
+        stdout_lens.push(run.stdout.len());
     }
 
-    let totals = home.metrics();
-    assert_eq!(totals.status.code(), Some(0));
-    let parsed: Value = serde_json::from_slice(&totals.stdout).unwrap();
-    assert_eq!(parsed["by_rule"]["shell-rewrite"]["count"], 5);
-    for host in ["claude", "cursor", "devin", "droid", "muse"] {
-        assert_eq!(parsed["by_host"][host]["count"], 1, "host={host}");
+    let rows = home.rows();
+    assert_eq!(rows.len(), 2, "rows: {rows:?}");
+    for (host, stdout_len) in [("droid", stdout_lens[0]), ("omp", stdout_lens[1])] {
+        let row = find_row(&rows, host, "compact");
+        assert_metric_row_keys(row);
+        assert_eq!(row["raw_bytes"].as_u64(), Some(3300), "row: {row}");
+        assert_eq!(
+            row["emitted_bytes"].as_u64().unwrap() as usize,
+            stdout_len,
+            "row: {row}"
+        );
+    }
+    let ledger = fs::read_to_string(home.metrics_file()).unwrap();
+    for forbidden in [
+        "sess-droid-attribution",
+        "omp-rewrite-attribution",
+        "dotnet test",
+        fakebin.to_str().unwrap(),
+        "--rewrite-host",
+    ] {
+        assert!(
+            !ledger.contains(forbidden),
+            "ledger stores {forbidden}: {ledger}"
+        );
     }
 }
 
@@ -973,6 +1053,20 @@ fn metrics_opt_out_disables_writes() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let cmd_opt_out = kit_stdin_env(
+        &home,
+        &["compact", "--no-spillover"],
+        b"squeeze\n",
+        &[("PROMETHEUS_KIT_NO_METRICS", "1")],
+    );
+    assert_eq!(cmd_opt_out.status.code(), Some(0));
+    let cmd_empty_opt_out = kit_stdin_env(
+        &home,
+        &["compact", "--no-spillover"],
+        b"squeeze\n",
+        &[("PROMETHEUS_KIT_NO_METRICS", "")],
+    );
+    assert_eq!(cmd_empty_opt_out.status.code(), Some(0));
     assert!(
         !home.metrics_file().exists(),
         "opt-out must not create savings.jsonl"
@@ -992,14 +1086,13 @@ fn metrics_path_obstruction_keeps_hook_stdout_identical() {
     // `.agents` as a regular file blocks the fd walk before any write.
     fs::write(bad.home.join(".agents"), b"not a directory").unwrap();
 
-    let ev = rewrite_event("Bash", &good.repo, "sess-claude");
-    let out_good = good.hook("claude", &ev);
-    let out_bad = bad.hook("claude", &ev);
+    let out_good = kit_stdin(&good, &["compact", "--no-spillover"], b"squeeze\n");
+    let out_bad = kit_stdin(&bad, &["compact", "--no-spillover"], b"squeeze\n");
     assert_eq!(out_good.status.code(), Some(0));
     assert_eq!(out_bad.status.code(), Some(0));
     assert_eq!(
         out_good.stdout, out_bad.stdout,
-        "metrics obstruction must not change the hook reply"
+        "metrics obstruction must not change command output"
     );
     assert!(good.metrics_file().exists());
     assert!(!bad.metrics_file().exists());
@@ -1015,8 +1108,7 @@ fn metrics_refuses_insecure_dirs_symlinks_and_loose_files() {
     let metrics_dir = home.home.join(".agents/prometheus/metrics");
     fs::create_dir_all(&metrics_dir).unwrap();
     fs::set_permissions(&metrics_dir, fs::Permissions::from_mode(0o755)).unwrap();
-    let ev = rewrite_event("Bash", &home.repo, "sess-claude");
-    let out = home.hook("claude", &ev);
+    let out = kit_stdin(&home, &["compact", "--no-spillover"], b"squeeze\n");
     assert_eq!(out.status.code(), Some(0));
     assert!(!metrics_dir.join("savings.jsonl").exists());
 
@@ -1027,7 +1119,7 @@ fn metrics_refuses_insecure_dirs_symlinks_and_loose_files() {
     fs::create_dir_all(&real_metrics).unwrap();
     fs::set_permissions(&real_metrics, fs::Permissions::from_mode(0o700)).unwrap();
     std::os::unix::fs::symlink(&real, linked.home.join(".agents")).unwrap();
-    let out = linked.hook("claude", &ev);
+    let out = kit_stdin(&linked, &["compact", "--no-spillover"], b"squeeze\n");
     assert_eq!(out.status.code(), Some(0));
     assert!(!real_metrics.join("savings.jsonl").exists());
 
@@ -1042,7 +1134,7 @@ fn metrics_refuses_insecure_dirs_symlinks_and_loose_files() {
     .unwrap();
     fs::write(&loose_file, "{}\n").unwrap();
     fs::set_permissions(&loose_file, fs::Permissions::from_mode(0o644)).unwrap();
-    let out = loose.hook("claude", &ev);
+    let out = kit_stdin(&loose, &["compact", "--no-spillover"], b"squeeze\n");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(fs::read_to_string(&loose_file).unwrap(), "{}\n");
 }
@@ -1050,8 +1142,7 @@ fn metrics_refuses_insecure_dirs_symlinks_and_loose_files() {
 #[test]
 fn metrics_file_stops_accepting_rows_at_cap() {
     let home = MetricsHome::new("cap_metrics");
-    let ev = rewrite_event("Bash", &home.repo, "sess-claude");
-    let out = home.hook("claude", &ev);
+    let out = kit_stdin(&home, &["compact", "--no-spillover"], b"squeeze\n");
     assert_eq!(out.status.code(), Some(0));
     assert!(home.metrics_file().exists());
 
@@ -1066,7 +1157,7 @@ fn metrics_file_stops_accepting_rows_at_cap() {
     assert_eq!(data.len(), METRICS_MAX_BYTES);
     fs::write(home.metrics_file(), &data).unwrap();
 
-    let out = home.hook("claude", &ev);
+    let out = kit_stdin(&home, &["compact", "--no-spillover"], b"squeeze\n");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         fs::metadata(home.metrics_file()).unwrap().len(),
@@ -1468,6 +1559,118 @@ fn metrics_totals_skips_malformed_non_utf8_row() {
 }
 
 #[test]
+fn metrics_reporting_filters_windows_and_cross_tabulates_deterministically() {
+    let home = MetricsHome::new("metrics_reporting");
+    // Create the store through the guarded writer first, then replace its
+    // contents with a deterministic ledger fixture.
+    let seed = kit_stdin(&home, &["compact", "--no-spillover"], b"seed line\n");
+    assert_eq!(seed.status.code(), Some(0));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    fs::write(
+        home.metrics_file(),
+        format!(
+            concat!(
+                "{{\"timestamp\":1696118399,\"host\":\"claude\",\"rule_id\":\"search\",\"raw_bytes\":100,\"emitted_bytes\":40}}\n",
+                "{{\"timestamp\":1696204800,\"host\":\"claude\",\"rule_id\":\"search\",\"raw_bytes\":100,\"emitted_bytes\":40}}\n",
+                "{{\"timestamp\":1696204801,\"host\":\"droid\",\"rule_id\":\"compact\",\"raw_bytes\":200,\"emitted_bytes\":50}}\n",
+                "{{\"timestamp\":1696204801,\"host\":\"droid\",\"rule_id\":\"shell-rewrite\",\"raw_bytes\":20,\"emitted_bytes\":30}}\n",
+                "{{\"timestamp\":{},\"host\":\"omp\",\"rule_id\":\"slice\",\"raw_bytes\":90,\"emitted_bytes\":10}}\n",
+            ),
+            now
+        ),
+    )
+    .unwrap();
+
+    let all = home.metrics();
+    assert_eq!(all.status.code(), Some(0));
+    let parsed: Value = serde_json::from_slice(&all.stdout).unwrap();
+    assert_eq!(parsed["by_host"]["claude"]["count"], 2);
+    assert_eq!(parsed["by_rule"]["shell-rewrite"]["net_bytes"], -10);
+    assert_eq!(parsed["by_host_rule"]["claude"]["search"]["count"], 2);
+    assert_eq!(parsed["by_host_rule"]["droid"]["compact"]["raw_bytes"], 200);
+    assert_eq!(parsed["by_host_rule"]["omp"]["slice"]["net_bytes"], 80);
+
+    let boundary = home
+        .command(&["metrics", "--since", "2023-10-02", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(boundary.status.code(), Some(0));
+    let boundary_json: Value = serde_json::from_slice(&boundary.stdout).unwrap();
+    // 2023-10-02T00:00:00Z is inclusive: the row exactly at 1696204800 stays,
+    // while the row one second earlier is filtered out.
+    assert_eq!(
+        boundary_json["by_host_rule"]["claude"]["search"]["count"],
+        1
+    );
+    assert_eq!(
+        boundary_json["by_host_rule"]["claude"]["search"]["raw_bytes"],
+        100
+    );
+    assert_eq!(boundary_json["by_rule"]["compact"]["count"], 1);
+
+    let empty = home
+        .command(&["metrics", "--since", "2999-01-01", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(empty.status.code(), Some(0));
+    let empty_json: Value = serde_json::from_slice(&empty.stdout).unwrap();
+    assert_eq!(empty_json["by_host"], serde_json::json!({}));
+    assert_eq!(empty_json["by_rule"], serde_json::json!({}));
+    assert_eq!(empty_json["by_host_rule"], serde_json::json!({}));
+
+    let recent = home
+        .command(&["metrics", "--since", "1w", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(recent.status.code(), Some(0));
+    let recent_json: Value = serde_json::from_slice(&recent.stdout).unwrap();
+    assert_eq!(recent_json["by_host"]["omp"]["count"], 1);
+    assert!(recent_json["by_host"].get("claude").is_none());
+
+    let text_args = ["metrics", "--since", "2023-10-02"];
+    let text1 = home.command(&text_args).output().unwrap();
+    let text2 = home.command(&text_args).output().unwrap();
+    assert_eq!(text1.status.code(), Some(0));
+    assert_eq!(text2.status.code(), Some(0));
+    assert_eq!(
+        text1.stdout, text2.stdout,
+        "text output must be deterministic"
+    );
+    let text = String::from_utf8(text1.stdout).unwrap();
+    assert!(text.contains("by_host:\n"), "{text}");
+    assert!(text.contains("by_rule:\n"), "{text}");
+    assert!(text.contains("by_host_rule:\n"), "{text}");
+    assert!(
+        text.contains("claude/search count=1 raw_bytes=100 emitted_bytes=40 net_bytes=60"),
+        "{text}"
+    );
+    assert!(!text.contains("claude/search count=2"), "{text}");
+}
+
+#[test]
+fn metrics_rejects_invalid_rewrite_attribution_args() {
+    let home = MetricsHome::new("invalid_rewrite_attribution");
+    for args in [
+        ["--rewrite-host", "standalone", "--rewrite-rule", "compact"].as_slice(),
+        ["--rewrite-host", "droid", "--rewrite-rule", "shell-rewrite"].as_slice(),
+        ["--rewrite-host", "not-a-host", "--rewrite-rule", "compact"].as_slice(),
+        ["--rewrite-host", "droid", "--rewrite-rule"].as_slice(),
+    ] {
+        let out = home.command(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "args={args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("invalid rewrite attribution"),
+            "args={args:?} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(!home.metrics_file().exists());
+}
+
+#[test]
 fn metrics_host_marker_single_vs_ambiguous() {
     let home = MetricsHome::new("host_markers");
     // One known marker -> that host.
@@ -1483,22 +1686,61 @@ fn metrics_host_marker_single_vs_ambiguous() {
         &home,
         &["compact", "--no-spillover"],
         b"squeeze\n",
-        &[("CLAUDECODE", "1"), ("CURSOR_PROJECT_DIR", "/tmp/ambiguous")],
+        &[
+            ("CLAUDECODE", "1"),
+            ("CURSOR_PROJECT_DIR", "/tmp/ambiguous"),
+        ],
     );
     assert_eq!(ambiguous.status.code(), Some(0));
 
-    let rows = home.rows();
-    assert_eq!(rows.len(), 2, "rows: {rows:?}");
-    assert_eq!(rows[0]["host"].as_str(), Some("claude"), "row: {}", rows[0]);
-    assert_eq!(
-        rows[1]["host"].as_str(),
-        Some("standalone"),
-        "row: {}",
-        rows[1]
+    // Droid's Execute environment exposes FACTORY_SESSION_ID; both Droid
+    // marker spellings name the same host and are not ambiguity.
+    let factory = kit_stdin_env(
+        &home,
+        &["compact", "--no-spillover"],
+        b"squeeze\n",
+        &[("FACTORY_SESSION_ID", "factory-1")],
     );
+    assert_eq!(factory.status.code(), Some(0));
+    let both_droid = kit_stdin_env(
+        &home,
+        &["compact", "--no-spillover"],
+        b"squeeze\n",
+        &[
+            ("FACTORY_SESSION_ID", "factory-1"),
+            ("FACTORY_DROID_SESSION_ID", "droid-1"),
+        ],
+    );
+    assert_eq!(both_droid.status.code(), Some(0));
+    // omp session commands carry PI_SESSION_ID.
+    let omp = kit_stdin_env(
+        &home,
+        &["compact", "--no-spillover"],
+        b"squeeze\n",
+        &[("PI_SESSION_ID", "omp-1")],
+    );
+    assert_eq!(omp.status.code(), Some(0));
+
+    let rows = home.rows();
+    assert_eq!(rows.len(), 5, "rows: {rows:?}");
+    for (index, host) in ["claude", "standalone", "droid", "droid", "omp"]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            rows[index]["host"].as_str(),
+            Some(*host),
+            "row: {}",
+            rows[index]
+        );
+    }
     for row in &rows {
         assert_eq!(row["rule_id"].as_str(), Some("compact"), "row: {row}");
         assert_metric_row_keys(row);
+    }
+    let ledger = fs::read_to_string(home.metrics_file()).unwrap();
+    for forbidden in ["factory-1", "droid-1", "omp-1", "/tmp/ambiguous"] {
+        assert!(!ledger.contains(forbidden), "ledger stores {forbidden}");
     }
 }
 
@@ -2463,12 +2705,12 @@ fn hook_omp_rewrites_guards_unlocks_and_records_metrics() {
     .unwrap();
     assert_eq!(strict_blocked["block"], Value::Bool(true));
 
-    // 5. Unified metrics record only the shell rewrite under omp (no read/dump denials).
+    // 5. Hook evaluation records no command-length rewrite row and no read/dump denials.
     let totals = home.metrics();
     assert_eq!(totals.status.code(), Some(0));
     let parsed: Value = serde_json::from_slice(&totals.stdout).unwrap();
-    assert_eq!(parsed["by_host"]["omp"]["count"], 1, "{parsed}");
-    assert_eq!(parsed["by_rule"]["shell-rewrite"]["count"], 1, "{parsed}");
+    assert!(parsed["by_host"].get("omp").is_none(), "{parsed}");
+    assert!(parsed["by_rule"].get("shell-rewrite").is_none(), "{parsed}");
     assert!(parsed["by_rule"].get("first-read-denial").is_none(), "{parsed}");
     assert!(parsed["by_rule"].get("reread-denial").is_none(), "{parsed}");
     assert!(parsed["by_rule"].get("inline-dump-denial").is_none(), "{parsed}");

@@ -631,6 +631,16 @@ pub fn rewrite_command_str(
     rtk_active: bool,
     event_cwd: Option<&Path>,
 ) -> Option<String> {
+    rewrite_command(command, kit_bin, rtk_active, event_cwd, None)
+}
+
+fn rewrite_command(
+    command: &str,
+    kit_bin: &str,
+    rtk_active: bool,
+    event_cwd: Option<&Path>,
+    metrics_host: Option<crate::metrics::Host>,
+) -> Option<String> {
     let truncated = truncated_runner(command);
     let (cd_prefix, rest) = scan_and_split_cd_prefix(truncated.unwrap_or(command))?;
     let tokens = shell_split(rest)?;
@@ -654,13 +664,36 @@ pub fn rewrite_command_str(
         cd_prefix,
         event_cwd,
     };
-    let rewritten_tail = rules::rewrite_with_rule_table(&cmd0, &tokens, rtk_active, &context)?;
-
-    if let Some(prefix) = cd_prefix {
-        Some(format!("{prefix} && {rewritten_tail}"))
+    let (rewritten_tail, rule) =
+        rules::rewrite_with_rule_table(&cmd0, &tokens, rtk_active, &context)?;
+    let rewritten_tail = if let Some(host) = metrics_host {
+        attribute_tail(&rewritten_tail, kit_bin, host, rule)?
     } else {
-        Some(rewritten_tail)
-    }
+        rewritten_tail
+    };
+
+    let command = if let Some(prefix) = cd_prefix {
+        format!("{prefix} && {rewritten_tail}")
+    } else {
+        rewritten_tail
+    };
+    Some(command)
+}
+
+/// Insert fixed-vocabulary attribution as leading kit arguments. Values are
+/// enum names only; no session, path, command, or content crosses this seam.
+fn attribute_tail(
+    rewritten_tail: &str,
+    kit_bin: &str,
+    host: crate::metrics::Host,
+    rule: crate::metrics::Rule,
+) -> Option<String> {
+    let rest = rewritten_tail.strip_prefix(kit_bin)?;
+    Some(format!(
+        "{kit_bin} --rewrite-host {} --rewrite-rule {}{rest}",
+        host.name(),
+        rule.name()
+    ))
 }
 
 /// Interception capability tier for shell commands (ADR-0014).
@@ -718,6 +751,25 @@ pub fn evaluate_shell_policy(
     session_id: &str,
     event_cwd: Option<&Path>,
 ) -> ShellAction {
+    evaluate_shell_policy_attributed(
+        ambient, rtk_active, tier, tool_name, tool_input, session_id, event_cwd, None,
+    )
+}
+
+/// Hook-entry variant carrying the fixed host attribution into transparent
+/// rewrites. Guided deny-once suggestions stay clean because the user copies
+/// those commands explicitly.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_shell_policy_attributed(
+    ambient: &crate::hook::AmbientFacts,
+    rtk_active: bool,
+    tier: ShellPolicyTier,
+    tool_name: &str,
+    tool_input: &Map<String, Value>,
+    session_id: &str,
+    event_cwd: Option<&Path>,
+    metrics_host: Option<crate::metrics::Host>,
+) -> ShellAction {
     if ambient.rewrite_disabled || !is_shell_tool(tool_name) {
         return ShellAction::Pass;
     }
@@ -727,20 +779,20 @@ pub fn evaluate_shell_policy(
     let Some(kit_bin) = kit_bin_quoted(ambient) else {
         return ShellAction::Pass;
     };
-    let Some(rewritten) = rewrite_command_str(command, &kit_bin, rtk_active, event_cwd) else {
+    let rewrite_host = match tier {
+        ShellPolicyTier::Rewrite => metrics_host,
+        ShellPolicyTier::DenyOnce => None,
+    };
+    let Some(rewritten) = rewrite_command(command, &kit_bin, rtk_active, event_cwd, rewrite_host)
+    else {
         return ShellAction::Pass;
     };
-    let rewritten_len = rewritten.len();
     match tier {
         ShellPolicyTier::Rewrite => ShellAction::Rewrite {
             command_key: command_key.to_owned(),
             rewritten,
             raw_bytes: command.len(),
-            metrics: vec![crate::metrics::MetricRecord {
-                rule: crate::metrics::Rule::ShellRewrite,
-                raw_bytes: command.len(),
-                emitted_bytes: rewritten_len,
-            }],
+            metrics: Vec::new(),
         },
         ShellPolicyTier::DenyOnce => {
             match crate::hook::shell_deny_once_decision(session_id, event_cwd, command, &rewritten, ambient) {

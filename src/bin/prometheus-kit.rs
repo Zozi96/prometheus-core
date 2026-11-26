@@ -9,7 +9,7 @@
 //!   map         One-call repository tree with line counts and optional top-level symbols.
 //!   hook        PreToolUse secret-path, large-read/reread, and shell-rewrite guards.
 //!   droid-mode  Switch installed Factory Droid model pins between on/off modes.
-//!   metrics     Print local hook-rule totals by host and rule (maintainer aid).
+//!   metrics     Print windowed local savings totals by host, rule, and host × rule.
 
 use prometheus_core::compact::{
     capture_command_log, compact_command, compact_text, render_compact_json, render_compact_text,
@@ -36,6 +36,7 @@ use prometheus_core::slice::{
 };
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAIN_USAGE: &str = "\
 usage: prometheus-kit <command> [options] <args...>
@@ -49,7 +50,7 @@ commands:
   map         Repository directory map with line counts and optional top-level symbols
   hook        Evaluate PreToolUse secret, read-budget, and rewrite guards for a host
   droid-mode  Switch installed Droid model pins between on and off modes
-  metrics     Print local totals by host and rule (maintainer aid)
+  metrics     Print windowed local totals by host, rule, and host × rule
 
 options:
   -h, --help      Show help
@@ -195,8 +196,53 @@ fn wire_len(s: &str) -> usize {
 fn emit_measured(rule: Rule, raw: usize, clipped: bool, rendered: &str) {
     emit_output(rendered);
     if clipped || raw > wire_len(rendered) {
-        metrics::record(metrics::command_host(), rule, raw, wire_len(rendered));
+        let (host, rule) =
+            process_rewrite_attribution().unwrap_or_else(|| (metrics::command_host(), rule));
+        metrics::record(host, rule, raw, wire_len(rendered));
     }
+}
+
+fn attribution_from(raw: &[String]) -> Option<(metrics::Host, Rule)> {
+    if raw.len() >= 4 && raw[0] == "--rewrite-host" && raw[2] == "--rewrite-rule" {
+        let host = metrics::Host::parse(&raw[1])?;
+        let rule = Rule::parse(&raw[3])?;
+        if host == metrics::Host::Standalone
+            || !matches!(
+                rule,
+                Rule::Slice | Rule::Search | Rule::Diff | Rule::Compact
+            )
+        {
+            return None;
+        }
+        return Some((host, rule));
+    }
+    None
+}
+
+fn process_rewrite_attribution() -> Option<(metrics::Host, Rule)> {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    attribution_from(&raw)
+}
+
+fn strip_rewrite_attribution(raw: &mut Vec<String>) -> Result<(), i32> {
+    if raw
+        .first()
+        .is_some_and(|arg| arg == "--rewrite-host" || arg == "--rewrite-rule")
+    {
+        let valid = raw.len() >= 4
+            && raw[0] == "--rewrite-host"
+            && raw[2] == "--rewrite-rule"
+            && attribution_from(raw).is_some();
+        if !valid {
+            eprintln!(
+                "prometheus-kit: invalid rewrite attribution
+{MAIN_USAGE}"
+            );
+            return Err(2);
+        }
+        raw.drain(..4);
+    }
+    Ok(())
 }
 
 /// Detect a render-stage budget cut by comparing `rendered` with an
@@ -1007,8 +1053,64 @@ options:
   -h, --help        Show help";
 
 const METRICS_USAGE: &str = "\
-usage: prometheus-kit metrics
-Print local totals by host and rule. Set PROMETHEUS_KIT_NO_METRICS to disable writes.";
+usage: prometheus-kit metrics [--since <duration|date>] [--json]
+
+options:
+  --since <window>  Include rows at or after <n>s|m|h|d|w ago, or UTC YYYY-MM-DD midnight
+  --json            Emit compact JSON instead of text
+  -h, --help        Show help
+
+Rows store only epoch seconds, fixed host/rule ids, and byte counts. Set PROMETHEUS_KIT_NO_METRICS to disable writes.";
+
+fn run_metrics(raw: &[String]) -> i32 {
+    let mut since_value: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0usize;
+    while i < raw.len() {
+        match raw[i].as_str() {
+            "-h" | "--help" => {
+                println!("{METRICS_USAGE}");
+                return 0;
+            }
+            "--since" => {
+                if since_value.is_some() {
+                    eprintln!("prometheus-kit metrics: duplicate --since\n{METRICS_USAGE}");
+                    return 2;
+                }
+                match next_val(raw, &mut i, "--since", METRICS_USAGE) {
+                    Ok(value) => since_value = Some(value),
+                    Err(code) => return code,
+                }
+            }
+            "--json" => json_mode = true,
+            other => {
+                eprintln!("prometheus-kit metrics: unknown option `{other}`\n{METRICS_USAGE}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    let since = if let Some(value) = since_value {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        match metrics::parse_since(&value, now) {
+            Some(since) => Some(since),
+            None => {
+                eprintln!("prometheus-kit metrics: invalid --since `{value}`\n{METRICS_USAGE}");
+                return 2;
+            }
+        }
+    } else {
+        None
+    };
+    if json_mode {
+        println!("{}", metrics::totals_json(since));
+    } else {
+        print!("{}", metrics::totals_text(since));
+    }
+    0
+}
 
 fn run_hook_cmd(raw: &[String]) -> i32 {
     let mut host: Option<String> = None;
@@ -1123,7 +1225,10 @@ fn run_droid_mode_cmd(raw: &[String]) -> i32 {
 }
 
 fn main() {
-    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let mut raw: Vec<String> = std::env::args().skip(1).collect();
+    if let Err(code) = strip_rewrite_attribution(&mut raw) {
+        std::process::exit(code);
+    }
     let Some(first) = raw.first().map(String::as_str) else {
         eprintln!("{MAIN_USAGE}");
         std::process::exit(2);
@@ -1145,18 +1250,7 @@ fn main() {
         "map" => run_map(&raw[1..]),
         "hook" => run_hook_cmd(&raw[1..]),
         "droid-mode" => run_droid_mode_cmd(&raw[1..]),
-        "metrics" if raw.len() == 1 => {
-            println!("{}", prometheus_core::metrics::totals());
-            0
-        }
-        "metrics" if matches!(raw.as_slice(), [_, flag] if flag == "-h" || flag == "--help") => {
-            println!("{METRICS_USAGE}");
-            0
-        }
-        "metrics" => {
-            eprintln!("{METRICS_USAGE}");
-            2
-        }
+        "metrics" => run_metrics(&raw[1..]),
         other => {
             eprintln!("prometheus-kit: unknown command `{other}`\n{MAIN_USAGE}");
             2

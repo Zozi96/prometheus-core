@@ -40,24 +40,29 @@ fingerprint with `git add -A` and `git write-tree` across randomized trees.
 
 ## Maintainer metrics
 
-`prometheus-kit metrics` prints lifetime totals aggregated from
-`~/.agents/prometheus/metrics/savings.jsonl` as `{"by_host": ..., "by_rule": ...}`
-(`--help` for usage). Each row stores only an epoch timestamp, a fixed host
-(`claude`, `cursor`, `devin`, `droid`, `muse`, `standalone`), a fixed rule id,
-and two byte counts — never session ids, paths, commands, or content. Hook
-hosts come from the hook name; CLI commands classify only from the presence
-of known nonempty host markers (`CURSOR_PROJECT_DIR`, `DEVIN_PROJECT_DIR`,
-`CLAUDECODE`, `FACTORY_DROID_SESSION_ID`, `MUSE_SESSION_ID`), and zero or
-multiple distinct markers report `standalone`.
+`prometheus-kit metrics` prints deterministic text totals aggregated from
+`~/.agents/prometheus/metrics/savings.jsonl`; `--json` emits
+`{"by_host": ..., "by_rule": ..., "by_host_rule": ...}` and `--since` accepts
+a `<n>s|m|h|d|w` duration or UTC `YYYY-MM-DD` date (`--help` for usage). Each
+row stores only an epoch timestamp, a fixed host, a fixed rule id, and two byte
+counts — never session ids, paths, commands, or content. Hook hosts come from
+the hook name and travel into rewritten kit commands as fixed host/rule
+arguments; CLI commands otherwise classify only from the presence of known
+nonempty host markers (`CURSOR_PROJECT_DIR`, `DEVIN_PROJECT_DIR`, `CLAUDECODE`,
+`FACTORY_DROID_SESSION_ID`, `FACTORY_SESSION_ID`, `PI_SESSION_ID`,
+`MUSE_SESSION_ID`, `GROK_SESSION_ID`, `ANTIGRAVITY_CONVERSATION_ID`,
+`OPENCODE_SESSION_ID`), and zero or multiple distinct markers report
+`standalone`.
 
-What counts: shell command rewrites (original command bytes → replacement
-bytes), large-read advisories and reread warnings (zero raw bytes → warning
+What counts: large-read advisories and reread warnings (zero raw bytes → warning
 length), reread denials (estimated read bytes → denial message length),
 allowed retries (zero raw bytes → the same estimate, cancelling the denial's
 credit), and at most one row per `compact`, `outline`, `slice`, `search`,
 `diff`, or `map` invocation whose output was actually reduced or clipped —
-`compact` counts every compaction including render overhead. For command
-rows `raw_bytes` minus `emitted_bytes` is the measured saving; warning rows
+`compact` counts every compaction including render overhead. Transparent shell
+rewrites are attributed to the executed kit command rather than writing a
+command-string-length row. For command rows `raw_bytes` minus `emitted_bytes`
+is the measured saving; warning rows
 add bytes, so only compare deltas within a single `rule_id` — the reread
 guard's net is `reread-denial` and `allowed-retry` taken together. For
 `slice` and `search` on files that are not valid UTF-8, `raw_bytes` counts
