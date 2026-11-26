@@ -22,8 +22,8 @@ use std::time::Duration;
 // Repository config (.prometheus.json)
 
 /// The slice of `.prometheus.json` the runner reads. Unknown keys are the
-/// repository's business; a malformed file yields the defaults, and the
-/// caller reports that the config could not be read.
+/// repository's business; malformed JSON is reported by `load_config`
+/// with the file name and parse error.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     /// `test_command`: a string (split on whitespace) or an argv list.
@@ -34,16 +34,25 @@ pub struct Config {
     pub iteration_profile: BTreeMap<String, String>,
 }
 
-pub fn load_config(root: &Path) -> Config {
-    let Ok(text) = std::fs::read_to_string(root.join(".prometheus.json")) else {
-        return Config::default();
+pub fn load_config(root: &Path) -> Result<Config, String> {
+    let path = root.join(".prometheus.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
     };
-    parse_config(&text).unwrap_or_default()
+    parse_config_result(&text).map_err(|error| format!("failed to parse {}: {error}", path.display()))
 }
 
 pub fn parse_config(text: &str) -> Option<Config> {
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    let object = value.as_object()?;
+    parse_config_result(text).ok()
+}
+
+fn parse_config_result(text: &str) -> Result<Config, String> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "expected a JSON object".to_owned())?;
     let test_command = match object.get("test_command") {
         Some(serde_json::Value::String(text)) => {
             let parts: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
@@ -77,7 +86,7 @@ pub fn parse_config(text: &str) -> Option<Config> {
             .collect(),
         _ => BTreeMap::new(),
     };
-    Some(Config { test_command, parallelism, iteration_profile })
+    Ok(Config { test_command, parallelism, iteration_profile })
 }
 
 /// The Iteration profile tokens for an MSBuild run: `-p:Key=Value`, sorted

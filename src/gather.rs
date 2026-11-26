@@ -387,7 +387,7 @@ fn root_files(root: &Path, suffixes: &[&str]) -> Vec<String> {
 /// Gather the Tree scan facts for one `--changed` Check run.
 pub fn gather_scan(request: &GatherRequest) -> GatheredScan {
     let root = &request.root;
-    let config = load_config(root);
+    let config = load_config(root).unwrap_or_default();
     let base = resolve_base(root, request.base.clone());
     let deltas = compute_deltas(root, base.as_deref());
 

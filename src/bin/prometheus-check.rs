@@ -34,7 +34,7 @@ use std::time::Duration;
 
 const USAGE: &str = "usage: prometheus-check [--root <dir>] [--store <dir>] [--slot-dir <dir>] \
 [--log <path>] [--base <ref>] [--timeout <seconds>] [--force] [--no-profile] \
-(-- <command...> | --changed)\n       prometheus-check selection-report [--since <YYYY-MM-DD|duration>] [--json]";
+(-- <command...> | --changed | --failed)\n       prometheus-check selection-report [--since <YYYY-MM-DD|duration>] [--json]";
 const REPORT_USAGE: &str =
     "usage: prometheus-check selection-report [--since <YYYY-MM-DD|duration>] [--json]";
 
@@ -48,6 +48,7 @@ struct Args {
     force: bool,
     no_profile: bool,
     changed: bool,
+    failed: bool,
     command: Vec<String>,
 }
 
@@ -67,6 +68,7 @@ fn parse_args() -> Result<Args, String> {
         force: false,
         no_profile: false,
         changed: false,
+        failed: false,
         command: Vec::new(),
     };
     let mut index = 0;
@@ -92,9 +94,12 @@ fn parse_args() -> Result<Args, String> {
             "--force" => args.force = true,
             "--no-profile" => args.no_profile = true,
             "--changed" => args.changed = true,
+            "--failed" => args.failed = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 println!("standalone check runner over Prometheus core (ADR-0010)");
+                println!("--failed reruns failing selectors from the latest red log (or --log <path> as input)");
+                println!(".prometheus.json keys: test_command, parallelism, iteration_profile");
                 std::process::exit(0);
             }
             "--version" => {
@@ -105,7 +110,7 @@ fn parse_args() -> Result<Args, String> {
         }
         index += 1;
     }
-    if args.changed != args.command.is_empty() {
+    if usize::from(args.changed) + usize::from(args.failed) + usize::from(!args.command.is_empty()) != 1 {
         return Err(USAGE.to_string());
     }
     Ok(args)
@@ -146,7 +151,8 @@ fn print_outcome(outcome: &prometheus_core::check_run::CheckOutcome) -> i32 {
                     for reason in widened {
                         println!("widened: {reason}");
                     }
-                    println!("validation pending: ask for the test_command");
+                    println!("validation pending: ask for the test_command or set test_command in .prometheus.json");
+                    println!(".prometheus.json supported keys: test_command, parallelism, iteration_profile");
                 }
                 PendingReason::SlotHeld { holder } => {
                     println!(
@@ -334,7 +340,13 @@ fn main() {
         }
     };
     let _ = std::fs::create_dir_all(&store);
-    let config = load_config(&root);
+    let config = match load_config(&root) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("prometheus-check: {error}");
+            std::process::exit(2);
+        }
+    };
 
     // The Check run request the binary builds at its edge: arguments
     // parsed, Ambient facts read (the default Check slot directory
@@ -365,6 +377,55 @@ fn main() {
             expected_fingerprint,
         }
     };
+
+    if args.failed {
+        let source = match &args.log {
+            Some(path) => path.clone(),
+            None => {
+                let logs_dir = store.join("logs");
+                match prometheus_core::failed::latest_red_log(&logs_dir) {
+                    Some(path) => path,
+                    None => {
+                        eprintln!(
+                            "prometheus-check: --failed found no red log in {}; pass --log <path>",
+                            logs_dir.display()
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+        };
+        let text = match std::fs::read_to_string(&source) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("prometheus-check: --failed could not read {}: {error}", source.display());
+                std::process::exit(1);
+            }
+        };
+        let command = match prometheus_core::failed::failed_rerun_command(&text, &config) {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!(
+                    "prometheus-check: --failed cannot rerun {}: {error}",
+                    source.display()
+                );
+                std::process::exit(1);
+            }
+        };
+        println!("failed selection targeted: {}", command.join(" "));
+        // In --failed mode `--log` names the input red log, not the output;
+        // the rerun creates its own log under the normal receipt contract.
+        let mut request = make_request(
+            Some(command),
+            prometheus_core::selection::Level::Targeted,
+            Vec::new(),
+            String::new(),
+            false,
+            None,
+        );
+        request.log = None;
+        run_and_exit(request);
+    }
 
     if !args.changed {
         let level = if is_full_command(&args.command, &config) {
