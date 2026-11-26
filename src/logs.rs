@@ -946,16 +946,27 @@ fn resolve_dotnet(
 // ---------------------------------------------------------------------------
 // The typed result.
 
+/// One structured failure: the test identity, its re-runnable selector,
+/// and the concise runner error line when the log carries one. These
+/// details are the typed input shared by Check and compact rendering.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FailureDetail {
+    pub test: String,
+    pub selector: String,
+    pub message: String,
+}
+
 /// The typed result of parsing a test log (ticket #94): counts or a
 /// named error, the failing lines, and the failed-test selectors.
-/// Serializes as `{counts, error, failing_lines, failed_tests}` — the
-/// shape the golden corpus compares.
+/// Serializes as `{counts, error, failing_lines, failed_tests,
+/// failure_details}` — the shape the golden corpus compares.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ParsedLog {
     pub counts: Option<crate::check::Counts>,
     pub error: Option<String>,
     pub failing_lines: Vec<String>,
     pub failed_tests: Vec<String>,
+    pub failure_details: Vec<FailureDetail>,
 }
 
 impl ParsedLog {
@@ -965,8 +976,240 @@ impl ParsedLog {
             error: Some("no-summary".to_string()),
             failing_lines: Vec::new(),
             failed_tests: Vec::new(),
+            failure_details: Vec::new(),
         }
     }
+}
+
+fn detail_test_name(selector: &str) -> String {
+    if let Some(name) = selector.strip_prefix("cargo test -- --exact ") {
+        return name.to_string();
+    }
+    if let Some(name) = selector.strip_prefix("dotnet test --filter FullyQualifiedName=") {
+        return name.to_string();
+    }
+    selector.to_string()
+}
+
+fn push_detail(
+    details: &mut HashMap<String, FailureDetail>,
+    test: &str,
+    selector: String,
+    message: &str,
+) {
+    let message = message.trim();
+    if test.is_empty() || message.is_empty() {
+        return;
+    }
+    if details.len() >= SELECTOR_LIMIT && !details.contains_key(&selector) {
+        return;
+    }
+    let message: String = message.chars().take(160).collect();
+    details.entry(selector.clone()).or_insert_with(|| FailureDetail {
+        test: test.to_string(),
+        selector,
+        message,
+    });
+}
+
+fn line_is_old_panic_format(line: &str) -> bool {
+    line.contains(" panicked at '")
+}
+
+/// Extract concise per-test failure details from the runner-specific
+/// shapes the selectors already recognize. This pass is deliberately
+/// independent of count resolution: a malformed summary never discards
+/// failure identity, and an unrecognized shape simply yields no detail.
+fn extract_failure_details(lines: &[&str]) -> HashMap<String, FailureDetail> {
+    let mut details = HashMap::new();
+
+    // pytest's short summary already carries `nodeid - concise error`.
+    for line in lines {
+        if let Some(nodeid) = pytest_failure(line) {
+            let message = line
+                .split_once(" - ")
+                .map(|(_, message)| message)
+                .unwrap_or("failed");
+            push_detail(&mut details, nodeid, nodeid.to_string(), message);
+        }
+    }
+
+    // cargo prints captured failure output in `---- <test> stdout ----`
+    // blocks. Scan the whole block in O(1) memory: stdout noise before the
+    // panic must not push the panic payload out of a fixed-size window.
+    let mut cargo_name: Option<String> = None;
+    let mut cargo_fallback: Option<String> = None;
+    let mut cargo_message: Option<String> = None;
+    let mut cargo_waiting_payload = false;
+    fn finish_cargo(
+        details: &mut HashMap<String, FailureDetail>,
+        cargo_name: &mut Option<String>,
+        cargo_fallback: &mut Option<String>,
+        cargo_message: &mut Option<String>,
+        cargo_waiting_payload: &mut bool,
+    ) {
+        if let Some(name) = cargo_name.take() {
+            let message = cargo_message
+                .take()
+                .or_else(|| cargo_fallback.take())
+                .unwrap_or_default();
+            push_detail(
+                details,
+                &name,
+                format!("cargo test -- --exact {name}"),
+                &message,
+            );
+        }
+        cargo_fallback.take();
+        cargo_message.take();
+        *cargo_waiting_payload = false;
+    }
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("---- ") {
+            if let Some(name) = rest.strip_suffix(" stdout ----") {
+                finish_cargo(
+                    &mut details,
+                    &mut cargo_name,
+                    &mut cargo_fallback,
+                    &mut cargo_message,
+                    &mut cargo_waiting_payload,
+                );
+                cargo_name = Some(name.to_string());
+                continue;
+            }
+        }
+        if cargo_name.is_some() {
+            if line.starts_with("test result:") || *line == "failures:" {
+                finish_cargo(
+                    &mut details,
+                    &mut cargo_name,
+                    &mut cargo_fallback,
+                    &mut cargo_message,
+                    &mut cargo_waiting_payload,
+                );
+            } else {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let bounded: String = trimmed.chars().take(260).collect();
+                if cargo_fallback.is_none() {
+                    cargo_fallback = Some(bounded.clone());
+                }
+                if cargo_waiting_payload {
+                    cargo_message = Some(bounded);
+                    cargo_waiting_payload = false;
+                } else if cargo_message.is_none()
+                    && trimmed.starts_with("thread '")
+                    && trimmed.contains(" panicked at ")
+                {
+                    if line_is_old_panic_format(trimmed) {
+                        cargo_message = Some(bounded);
+                    } else {
+                        cargo_waiting_payload = true;
+                    }
+                }
+            }
+        }
+    }
+    finish_cargo(
+        &mut details,
+        &mut cargo_name,
+        &mut cargo_fallback,
+        &mut cargo_message,
+        &mut cargo_waiting_payload,
+    );
+
+    // unittest failure sections end at the next section or the run
+    // summary; their concise error is the last column-zero exception line.
+    let mut unit_selector: Option<String> = None;
+    let mut unit_message: Option<String> = None;
+    fn finish_unit(
+        details: &mut HashMap<String, FailureDetail>,
+        unit_selector: &mut Option<String>,
+        unit_message: &mut Option<String>,
+    ) {
+        if let (Some(selector), Some(message)) = (unit_selector.take(), unit_message.take()) {
+            let test = detail_test_name(&selector);
+            push_detail(details, &test, selector, &message);
+        }
+        unit_message.take();
+    }
+    for line in lines {
+        if let Some((name, qualifier)) = unittest_failure(line) {
+            finish_unit(&mut details, &mut unit_selector, &mut unit_message);
+            unit_selector = Some(unittest_selector(name, qualifier));
+            continue;
+        }
+        if unit_selector.is_some() {
+            if unittest_ran(line).is_some() || unittest_end(line).is_some() {
+                finish_unit(&mut details, &mut unit_selector, &mut unit_message);
+                continue;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed.bytes().all(|b| b == b'-')
+                || trimmed.bytes().all(|b| b == b'=')
+                || line.starts_with(char::is_whitespace)
+                || trimmed.starts_with("Traceback ")
+            {
+                continue;
+            }
+            unit_message = Some(trimmed.to_string());
+        }
+    }
+    finish_unit(&mut details, &mut unit_selector, &mut unit_message);
+
+    // VSTest puts the message on the indented line after `Error Message:`;
+    // MTP indents the concise message directly below the failed test.
+    let mut dotnet_name: Option<String> = None;
+    let mut dotnet_ready = false;
+    fn finish_dotnet(
+        details: &mut HashMap<String, FailureDetail>,
+        dotnet_name: &mut Option<String>,
+        message: Option<&str>,
+    ) {
+        if let (Some(name), Some(message)) = (dotnet_name.take(), message) {
+            push_detail(
+                details,
+                &name,
+                format!("dotnet test --filter FullyQualifiedName={name}"),
+                message,
+            );
+        }
+    }
+    for line in lines {
+        if let Some(name) = vstest_failure(line).or_else(|| mtp_failure(line)) {
+            finish_dotnet(&mut details, &mut dotnet_name, None);
+            dotnet_name = Some(name.to_string());
+            dotnet_ready = mtp_failure(line).is_some();
+            continue;
+        }
+        if dotnet_name.is_some() {
+            let trimmed = line.trim();
+            if let Some(inline) = trimmed.strip_prefix("Error Message:") {
+                let inline = inline.trim();
+                if inline.is_empty() {
+                    dotnet_ready = true;
+                } else {
+                    finish_dotnet(&mut details, &mut dotnet_name, Some(inline));
+                    dotnet_ready = false;
+                }
+            } else if dotnet_ready && !trimmed.is_empty() && line.starts_with(char::is_whitespace) {
+                finish_dotnet(&mut details, &mut dotnet_name, Some(trimmed));
+                dotnet_ready = false;
+            } else if !trimmed.is_empty()
+                && !line.starts_with(char::is_whitespace)
+                && !trimmed.starts_with("Stack Trace:")
+            {
+                finish_dotnet(&mut details, &mut dotnet_name, None);
+                dotnet_ready = false;
+            }
+        }
+    }
+    finish_dotnet(&mut details, &mut dotnet_name, None);
+
+    details
 }
 
 fn to_check_counts(counts: &Counts) -> Option<crate::check::Counts> {
@@ -1273,11 +1516,26 @@ fn parse_impl(text: &str, exit_code: Option<i64>) -> ParsedLog {
     } else {
         (None, Some("no-summary"))
     };
+    let extracted_details = extract_failure_details(&lines);
+    let failure_details = failed_tests
+        .iter()
+        .map(|selector| {
+            extracted_details
+                .get(selector)
+                .cloned()
+                .unwrap_or_else(|| FailureDetail {
+                    test: detail_test_name(selector),
+                    selector: selector.clone(),
+                    message: String::new(),
+                })
+        })
+        .collect();
     ParsedLog {
         counts: counts.as_ref().and_then(to_check_counts),
         error: error.map(str::to_string),
         failing_lines,
         failed_tests,
+        failure_details,
     }
 }
 

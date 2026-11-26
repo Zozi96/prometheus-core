@@ -8,6 +8,7 @@ pub mod classify;
 pub mod compact;
 pub mod diff;
 pub mod droid_mode;
+pub mod failure_summary;
 pub mod fingerprint;
 pub mod gather;
 pub mod hook;

@@ -10,5 +10,12 @@
   "failing_lines": [],
   "failed_tests": [
     "dotnet test --filter FullyQualifiedName=Foo.Tests.UnitTest1.TestMethod1"
+  ],
+  "failure_details": [
+    {
+      "test": "Foo.Tests.UnitTest1.TestMethod1",
+      "selector": "dotnet test --filter FullyQualifiedName=Foo.Tests.UnitTest1.TestMethod1",
+      "message": "Assert.AreEqual failed."
+    }
   ]
 }

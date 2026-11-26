@@ -15,5 +15,17 @@
   "failed_tests": [
     "tests/test_app.py:T.test_value",
     "tests/test_app.py:T.test_load"
+  ],
+  "failure_details": [
+    {
+      "test": "tests/test_app.py:T.test_value",
+      "selector": "tests/test_app.py:T.test_value",
+      "message": "AssertionError: 1 != 2"
+    },
+    {
+      "test": "tests/test_app.py:T.test_load",
+      "selector": "tests/test_app.py:T.test_load",
+      "message": "RuntimeError: boom"
+    }
   ]
 }

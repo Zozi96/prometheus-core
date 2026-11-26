@@ -16,5 +16,22 @@
     "tests/test_x.py::T::test_a",
     "tests/test_x.py::test_c[param]",
     "tests/test_y.py"
+  ],
+  "failure_details": [
+    {
+      "test": "tests/test_x.py::T::test_a",
+      "selector": "tests/test_x.py::T::test_a",
+      "message": "AssertionError: boom"
+    },
+    {
+      "test": "tests/test_x.py::test_c[param]",
+      "selector": "tests/test_x.py::test_c[param]",
+      "message": "ValueError: bad"
+    },
+    {
+      "test": "tests/test_y.py",
+      "selector": "tests/test_y.py",
+      "message": "failed"
+    }
   ]
 }

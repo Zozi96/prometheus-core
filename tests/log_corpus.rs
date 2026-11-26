@@ -19,6 +19,7 @@ struct Expected {
     error: Option<String>,
     failing_lines: Vec<String>,
     failed_tests: Vec<String>,
+    failure_details: Option<Vec<serde_json::Value>>,
 }
 
 #[test]
@@ -53,6 +54,7 @@ fn golden_corpus_matches_parser_output() {
             "error": expected.error,
             "failing_lines": expected.failing_lines,
             "failed_tests": expected.failed_tests,
+            "failure_details": expected.failure_details.unwrap_or_default(),
         });
         assert_eq!(doc, want, "fixture {name}");
     }

@@ -197,8 +197,18 @@ fn print_outcome(outcome: &prometheus_core::check_run::CheckOutcome) -> i32 {
                         "passed {} failed {} skipped {} total {} exit {}",
                         counts.passed, counts.failed, counts.skipped, counts.total, run.exit_code
                     );
-                    for line in &run.parsed.failing_lines {
-                        println!("{line}");
+                    let failure_summary = prometheus_core::failure_summary::render_failure_summary(
+                        &run.parsed,
+                        Some(&run.log_path.display().to_string()),
+                    );
+                    if failure_summary.is_empty() {
+                        for line in &run.parsed.failing_lines {
+                            println!("{line}");
+                        }
+                    } else {
+                        for line in failure_summary {
+                            println!("{line}");
+                        }
                     }
                 }
                 None => {
@@ -207,6 +217,12 @@ fn print_outcome(outcome: &prometheus_core::check_run::CheckOutcome) -> i32 {
                     }
                     println!("exit {}", run.exit_code);
                     println!("no test summary was found; this run is not behavioral evidence");
+                    for line in prometheus_core::failure_summary::render_failure_summary(
+                        &run.parsed,
+                        Some(&run.log_path.display().to_string()),
+                    ) {
+                        println!("{line}");
+                    }
                 }
             }
             println!("log: {}", run.log_path.display());

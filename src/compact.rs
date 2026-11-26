@@ -3,7 +3,8 @@
 use crate::budget::{self, KeepPolicy};
 use crate::check::Counts;
 use crate::kit_util::{approx_tokens, clip_end, strip_ansi_and_cr, write_spillover_log};
-use crate::logs::parse_log;
+use crate::failure_summary::{failure_omission_notice, render_failure_summary};
+use crate::logs::{parse_log, FailureDetail};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -87,6 +88,13 @@ pub struct CompactResult {
     pub test_counts: Option<Counts>,
     pub diagnostics: Vec<DiagnosticGroup>,
     pub failing_lines: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failure_details: Vec<FailureDetail>,
+    #[serde(skip)]
+    pub failure_total: usize,
+    /// Set when the caller already prints the log pointer (compact --keep-log).
+    #[serde(skip)]
+    pub log_path_in_prefix: bool,
     pub lines: Vec<String>,
     pub raw_lines: usize,
     pub raw_tokens: usize,
@@ -96,6 +104,9 @@ pub struct CompactResult {
     pub log_path: Option<String>,
     pub truncated: bool,
     pub omitted_items: usize,
+    /// Budget-trimmed typed failure rows, already included in `omitted_items`.
+    #[serde(skip)]
+    pub omitted_failure_details: usize,
     /// Byte length of the raw input this result was compacted from; metrics-only.
     #[serde(skip)]
     pub raw_bytes: usize,
@@ -509,26 +520,89 @@ pub fn format_diagnostic(g: &DiagnosticGroup) -> String {
     clip_end(&line, MAX_LINE_CHARS).0
 }
 
+fn parsed_failure_view(counts: Option<Counts>, details: &[FailureDetail]) -> crate::logs::ParsedLog {
+    crate::logs::ParsedLog {
+        counts,
+        error: None,
+        failing_lines: Vec::new(),
+        failed_tests: details
+            .iter()
+            .map(|detail| detail.selector.clone())
+            .collect(),
+        failure_details: details.to_vec(),
+    }
+}
+
+fn typed_failure_summary_complete(counts: Option<Counts>, details: &[FailureDetail]) -> bool {
+    if details.is_empty() {
+        return false;
+    }
+    let parsed = parsed_failure_view(counts, details);
+    !render_failure_summary(&parsed, None)
+        .last()
+        .is_some_and(|line| line.contains("failures omitted"))
+}
+
+fn typed_details_budget_trimmed(res: &CompactResult, max_tokens: usize) -> bool {
+    if max_tokens == 0 || res.failure_details.is_empty() {
+        return false;
+    }
+    let original = res.failure_details.len();
+    let mut text = res.clone();
+    budget::trim_structured(
+        &mut text,
+        max_tokens,
+        |state| render_compact_text_inner(state, true),
+        compact_trim_step,
+    );
+    let mut json = res.clone();
+    budget::trim_structured(
+        &mut json,
+        max_tokens,
+        |state| serde_json::to_string(state).unwrap_or_else(|_| "{}".to_owned()),
+        compact_trim_step,
+    );
+    text.failure_details.len() < original || json.failure_details.len() < original
+}
+
 pub fn compact_text(raw: &str, exit_code: Option<i32>, opts: &CompactOptions) -> CompactResult {
     let normalized = strip_ansi_and_cr(raw);
     let raw_lines_vec: Vec<&str> = normalized.lines().collect();
     let raw_lines = raw_lines_vec.len();
     let raw_tokens = approx_tokens(raw);
 
-    let (test_counts, mut failing_lines) = if matches!(opts.mode, CompactMode::Auto | CompactMode::Test)
-    {
-        let parsed = parse_log(&normalized, exit_code.map(i64::from));
-        let fl: Vec<String> = parsed
-            .failing_lines
-            .iter()
-            .map(|line| clip_end(line.trim(), MAX_LINE_CHARS).0)
-            .collect();
-        (parsed.counts, fl)
-    } else {
-        (None, Vec::new())
-    };
+    let (test_counts, mut failing_lines, failure_details) =
+        if matches!(opts.mode, CompactMode::Auto | CompactMode::Test) {
+            let parsed = parse_log(&normalized, exit_code.map(i64::from));
+            let fl: Vec<String> = if parsed.failure_details.is_empty() {
+                parsed
+                    .failing_lines
+                    .iter()
+                    .map(|line| clip_end(line.trim(), MAX_LINE_CHARS).0)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (parsed.counts, fl, parsed.failure_details)
+        } else {
+            (None, Vec::new(), Vec::new())
+        };
+    let has_typed_failures = !failure_details.is_empty();
 
-    let (diagnostics, diag_line_indices) = extract_diagnostics(&raw_lines_vec, opts.mode);
+    let (mut diagnostics, diag_line_indices) = extract_diagnostics(&raw_lines_vec, opts.mode);
+    if has_typed_failures {
+        diagnostics.retain(|group| {
+            group.message.is_empty()
+                || !failure_details.iter().any(|detail| {
+                    let with_code = if group.code.is_empty() {
+                        group.message.clone()
+                    } else {
+                        format!("{}: {}", group.code, group.message)
+                    };
+                    detail.message == with_code || detail.message == group.message
+                })
+        });
+    }
 
     let mut filtered_lines: Vec<String> = Vec::new();
     for (idx, &line) in raw_lines_vec.iter().enumerate() {
@@ -547,8 +621,8 @@ pub fn compact_text(raw: &str, exit_code: Option<i32>, opts: &CompactOptions) ->
 
     let folded = fold_frames_and_repeats(&filtered_lines);
     let show_tail = matches!(opts.mode, CompactMode::Generic | CompactMode::Log)
-        || (diagnostics.is_empty() && test_counts.is_none())
-        || exit_code.unwrap_or(0) != 0;
+        || (diagnostics.is_empty() && test_counts.is_none() && !has_typed_failures)
+        || (exit_code.unwrap_or(0) != 0 && !has_typed_failures);
 
     let selected_lines = if !show_tail || opts.tail_lines == 0 {
         Vec::new()
@@ -576,12 +650,24 @@ pub fn compact_text(raw: &str, exit_code: Option<i32>, opts: &CompactOptions) ->
         failing_lines.truncate(20);
     }
 
+    let failure_total = if failure_details.is_empty() {
+        0
+    } else {
+        failure_details.len().max(
+            test_counts
+                .and_then(|counts| usize::try_from(counts.failed).ok())
+                .unwrap_or(0),
+        )
+    };
     let mut result = CompactResult {
         mode: opts.mode.as_str().to_owned(),
         exit_code,
         test_counts,
         diagnostics,
         failing_lines,
+        failure_total,
+        log_path_in_prefix: false,
+        failure_details,
         lines: selected_lines,
         raw_lines,
         raw_tokens,
@@ -590,14 +676,20 @@ pub fn compact_text(raw: &str, exit_code: Option<i32>, opts: &CompactOptions) ->
         log_path: None,
         truncated: false,
         omitted_items: 0,
+        omitted_failure_details: 0,
         raw_bytes: raw.len(),
     };
 
     let preview_text = render_compact_text_inner(&result, false);
     let out_tok_est = approx_tokens(&preview_text);
+    let typed_complete = typed_failure_summary_complete(test_counts, &result.failure_details);
+    let budget_trims_typed = typed_details_budget_trimmed(&result, opts.max_tokens);
+    let nonzero_needs_log = exit_code.is_some_and(|code| code != 0) && !typed_complete;
+    let file_typed_needs_log = exit_code.is_none() && has_typed_failures && !typed_complete;
+    let size_needs_log = raw_tokens > out_tok_est.saturating_add(150);
     let need_spillover = opts.save_log.is_some()
         || (opts.allow_spillover
-            && (exit_code.unwrap_or(0) != 0 || raw_tokens > out_tok_est.saturating_add(150)));
+            && (nonzero_needs_log || file_typed_needs_log || size_needs_log || budget_trims_typed));
     if need_spillover {
         if let Some(path) = write_spillover_log(opts.save_log.as_deref(), "compact", &normalized) {
             result.log_path = Some(path.to_string_lossy().to_string());
@@ -629,6 +721,13 @@ fn compact_trim_step(res: &mut CompactResult) -> bool {
         res.omitted_items += 1;
         return true;
     }
+    if !res.failure_details.is_empty() {
+        res.failure_details.pop();
+        res.truncated = true;
+        res.omitted_items += 1;
+        res.omitted_failure_details += 1;
+        return true;
+    }
     if !res.failing_lines.is_empty() {
         res.failing_lines.pop();
         res.truncated = true;
@@ -656,12 +755,18 @@ fn compact_trim_step(res: &mut CompactResult) -> bool {
     false
 }
 
+fn nonfailure_omitted_items(res: &CompactResult) -> usize {
+    res.omitted_items
+        .saturating_sub(res.omitted_failure_details)
+}
+
 /// The `compact` truncation notice for a (possibly trimmed) result,
-/// without its trailing newline. Wording is unchanged.
+/// without its trailing newline. Wording is unchanged. Typed failure rows
+/// carry their own omission notice, so they are not double-counted here.
 fn compact_notice(res: &CompactResult) -> String {
     format!(
         "... (+{} omitted lines/diagnostics; see full log or --max-tokens)",
-        res.omitted_items
+        nonfailure_omitted_items(res)
     )
 }
 
@@ -686,6 +791,23 @@ fn render_compact_text_inner(res: &CompactResult, with_footer: bool) -> String {
         out.push_str(&format_diagnostic(g));
         out.push('\n');
     }
+    let mut parsed = parsed_failure_view(res.test_counts, &res.failure_details);
+    if res.failure_total > 0 {
+        let mut counts = parsed.counts.unwrap_or_default();
+        counts.failed = i64::try_from(res.failure_total).unwrap_or(counts.failed);
+        parsed.counts = Some(counts);
+    }
+    for line in render_failure_summary(&parsed, res.log_path.as_deref()) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if res.failure_total > 0 && res.failure_details.is_empty() {
+        out.push_str(&failure_omission_notice(
+            res.failure_total,
+            res.log_path.as_deref(),
+        ));
+        out.push('\n');
+    }
     for f in &res.failing_lines {
         out.push_str(&format!("fail: {f}\n"));
     }
@@ -693,26 +815,39 @@ fn render_compact_text_inner(res: &CompactResult, with_footer: bool) -> String {
         out.push_str(l);
         out.push('\n');
     }
-    if res.truncated && res.omitted_items > 0 {
+    if res.truncated && nonfailure_omitted_items(res) > 0 {
         out.push_str(&compact_notice(res));
         out.push('\n');
     }
     if with_footer {
-        let cur_tok = approx_tokens(&out);
-        let pct = if res.raw_tokens > 0 {
-            (1.0 - (cur_tok as f64 / res.raw_tokens as f64)) * 100.0
+        if res.failure_total > 0 {
+            // Typed failure output is already the compaction. Keep only the
+            // recoverability pointer: the full savings footer can cost more
+            // bytes than a small failing corpus log itself.
+            if let Some(path) = &res.log_path {
+                if !res.log_path_in_prefix {
+                    out.push_str(&format!("log: {path}\n"));
+                }
+            }
         } else {
-            0.0
-        };
-        let mut footer = format!(
-            "raw: {}L (~{} tok) -> ~{} tok ({:.1}% saved)",
-            res.raw_lines, res.raw_tokens, cur_tok, pct
-        );
-        if let Some(path) = &res.log_path {
-            footer.push_str(&format!(" | log: {path}"));
+            let cur_tok = approx_tokens(&out);
+            let pct = if res.raw_tokens > 0 {
+                (1.0 - (cur_tok as f64 / res.raw_tokens as f64)) * 100.0
+            } else {
+                0.0
+            };
+            let mut footer = format!(
+                "raw: {}L (~{} tok) -> ~{} tok ({:.1}% saved)",
+                res.raw_lines, res.raw_tokens, cur_tok, pct
+            );
+            if let Some(path) = &res.log_path {
+                if !res.log_path_in_prefix {
+                    footer.push_str(&format!(" | log: {path}"));
+                }
+            }
+            out.push_str(&footer);
+            out.push('\n');
         }
-        out.push_str(&footer);
-        out.push('\n');
     }
     out
 }
@@ -740,7 +875,13 @@ pub fn render_compact_text(res: &CompactResult, max_tokens: usize) -> String {
     if rendered_no_footer.len() <= budget {
         return rendered_no_footer;
     }
-    let notice = if trimmed.truncated && trimmed.omitted_items > 0 {
+    let failure_notice = rendered_no_footer
+        .lines()
+        .find(|line| line.starts_with("... (") && line.contains(" failures omitted;"))
+        .map(str::to_owned);
+    let notice = if let Some(notice) = failure_notice {
+        notice
+    } else if trimmed.truncated && nonfailure_omitted_items(&trimmed) > 0 {
         compact_notice(&trimmed)
     } else {
         "... (truncated; see full log or --max-tokens)".to_owned()

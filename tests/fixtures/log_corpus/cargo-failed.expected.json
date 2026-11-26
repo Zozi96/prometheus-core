@@ -14,5 +14,17 @@
   "failed_tests": [
     "cargo test -- --exact tests::test_sub",
     "cargo test -- --exact net::probe::test_connect"
+  ],
+  "failure_details": [
+    {
+      "test": "tests::test_sub",
+      "selector": "cargo test -- --exact tests::test_sub",
+      "message": "assertion failed"
+    },
+    {
+      "test": "net::probe::test_connect",
+      "selector": "cargo test -- --exact net::probe::test_connect",
+      "message": ""
+    }
   ]
 }

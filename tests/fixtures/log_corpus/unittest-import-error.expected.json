@@ -13,5 +13,12 @@
   ],
   "failed_tests": [
     "test_broken.py"
+  ],
+  "failure_details": [
+    {
+      "test": "test_broken.py",
+      "selector": "test_broken.py",
+      "message": "ModuleNotFoundError: No module named 'missing_dep_prometheus_fix_d'"
+    }
   ]
 }
